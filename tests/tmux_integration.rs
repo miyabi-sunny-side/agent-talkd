@@ -4,7 +4,7 @@ use std::{
     path::Path,
     process::{Command, Output},
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 struct Server {
@@ -208,18 +208,27 @@ fn daemon_queue_delivery_stale_socket_and_pane_exit() {
         &["send", "claude", "second"],
     );
     tmux(&name, &["kill-pane", "-t", &panes[1]]);
-    thread::sleep(Duration::from_millis(500));
-
-    let who = text(agent(&socket, &runtime, &state, &mail, &panes[0], &["who"]));
-    assert!(who.contains("codex"));
-    assert!(!who.contains("claude"));
-    let sender_state = text(tmux(
-        &name,
-        &["show-option", "-pqv", "-t", &panes[0], "@agent_state"],
-    ));
-    assert_eq!(sender_state, "busy");
-    let sender_screen = text(tmux(&name, &["capture-pane", "-p", "-t", &panes[0]]));
-    assert!(sender_screen.contains("[agent-talk] 配達失敗:"));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let who = text(agent(&socket, &runtime, &state, &mail, &panes[0], &["who"]));
+        let sender_state = text(tmux(
+            &name,
+            &["show-option", "-pqv", "-t", &panes[0], "@agent_state"],
+        ));
+        let sender_screen = text(tmux(&name, &["capture-pane", "-p", "-t", &panes[0]]));
+        if who.contains("codex")
+            && !who.contains("claude")
+            && sender_state == "busy"
+            && sender_screen.contains("[agent-talk] 配達失敗:")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "failure notification timed out: who={who:?} state={sender_state:?}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn agent(
