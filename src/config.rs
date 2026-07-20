@@ -40,7 +40,9 @@ impl Config {
             .unwrap_or_else(|| "info".into());
         Ok(Self {
             tmux_socket,
-            rpc_socket: runtime.join("agent-talkd").join(format!("{name}.sock")),
+            rpc_socket: env::var_os("AGENT_TALK_RPC_SOCKET")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| runtime.join("agent-talkd").join(format!("{name}.sock"))),
             journal: state.join("agent-talkd").join(format!("{name}.journal")),
             log: state.join("agent-talkd").join("agent-talkd.log"),
             maildir,

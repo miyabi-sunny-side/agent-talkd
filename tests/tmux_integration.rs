@@ -199,14 +199,15 @@ fn daemon_queue_delivery_stale_socket_and_pane_exit() {
 
     agent(&socket, &runtime, &state, &mail, &panes[1], &["turn-end"]);
     agent(&socket, &runtime, &state, &mail, &panes[1], &["busy"]);
-    agent(
+    let second = text(agent(
         &socket,
         &runtime,
         &state,
         &mail,
         &panes[0],
         &["send", "claude", "second"],
-    );
+    ));
+    assert!(second.starts_with("queued (busy) -> "));
     tmux(&name, &["kill-pane", "-t", &panes[1]]);
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -225,7 +226,8 @@ fn daemon_queue_delivery_stale_socket_and_pane_exit() {
         }
         assert!(
             Instant::now() < deadline,
-            "failure notification timed out: who={who:?} state={sender_state:?}"
+            "failure notification timed out: who={who:?} state={sender_state:?}\ndaemon log:\n{}",
+            fs::read_to_string(state.join("agent-talkd/agent-talkd.log")).unwrap_or_default()
         );
         thread::sleep(Duration::from_millis(50));
     }
@@ -242,8 +244,9 @@ fn agent(
     let output = agent_raw(socket, runtime, state, mail, pane, args);
     assert!(
         output.status.success(),
-        "agent-talk failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+        "agent-talk {args:?} failed: {}\ndaemon log:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        fs::read_to_string(state.join("agent-talkd/agent-talkd.log")).unwrap_or_default()
     );
     output
 }

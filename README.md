@@ -100,7 +100,7 @@ ignore されています。
 
 - Linux x86_64
 - macOS Apple Silicon
-- tmux（3.6bで検証）
+- tmux 3.4以上（3.4 / 3.6bで検証）
 
 Windowsはtmuxを前提とするためサポート対象外です。
 

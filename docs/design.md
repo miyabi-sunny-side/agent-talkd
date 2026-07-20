@@ -11,7 +11,10 @@ agent-talkd は、tmux 上の対話エージェントへ作業中の入力を割
   通じてdaemonへ1要求を送ります。daemonがなければ競合を避けて自動起動します。
 - tmux control mode接続はtmuxサーバーの終了検知に使います。pane消滅はtmuxの
   通知だけでは全sessionを網羅できないため、global hookをwake-upとして
-  live pane一覧と照合します。
+  tmuxの状態確定を短時間待ってからlive pane一覧と照合します。control mode
+  だけが切断された場合はdaemonを維持し、低頻度のhealth checkでtmuxサーバー
+  終了を検知します。hookにはdaemonのRPC socket絶対パスを渡し、tmux serverと
+  CLIの環境変数が異なっても同じdaemonへ接続します。
 
 ## 状態と配送
 

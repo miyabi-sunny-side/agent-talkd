@@ -29,6 +29,7 @@ enum Event {
     Request(Request, oneshot::Sender<Response>),
     PaneExited(String),
     ControlDisconnected,
+    ServerCheck,
 }
 
 pub async fn run(config: Config) -> Result<()> {
@@ -49,7 +50,8 @@ pub async fn run(config: Config) -> Result<()> {
 
     let tmux = Tmux::new(config.tmux_socket.clone());
     let executable = env::current_exe()?;
-    tmux.install_pane_exit_hook(&executable).await?;
+    tmux.install_pane_exit_hook(&executable, &config.rpc_socket)
+        .await?;
     let (control_tx, mut control_rx) = mpsc::channel(32);
     let mut control = tmux.start_control(control_tx).await?;
     let (tx, mut rx) = mpsc::channel::<Event>(64);
@@ -66,6 +68,16 @@ pub async fn run(config: Config) -> Result<()> {
             }
         }
     });
+    let health_tx = tx.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+        loop {
+            interval.tick().await;
+            if health_tx.send(Event::ServerCheck).await.is_err() {
+                break;
+            }
+        }
+    });
 
     let (journal, state) = Journal::open(config.journal.clone())?;
     let mut broker = Broker {
@@ -77,6 +89,7 @@ pub async fn run(config: Config) -> Result<()> {
     broker.reconcile(true).await;
     info!(source = "daemon", "started");
 
+    let mut control_lost = false;
     while let Some(event) = rx.recv().await {
         match event {
             Event::Request(request, reply) => {
@@ -86,7 +99,22 @@ pub async fn run(config: Config) -> Result<()> {
             Event::PaneExited(pane) => {
                 broker.remove_agent(&pane, "宛先が退出した").await;
             }
-            Event::ControlDisconnected => break,
+            Event::ControlDisconnected => {
+                if tmux.server_is_alive().await {
+                    control_lost = true;
+                    warn!(
+                        source = "tmux-control",
+                        "control mode disconnected while server is alive; using health checks"
+                    );
+                } else {
+                    break;
+                }
+            }
+            Event::ServerCheck => {
+                if control_lost && !tmux.server_is_alive().await {
+                    break;
+                }
+            }
         }
     }
 

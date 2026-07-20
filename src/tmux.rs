@@ -87,7 +87,7 @@ impl Tmux {
         let _ = self.set_option(pane, "@agent_talk_sent", Some("1")).await;
     }
 
-    pub async fn install_pane_exit_hook(&self, executable: &Path) -> Result<()> {
+    pub async fn install_pane_exit_hook(&self, executable: &Path, rpc_socket: &Path) -> Result<()> {
         self.run([
             "set-environment",
             "-g",
@@ -95,8 +95,15 @@ impl Tmux {
             &self.socket,
         ])
         .await?;
+        self.run([
+            "set-environment",
+            "-g",
+            "AGENT_TALK_RPC_SOCKET",
+            &rpc_socket.to_string_lossy(),
+        ])
+        .await?;
         let command = format!(
-            "run-shell -b '{} internal-reconcile'",
+            "run-shell -b -d 0.5 '{} internal-reconcile'",
             shell_quote(&executable.to_string_lossy())
         );
         for hook in [
@@ -154,6 +161,10 @@ impl Tmux {
             let _ = tx.send(ControlEvent::Disconnected).await;
         });
         Ok(child)
+    }
+
+    pub async fn server_is_alive(&self) -> bool {
+        self.run(["list-sessions"]).await.is_ok()
     }
 
     async fn run<I, S>(&self, args: I) -> Result<String>
