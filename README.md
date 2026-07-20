@@ -67,12 +67,15 @@ set -g @plugin 'miyabi-sunny-side/agent-talkd'
 ## CLI
 
 `register`, `unregister`, `busy`, `idle`, `turn-end`, `who`, `resolve`,
-`send` を提供します。互換用の `gc`, `watch` は no-op です。デーモンが未起動
-なら CLI が tmux サーバー単位で自動起動します。
+`send`, `read` を提供します。互換用の `gc`, `watch` は no-op です。
+デーモンが未起動なら CLI が tmux サーバー単位で自動起動します。
 
-状態遷移ログと queue journal は既定で
+`send` は `#<id>` を返し、受信側は呼び鈴に表示された
+`agent-talk read <id>` で依頼本文を取得します。`read` はcheckpointまでは
+繰り返し実行できます。本文、未配達queue、状態遷移は既定で
 `$XDG_STATE_HOME/agent-talkd/`（未設定時は `~/.local/state/agent-talkd/`）
-に保存します。
+のjournalに保存します。従来の `~/.cache/agent-talk/*.md` は新規作成せず、
+既存ファイルも自動削除しません。
 
 設定は tmux の `@agent_talkd_log_level`（既定 `info`）と
 `@agent_talkd_queue_limit`（pane ごとの通常メッセージ上限、既定 `1000`）

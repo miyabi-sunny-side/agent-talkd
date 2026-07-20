@@ -13,7 +13,6 @@ pub struct Config {
     pub rpc_socket: PathBuf,
     pub journal: PathBuf,
     pub log: PathBuf,
-    pub maildir: PathBuf,
     pub queue_limit: usize,
     pub log_level: String,
 }
@@ -28,9 +27,6 @@ impl Config {
         let state = env::var_os("XDG_STATE_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| home().join(".local/state"));
-        let maildir = env::var_os("AGENT_TALK_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home().join(".cache/agent-talk"));
         let queue_limit = tmux_option(&tmux_socket, "@agent_talkd_queue_limit")
             .and_then(|value| value.parse().ok())
             .filter(|limit| *limit > 0)
@@ -45,7 +41,6 @@ impl Config {
                 .unwrap_or_else(|| runtime.join("agent-talkd").join(format!("{name}.sock"))),
             journal: state.join("agent-talkd").join(format!("{name}.journal")),
             log: state.join("agent-talkd").join("agent-talkd.log"),
-            maildir,
             queue_limit,
             log_level,
         })

@@ -21,6 +21,7 @@ const HELP: &str = r#"agent-talk: tmux 上の対話エージェント同士の�
   agent-talk gc
   agent-talk resolve <addr>
   agent-talk send <addr> [message]
+  agent-talk read <id>
 "#;
 
 #[tokio::main]
@@ -70,6 +71,7 @@ async fn run() -> Result<i32> {
             | "watch"
             | "resolve"
             | "send"
+            | "read"
             | "internal-pane-exited"
             | "internal-reconcile"
     );

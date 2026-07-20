@@ -17,7 +17,6 @@ pub struct PaneInfo {
     pub window_index: String,
     pub pane_index: String,
     pub agent: Option<String>,
-    pub agent_state: Option<String>,
 }
 
 #[derive(Debug)]
@@ -37,13 +36,13 @@ impl Tmux {
     }
 
     pub async fn panes(&self) -> Result<Vec<PaneInfo>> {
-        let format = "#{session_name}\t#{window_id}\t#{pane_id}\t#{pane_current_path}\t#{window_index}\t#{pane_index}\t#{@agent}\t#{@agent_state}";
+        let format = "#{session_name}\t#{window_id}\t#{pane_id}\t#{pane_current_path}\t#{window_index}\t#{pane_index}\t#{@agent}";
         let output = self.run(["list-panes", "-a", "-F", format]).await?;
         Ok(output
             .lines()
             .filter_map(|line| {
                 let fields: Vec<_> = line.split('\t').collect();
-                (fields.len() == 8).then(|| PaneInfo {
+                (fields.len() == 7).then(|| PaneInfo {
                     session: fields[0].into(),
                     window_id: fields[1].into(),
                     pane_id: fields[2].into(),
@@ -51,7 +50,6 @@ impl Tmux {
                     window_index: fields[4].into(),
                     pane_index: fields[5].into(),
                     agent: (!fields[6].is_empty()).then(|| fields[6].into()),
-                    agent_state: (!fields[7].is_empty()).then(|| fields[7].into()),
                 })
             })
             .collect())

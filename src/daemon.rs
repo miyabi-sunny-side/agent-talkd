@@ -2,14 +2,12 @@ use std::{
     env,
     ffi::OsStr,
     fs::{self, OpenOptions},
-    io::Write,
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
-    path::{Path, PathBuf},
+    path::Path,
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
@@ -24,6 +22,8 @@ use crate::{
     state::{AgentState, BrokerState, Dispatch, Message},
     tmux::{ControlEvent, PaneInfo, Tmux},
 };
+
+const MAX_BODY_BYTES: usize = 1024 * 1024;
 
 enum Event {
     Request(Request, oneshot::Sender<Response>),
@@ -182,6 +182,7 @@ impl Broker {
             "who" => self.who().await,
             "resolve" => self.resolve_command(request).await,
             "send" => self.send(request).await,
+            "read" => self.read(request),
             "gc" | "watch" => Ok(Response::ok("")),
             "internal-pane-exited" => {
                 if let Some(pane) = request.args.first() {
@@ -195,7 +196,7 @@ impl Broker {
             }
             _ => Ok(Response::error("unknown command")),
         };
-        if let Err(error) = self.journal.checkpoint_if_needed(&self.state) {
+        if let Err(error) = self.journal.checkpoint_if_needed(&mut self.state) {
             warn!(%error, "journal checkpoint failed");
         }
         match result {
@@ -223,12 +224,7 @@ impl Broker {
                 "name は英数字と - _ のみ: '{name}'"
             )));
         }
-        let displaced = self
-            .state
-            .agents
-            .get(&pane)
-            .map(|agent| agent.queue.values().cloned().collect())
-            .unwrap_or_default();
+        let displaced = self.state.messages_for_target(&pane);
         if !self
             .notify_failures(displaced, "宛先エージェントが入れ替わった", Some(&pane))
             .await
@@ -310,26 +306,51 @@ impl Broker {
             pane: pane.clone(),
             state: AgentState::Idle,
         })?;
-        let message = self.state.turn_end(&pane);
-        info!(%pane, source = "turn-end", queued = message.is_some(), "turn ended");
-        if let Some(message) = message {
+        let message_id = loop {
+            let Some(id) = self.state.turn_end(&pane) else {
+                break None;
+            };
+            if self.state.message(id).is_some() {
+                break Some(id);
+            }
+            error!(%pane, id, "queued message body missing; skipping");
+            if let Err(error) = self.journal.append(&Record::Complete {
+                pane: pane.clone(),
+                id,
+            }) {
+                return Ok(Response::error(format!(
+                    "欠損メッセージのskipをjournalへ書き込めません: {error}"
+                )));
+            }
+        };
+        info!(%pane, source = "turn-end", queued = message_id.is_some(), "turn ended");
+        if let Some(id) = message_id {
             if let Err(error) = self.journal.append(&Record::State {
                 pane: pane.clone(),
                 state: AgentState::Busy,
             }) {
-                self.state.requeue_after_delivery_failure(&pane, message);
+                self.state.requeue_after_delivery_failure(&pane, id);
                 return Ok(Response::error(format!(
                     "配達状態を journal に書き込めません: {error}"
                 )));
             }
-            if self.tmux.deliver(&pane, &message.bell).await.is_ok() {
+            let Some(stored) = self.state.message(id) else {
+                error!(%pane, id, "message body disappeared before delivery");
+                self.state.set_state(&pane, AgentState::Idle);
+                return Ok(Response::error(format!(
+                    "message #{id} の本文が見つからないため配達を中止しました"
+                )));
+            };
+            let bell = stored.message.bell.clone();
+            if self.tmux.deliver(&pane, &bell).await.is_ok() {
                 self.journal.append(&Record::Complete {
                     pane: pane.clone(),
-                    id: message.id,
+                    id,
                 })?;
-                info!(%pane, id = message.id, source = "turn-end", "delivered");
+                self.state.complete_delivery(&pane, id);
+                info!(%pane, id, source = "turn-end", "delivered");
             } else {
-                self.state.requeue_after_delivery_failure(&pane, message);
+                self.state.requeue_after_delivery_failure(&pane, id);
                 self.journal.append(&Record::State {
                     pane,
                     state: AgentState::Idle,
@@ -391,6 +412,18 @@ impl Broker {
         if body.is_empty() {
             return Ok(Response::error("本文が空です"));
         }
+        if body.len() > MAX_BODY_BYTES {
+            return Ok(Response::error(format!(
+                "本文がサイズ上限 ({} bytes) を超えています",
+                MAX_BODY_BYTES
+            )));
+        }
+        if self.state.is_busy(&pane) && self.state.queue_len(&pane) >= self.config.queue_limit {
+            return Ok(Response::error(format!(
+                "宛先 {pane} のキュー保持上限 ({}) を超えました",
+                self.config.queue_limit
+            )));
+        }
 
         let panes = self.tmux.panes().await?;
         let from_pane = request.pane.as_deref();
@@ -399,38 +432,84 @@ impl Broker {
             .map(|agent| agent.name.clone())
             .unwrap_or_else(|| "human".into());
         let from_info = from_pane.and_then(|id| panes.iter().find(|p| p.pane_id == id));
-        let brief = self.write_brief(addr, &expected, &from_agent, from_info, &body)?;
-        let bell = format!(
-            "[agent-talk] {from_agent} から依頼が届きました。{} を読んで対応してください。",
-            brief.display()
-        );
+        let brief = build_brief(addr, &from_agent, from_info, &body);
         if from_agent != "human"
             && let Some(from_pane) = from_pane
         {
             self.tmux.mark_talk_sent(from_pane).await;
         }
         let sender = from_pane.unwrap_or("human").to_owned();
-        let dispatch =
-            self.state
-                .dispatch(&pane, sender, brief.display().to_string(), bell, &expected);
+        let dispatch = self.state.dispatch(
+            &pane,
+            sender,
+            brief,
+            &expected,
+            |id| {
+                format!(
+                    "[agent-talk] {from_agent} から依頼が届きました。agent-talk read {id} で本文を確認して対応してください。"
+                )
+            },
+        );
         match dispatch {
-            Ok(Dispatch::Deliver(message)) => {
+            Ok(dispatch) => {
+                let id = match dispatch {
+                    Dispatch::Deliver(id) | Dispatch::Queued(id) => id,
+                };
+                let Some(stored) = self.state.message(id) else {
+                    error!(%pane, id, "new message body missing before persistence");
+                    if matches!(dispatch, Dispatch::Deliver(_)) {
+                        self.state.set_state(&pane, AgentState::Idle);
+                    }
+                    self.state.discard_message(id);
+                    return Ok(Response::error(format!(
+                        "message #{id} の本文が見つからないため配達を中止しました"
+                    )));
+                };
+                let message = stored.message.clone();
+                if let Err(error) = self.journal.append(&Record::Enqueue {
+                    pane: pane.clone(),
+                    message,
+                }) {
+                    if matches!(dispatch, Dispatch::Deliver(_)) {
+                        self.state.set_state(&pane, AgentState::Idle);
+                    }
+                    self.state.discard_message(id);
+                    return Ok(Response::error(format!(
+                        "本文を journal に書き込めず配達できません: {error}"
+                    )));
+                }
+                if matches!(dispatch, Dispatch::Queued(_)) {
+                    info!(%pane, id, source = "send", "queued");
+                    return Ok(Response::ok(format!(
+                        "queued (busy) -> {pane} ({addr}): #{id}\n"
+                    )));
+                }
                 if let Err(error) = self.journal.append(&Record::State {
                     pane: pane.clone(),
                     state: AgentState::Busy,
                 }) {
                     self.state.set_state(&pane, AgentState::Idle);
                     return Ok(Response::error(format!(
-                        "配達状態を書き込めず配達できません (依頼書は {} に残っています): {error}",
-                        brief.display()
+                        "配達状態を書き込めず配達できません (#{}): {error}",
+                        id
                     )));
                 }
-                if self.tmux.deliver(&pane, &message.bell).await.is_ok() {
-                    info!(%pane, id = message.id, source = "send", "delivered");
-                    Ok(Response::ok(format!(
-                        "sent -> {pane} ({addr}): {}\n",
-                        brief.display()
-                    )))
+                let Some(stored) = self.state.message(id) else {
+                    error!(%pane, id, "persisted message body missing before delivery");
+                    self.state.set_state(&pane, AgentState::Idle);
+                    return Ok(Response::error(format!(
+                        "message #{id} の本文が見つからないため配達を中止しました"
+                    )));
+                };
+                let bell = stored.message.bell.clone();
+                if self.tmux.deliver(&pane, &bell).await.is_ok() {
+                    self.journal.append(&Record::Complete {
+                        pane: pane.clone(),
+                        id,
+                    })?;
+                    self.state.complete_delivery(&pane, id);
+                    info!(%pane, id, source = "send", "delivered");
+                    Ok(Response::ok(format!("sent -> {pane} ({addr}): #{id}\n")))
                 } else {
                     let target_is_live = self
                         .tmux
@@ -439,72 +518,62 @@ impl Broker {
                         .is_ok_and(|panes| panes.iter().any(|item| item.pane_id == pane));
                     if !target_is_live {
                         self.state.set_state(&pane, AgentState::Idle);
+                        self.journal.append(&Record::Consumed { id })?;
+                        self.state.consume(id);
                         self.remove_agent(&pane, "宛先が退出した").await;
                         return Ok(Response::error(format!(
-                            "宛先 {pane} ({addr}) は退出済みです。依頼書は {} に残っています",
-                            brief.display()
+                            "宛先 {pane} ({addr}) は退出済みです (message #{id})"
                         )));
                     }
-                    let id = message.id;
-                    self.state.requeue_after_delivery_failure(&pane, message);
+                    self.state.requeue_after_delivery_failure(&pane, id);
                     if let Err(error) = self.journal.append(&Record::State {
                         pane: pane.clone(),
                         state: AgentState::Idle,
                     }) {
-                        self.state.remove_message(&pane, id);
                         return Ok(Response::error(format!(
-                            "配達状態を書き込めず配達できません (依頼書は {} に残っています): {error}",
-                            brief.display()
-                        )));
-                    }
-                    let message = self.state.agents[&pane].queue[&id].clone();
-                    if let Err(error) = self.journal.append(&Record::Enqueue {
-                        pane: pane.clone(),
-                        message,
-                    }) {
-                        self.state.remove_message(&pane, id);
-                        return Ok(Response::error(format!(
-                            "キューへ書き込めず配達できません (依頼書は {} に残っています): {error}",
-                            brief.display()
+                            "配達状態を書き込めず配達できません (message #{id}): {error}"
                         )));
                     }
                     Ok(Response::ok(format!(
-                        "queued (busy) -> {pane} ({addr}): {}\n",
-                        brief.display()
+                        "queued (busy) -> {pane} ({addr}): #{id}\n"
                     )))
                 }
             }
-            Ok(Dispatch::Queued(id)) => {
-                if self.state.agents[&pane].queue.len() > self.config.queue_limit {
-                    self.state.remove_message(&pane, id);
-                    return Ok(Response::error(format!(
-                        "宛先 {pane} のキュー保持上限 ({}) を超えました (依頼書は {} に残っています)",
-                        self.config.queue_limit,
-                        brief.display()
-                    )));
-                }
-                let message = self.state.agents[&pane].queue[&id].clone();
-                if let Err(error) = self.journal.append(&Record::Enqueue {
-                    pane: pane.clone(),
-                    message,
-                }) {
-                    self.state.remove_message(&pane, id);
-                    return Ok(Response::error(format!(
-                        "キューへ書き込めず配達できません (依頼書は {} に残っています): {error}",
-                        brief.display()
-                    )));
-                }
-                info!(%pane, id, source = "send", "queued");
-                Ok(Response::ok(format!(
-                    "queued (busy) -> {pane} ({addr}): {}\n",
-                    brief.display()
-                )))
-            }
             Err(_) => Ok(Response::error(format!(
-                "宛先 {pane} ({addr}) は退出済みです。依頼書は {} に残っています",
-                brief.display()
+                "宛先 {pane} ({addr}) は退出済みです"
             ))),
         }
+    }
+
+    fn read(&mut self, request: Request) -> Result<Response> {
+        let Some(raw_id) = request.args.first() else {
+            return Ok(Response::error("usage: agent-talk read <id>"));
+        };
+        let Ok(id) = raw_id.trim_start_matches('#').parse::<u64>() else {
+            return Ok(Response::error(format!("message id が不正です: {raw_id}")));
+        };
+        let Some(pane) = request.pane.as_deref() else {
+            return Ok(Response::error(
+                "read は登録済みのtmux pane内で実行してください",
+            ));
+        };
+        let Some(stored) = self.state.message(id) else {
+            return Ok(Response::error(format!(
+                "message #{id} は見つかりません (checkpoint 済みの可能性があります)"
+            )));
+        };
+        let current_name = self.state.agents.get(pane).map(|agent| agent.name.as_str());
+        if stored.target_pane != pane || current_name != Some(stored.message.target_name.as_str()) {
+            return Ok(Response::error(format!(
+                "message #{id} はこのpane宛ではありません"
+            )));
+        }
+        let brief = stored.message.brief.clone();
+        if !stored.consumed {
+            self.journal.append(&Record::Consumed { id })?;
+            self.state.consume(id);
+        }
+        Ok(Response::ok(brief))
     }
 
     async fn resolve(
@@ -597,70 +666,11 @@ impl Broker {
         output
     }
 
-    fn write_brief(
-        &self,
-        addr: &str,
-        expected: &str,
-        from: &str,
-        info: Option<&PaneInfo>,
-        body: &str,
-    ) -> Result<PathBuf> {
-        let maildir_exists = self.config.maildir.exists();
-        fs::create_dir_all(&self.config.maildir)?;
-        if !maildir_exists {
-            fs::set_permissions(&self.config.maildir, fs::Permissions::from_mode(0o700))?;
-        }
-        let from_file = safe_name(from, "human");
-        let to_file = safe_name(expected, "agent");
-        let now = local_timestamp()?;
-        let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.subsec_nanos();
-        for suffix in 0..1000_u16 {
-            let path = self.config.maildir.join(format!(
-                "{now}-{from_file}-to-{to_file}-{:06x}.md",
-                nonce.wrapping_add(u32::from(suffix)) & 0x00ff_ffff
-            ));
-            let mut file = match OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .mode(0o600)
-                .open(&path)
-            {
-                Ok(file) => file,
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(error.into()),
-            };
-            let origin = info
-                .map(|pane| format!(" (session: {}, pane: {})", pane.session, pane.pane_id))
-                .unwrap_or_default();
-            let reply = if from != "human" {
-                info.map_or(
-                    "不要 (人間からの依頼。結果は自分の画面に表示すれば読まれる)"
-                        .to_owned(),
-                    |pane| {
-                        format!(
-                            "agent-talk send '{}' に返信本文を stdin で渡す (pane ID 指定は曖昧にならない)",
-                            pane.pane_id
-                        )
-                    },
-                )
-            } else {
-                "不要 (人間からの依頼。結果は自分の画面に表示すれば読まれる)".to_owned()
-            };
-            write!(
-                file,
-                "# agent-talk 依頼書\n- from: {from}{origin}\n- to: {addr}\n- reply: {reply}\n\n{body}\n"
-            )?;
-            file.sync_all()?;
-            return Ok(path);
-        }
-        bail!("依頼書ファイルを作成できません")
-    }
-
     async fn remove_agent(&mut self, pane: &str, reason: &str) -> bool {
-        let Some(agent) = self.state.agents.get(pane) else {
+        if !self.state.agents.contains_key(pane) {
             return true;
-        };
-        let messages: Vec<_> = agent.queue.values().cloned().collect();
+        }
+        let messages = self.state.messages_for_target(pane);
         if !self.notify_failures(messages, reason, Some(pane)).await {
             error!(%pane, "failure notifications remain pending in journal");
             return false;
@@ -671,8 +681,8 @@ impl Broker {
             error!(%pane, %error, "cannot journal agent removal");
             return false;
         }
-        let removed = self.state.remove(pane);
-        info!(%pane, source = "pane-exited", queued = removed.len(), "removed");
+        self.state.remove(pane);
+        info!(%pane, source = "pane-exited", "removed");
         true
     }
 
@@ -684,35 +694,67 @@ impl Broker {
     ) -> bool {
         let panes = self.tmux.panes().await.unwrap_or_default();
         for original in messages {
-            if !original.sender.starts_with('%') {
-                continue;
-            }
-            if Some(original.sender.as_str()) == excluded_pane {
-                continue;
-            }
-            let Some(sender_agent) = self.state.agents.get(&original.sender) else {
-                continue;
-            };
-            let expected = sender_agent.name.clone();
-            let sender_is_current = panes.iter().any(|pane| {
-                pane.pane_id == original.sender && pane.agent.as_deref() == Some(expected.as_str())
-            });
-            if !sender_is_current {
-                continue;
-            }
-            let bell = format!(
-                "[agent-talk] 配達失敗: {} は {} ため配達されませんでした。必要なら宛先を確認して送り直してください。",
-                original.brief, reason
-            );
-            let dispatch = self.state.dispatch(
-                &original.sender,
-                "system".into(),
-                original.brief.clone(),
-                bell,
-                &expected,
-            );
-            match dispatch {
-                Ok(Dispatch::Deliver(message)) => {
+            let sender_target = original
+                .sender
+                .starts_with('%')
+                .then(|| {
+                    self.state
+                        .agents
+                        .get(&original.sender)
+                        .map(|agent| agent.name.clone())
+                })
+                .flatten()
+                .filter(|expected| {
+                    Some(original.sender.as_str()) != excluded_pane
+                        && panes.iter().any(|pane| {
+                            pane.pane_id == original.sender
+                                && pane.agent.as_deref() == Some(expected.as_str())
+                        })
+                });
+            if let Some(expected) = sender_target {
+                let failure_brief = format!(
+                    "# agent-talk 配達失敗通知\n- from: system\n- to: {expected}\n- reply: 不要\n- original: #{}\n- reason: {reason}\n\n## 元の依頼\n{}",
+                    original.id, original.brief
+                );
+                let dispatch = self.state.dispatch(
+                    &original.sender,
+                    "system".into(),
+                    failure_brief,
+                    &expected,
+                    |id| {
+                        format!(
+                            "[agent-talk] 配達失敗: message #{} は {reason}ため配達されませんでした。agent-talk read {id} で元の依頼内容を確認してください。",
+                            original.id
+                        )
+                    },
+                );
+                let Ok(dispatch) = dispatch else {
+                    return false;
+                };
+                let id = match dispatch {
+                    Dispatch::Deliver(id) | Dispatch::Queued(id) => id,
+                };
+                let Some(stored) = self.state.message(id) else {
+                    error!(id, "failure notification body missing before persistence");
+                    if matches!(dispatch, Dispatch::Deliver(_)) {
+                        self.state.set_state(&original.sender, AgentState::Idle);
+                    }
+                    self.state.discard_message(id);
+                    return false;
+                };
+                let message = stored.message.clone();
+                if let Err(error) = self.journal.append(&Record::Enqueue {
+                    pane: original.sender.clone(),
+                    message,
+                }) {
+                    if matches!(dispatch, Dispatch::Deliver(_)) {
+                        self.state.set_state(&original.sender, AgentState::Idle);
+                    }
+                    self.state.discard_message(id);
+                    error!(%error, "cannot persist failure notification");
+                    return false;
+                }
+                if matches!(dispatch, Dispatch::Deliver(_)) {
                     if let Err(error) = self.journal.append(&Record::State {
                         pane: original.sender.clone(),
                         state: AgentState::Busy,
@@ -721,47 +763,39 @@ impl Broker {
                         error!(%error, "cannot persist failure notification state");
                         return false;
                     }
-                    if self
-                        .tmux
-                        .deliver(&original.sender, &message.bell)
-                        .await
-                        .is_err()
-                    {
-                        self.state.set_state(&original.sender, AgentState::Busy);
-                        let queued = self.state.dispatch(
-                            &original.sender,
-                            message.sender,
-                            message.brief,
-                            message.bell,
-                            &expected,
-                        );
-                        let Ok(Dispatch::Queued(id)) = queued else {
-                            return false;
-                        };
-                        let message = self.state.agents[&original.sender].queue[&id].clone();
-                        if let Err(error) = self.journal.append(&Record::Enqueue {
+                    let Some(stored) = self.state.message(id) else {
+                        error!(id, "failure notification body missing before delivery");
+                        self.state.set_state(&original.sender, AgentState::Idle);
+                        return false;
+                    };
+                    let bell = stored.message.bell.clone();
+                    if self.tmux.deliver(&original.sender, &bell).await.is_ok() {
+                        if let Err(error) = self.journal.append(&Record::Complete {
                             pane: original.sender.clone(),
-                            message,
+                            id,
                         }) {
-                            self.state.remove_message(&original.sender, id);
-                            error!(%error, "cannot persist failure notification");
+                            error!(%error, "cannot complete failure notification");
+                            return false;
+                        }
+                        self.state.complete_delivery(&original.sender, id);
+                    } else {
+                        self.state
+                            .requeue_after_delivery_failure(&original.sender, id);
+                        if let Err(error) = self.journal.append(&Record::State {
+                            pane: original.sender.clone(),
+                            state: AgentState::Idle,
+                        }) {
+                            error!(%error, "cannot requeue failure notification");
                             return false;
                         }
                     }
                 }
-                Ok(Dispatch::Queued(id)) => {
-                    let message = self.state.agents[&original.sender].queue[&id].clone();
-                    if let Err(error) = self.journal.append(&Record::Enqueue {
-                        pane: original.sender.clone(),
-                        message,
-                    }) {
-                        self.state.remove_message(&original.sender, id);
-                        error!(%error, "cannot persist failure notification");
-                        return false;
-                    }
-                }
-                Err(_) => {}
             }
+            if let Err(error) = self.journal.append(&Record::Consumed { id: original.id }) {
+                error!(%error, id = original.id, "cannot consume failed message");
+                return false;
+            }
+            self.state.consume(original.id);
         }
         true
     }
@@ -794,10 +828,7 @@ impl Broker {
             let Some(name) = pane.agent.as_ref() else {
                 continue;
             };
-            let state = match pane.agent_state.as_deref() {
-                Some("busy") => AgentState::Busy,
-                _ => AgentState::Idle,
-            };
+            let state = AgentState::Idle;
             if self
                 .journal
                 .append(&Record::Register {
@@ -818,33 +849,6 @@ impl Broker {
                 );
             }
         }
-        for pane in panes {
-            let Some(agent) = self.state.agents.get(&pane.pane_id) else {
-                continue;
-            };
-            let hinted_state = match pane.agent_state.as_deref() {
-                Some("busy") => AgentState::Busy,
-                Some("idle") => AgentState::Idle,
-                _ => continue,
-            };
-            if agent.state != hinted_state
-                && self
-                    .journal
-                    .append(&Record::State {
-                        pane: pane.pane_id.clone(),
-                        state: hinted_state,
-                    })
-                    .is_ok()
-            {
-                self.state.set_state(&pane.pane_id, hinted_state);
-                info!(
-                    pane = %pane.pane_id,
-                    ?hinted_state,
-                    source = "startup-mirror",
-                    "state recovered"
-                );
-            }
-        }
     }
 }
 
@@ -860,33 +864,26 @@ fn pretty(name: &str, state: AgentState, pane: &PaneInfo) -> String {
     )
 }
 
-fn safe_name(input: &str, fallback: &str) -> String {
-    let name: String = input
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
-        .collect();
-    if name.is_empty() {
-        fallback.into()
+fn build_brief(addr: &str, from: &str, info: Option<&PaneInfo>, body: &str) -> String {
+    let origin = info
+        .map(|pane| format!(" (session: {}, pane: {})", pane.session, pane.pane_id))
+        .unwrap_or_default();
+    let reply = if from != "human" {
+        info.map_or(
+            "不要 (人間からの依頼。結果は自分の画面に表示すれば読まれる)".to_owned(),
+            |pane| {
+                format!(
+                    "agent-talk send '{}' に返信本文を stdin で渡す (pane ID 指定は曖昧にならない)",
+                    pane.pane_id
+                )
+            },
+        )
     } else {
-        name
-    }
-}
-
-fn local_timestamp() -> Result<String> {
-    let now = unsafe { libc::time(std::ptr::null_mut()) };
-    let mut local = unsafe { std::mem::zeroed::<libc::tm>() };
-    if unsafe { libc::localtime_r(&now, &mut local) }.is_null() {
-        bail!("現在時刻を取得できません");
-    }
-    Ok(format!(
-        "{:04}{:02}{:02}-{:02}{:02}{:02}",
-        local.tm_year + 1900,
-        local.tm_mon + 1,
-        local.tm_mday,
-        local.tm_hour,
-        local.tm_min,
-        local.tm_sec
-    ))
+        "不要 (人間からの依頼。結果は自分の画面に表示すれば読まれる)".to_owned()
+    };
+    format!(
+        "# agent-talk 依頼書\n- from: {from}{origin}\n- to: {addr}\n- reply: {reply}\n\n{body}\n"
+    )
 }
 
 fn init_logging(path: &Path, configured_level: &str) -> Result<()> {
