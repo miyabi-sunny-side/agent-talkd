@@ -35,6 +35,27 @@ pub struct StoredMessage {
     pub consumed: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum MailboxDirection {
+    Out,
+    In,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExternalMailboxEvent {
+    pub id: u64,
+    pub created_at: i64,
+    pub mailbox: String,
+    pub source_label: String,
+    pub direction: MailboxDirection,
+    pub body: String,
+    pub skill: Option<String>,
+    pub target_name: String,
+    pub target_pane: String,
+    pub reply_to: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Agent {
     pub name: String,
@@ -46,6 +67,7 @@ pub struct Agent {
 pub struct BrokerState {
     pub agents: HashMap<String, Agent>,
     pub messages: BTreeMap<u64, StoredMessage>,
+    pub mailboxes: BTreeMap<String, Vec<ExternalMailboxEvent>>,
     next_id: u64,
 }
 
@@ -128,6 +150,51 @@ impl BrokerState {
             },
         );
         Ok(dispatch)
+    }
+
+    pub fn allocate_id(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
+    }
+
+    pub fn set_brief(&mut self, id: u64, brief: String) {
+        if let Some(stored) = self.messages.get_mut(&id) {
+            stored.message.brief = brief;
+        }
+    }
+
+    pub fn add_mailbox_event(&mut self, event: ExternalMailboxEvent) {
+        self.next_id = self.next_id.max(event.id + 1);
+        let events = self.mailboxes.entry(event.mailbox.clone()).or_default();
+        events.push(event);
+        if events.len() > 500 {
+            let remove = events.len() - 500;
+            events.drain(..remove);
+        }
+    }
+
+    pub fn mailbox_events(
+        &self,
+        mailbox: &str,
+        after: Option<u64>,
+        limit: usize,
+    ) -> Vec<ExternalMailboxEvent> {
+        self.mailboxes
+            .get(mailbox)
+            .into_iter()
+            .flat_map(|events| events.iter())
+            .filter(|event| after.is_none_or(|id| event.id > id))
+            .take(limit)
+            .cloned()
+            .collect()
+    }
+
+    pub fn external_event(&self, id: u64) -> Option<&ExternalMailboxEvent> {
+        self.mailboxes
+            .values()
+            .flat_map(|events| events.iter())
+            .find(|event| event.id == id)
     }
 
     pub fn turn_end(&mut self, pane: &str) -> Option<u64> {
@@ -311,5 +378,29 @@ mod tests {
         let ids: Vec<_> = state.agents["%1"].queue.iter().copied().collect();
         assert_eq!(ids.len(), 1000);
         assert!(ids.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn mailbox_retention_keeps_latest_500_and_replays_ordered_events() {
+        let mut state = BrokerState::default();
+        for id in 0..501 {
+            state.add_mailbox_event(ExternalMailboxEvent {
+                id,
+                created_at: id as i64,
+                mailbox: "mobile".into(),
+                source_label: "mobile".into(),
+                direction: MailboxDirection::Out,
+                body: format!("body-{id}"),
+                skill: None,
+                target_name: "claude".into(),
+                target_pane: "%1".into(),
+                reply_to: None,
+            });
+        }
+        let events = state.mailbox_events("mobile", None, 500);
+        assert_eq!(events.len(), 500);
+        assert_eq!(events.first().unwrap().id, 1);
+        assert_eq!(events.last().unwrap().id, 500);
+        assert_eq!(state.mailbox_events("mobile", Some(499), 10)[0].id, 500);
     }
 }

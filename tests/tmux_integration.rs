@@ -231,7 +231,7 @@ fn daemon_journal_read_recovery_and_pane_exit() {
         &["read", &mobile_id.to_string()],
     ));
     assert!(mobile_brief.contains("- from: mobile (session: test, pane:"));
-    assert!(mobile_brief.contains("- reply: 不要 (人間からの依頼。"));
+    assert!(mobile_brief.contains(&format!("agent-talk reply {mobile_id}")));
     assert!(mobile_brief.contains("mobile-only-journal-body"));
     agent(
         &socket,
@@ -369,6 +369,66 @@ fn daemon_journal_read_recovery_and_pane_exit() {
         &panes[2],
         &["register", "claude"],
     );
+
+    // External mailbox events are journaled without exposing pane-to-pane traffic.
+    let external = text(agent_external(
+        &socket,
+        &runtime,
+        &state,
+        &legacy_mail,
+        &[
+            "send",
+            panes[1].as_str(),
+            "--from",
+            "mobile",
+            "external body",
+        ],
+    ));
+    assert!(external.starts_with("sent -> "));
+    let external_id = message_id(&external);
+    let external_brief = text(agent(
+        &socket,
+        &runtime,
+        &state,
+        &legacy_mail,
+        &panes[1],
+        &["read", &external_id.to_string()],
+    ));
+    assert!(external_brief.contains(&format!("agent-talk reply {external_id}")));
+    let reply = text(agent(
+        &socket,
+        &runtime,
+        &state,
+        &legacy_mail,
+        &panes[1],
+        &["reply", &external_id.to_string(), "reply body"],
+    ));
+    assert!(reply.starts_with("replied: #"));
+    let mailbox = text(agent_external(
+        &socket,
+        &runtime,
+        &state,
+        &legacy_mail,
+        &["mailbox-list-v1", "mobile"],
+    ));
+    assert!(mailbox.contains("\"version\":1"));
+    assert!(mailbox.contains("external body"));
+    assert!(mailbox.contains("reply body"));
+    let mailbox_again = text(agent_external(
+        &socket,
+        &runtime,
+        &state,
+        &legacy_mail,
+        &[
+            "mailbox-list-v1",
+            "mobile",
+            "--after",
+            &external_id.to_string(),
+            "--limit",
+            "1",
+        ],
+    ));
+    assert!(mailbox_again.contains("reply body"));
     let ambiguous = agent_raw(
         &socket,
         &runtime,
@@ -595,6 +655,27 @@ fn agent_raw(
         .env_remove("AGENT_TALK_RPC_SOCKET")
         .env("TMUX", format!("{socket},1,0"))
         .env("TMUX_PANE", pane)
+        .output()
+        .unwrap()
+}
+
+fn agent_external(
+    socket: &str,
+    runtime: &Path,
+    state: &Path,
+    legacy_mail: &Path,
+    args: &[&str],
+) -> Output {
+    let binary = env!("CARGO_BIN_EXE_agent-talk");
+    Command::new(binary)
+        .args(args)
+        .env("AGENT_TALK_TMUX_SOCKET", socket)
+        .env("XDG_RUNTIME_DIR", runtime)
+        .env("XDG_STATE_HOME", state)
+        .env("AGENT_TALK_DIR", legacy_mail)
+        .env_remove("AGENT_TALK_RPC_SOCKET")
+        .env("TMUX", format!("{socket},1,0"))
+        .env_remove("TMUX_PANE")
         .output()
         .unwrap()
 }

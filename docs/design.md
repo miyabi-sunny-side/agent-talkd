@@ -73,6 +73,21 @@ identityとは分離します。登録agentからのラベル上書きと予約�
 ただしRPCのpane情報を含め、同一ユーザーで動くクライアントからの自己申告です。
 送信元の真正性を保証する認証境界ではなく、認可や監査には使用しません。
 
+## External mailbox
+
+`send --from <label>` は通常のpane配達と同じIDを持つ `direction=out` eventを
+journalへ追加します。返信は配達先paneで `agent-talk reply <id>` を実行し、現在の
+pane IDと登録agent名が元eventと一致する場合だけ `direction=in` eventを追記します。
+返信はtmuxへ打鍵しません。paneを同名agentが再登録した場合は後継paneとして返信を
+許可する既知の挙動です。
+
+`mailbox-list-v1` は非consumeのversioned JSON APIで、ID順・`--after`排他・limit最大500、
+mailboxごとの最新500件retentionです。保存時刻はepoch秒、出力時にRFC3339へ変換します。
+`TMUX_PANE`なしは外部callerの規約であり、セキュリティ境界は同一UIDのRPC socketです。
+allowlistから外したmailboxのeventは削除せず閲覧だけ拒否します。新しいjournal variantを
+含むファイルは旧binaryへdowngrade非対応です。外部event記録後のjournal障害では、配達
+されなかった `direction=out` event が履歴に残る場合がありますが、pane配達は取り消されます。
+
 スキル名は小文字ASCII英数字と `:`、`_`、`-` に限定し、64 bytesを上限とします。
 agentごとの記法は自由文字列ではなく `slash` または `dollar` として設定し、daemonが
 固定prefixを生成します。オプション付き送信は内部 `send-v2` protocolを使用するため、

@@ -5,6 +5,7 @@ use std::{
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::Path,
     sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
@@ -19,7 +20,7 @@ use crate::{
     config::{Config, is_safe_token},
     journal::{Journal, Record},
     protocol::{Request, Response},
-    state::{AgentState, BrokerState, Dispatch, Message},
+    state::{AgentState, BrokerState, Dispatch, ExternalMailboxEvent, MailboxDirection, Message},
     tmux::{ControlEvent, PaneInfo, Tmux},
 };
 
@@ -216,6 +217,8 @@ impl Broker {
             "send-v2" if request.send_options.is_some() => self.send(request).await,
             "send-v2" => Ok(Response::error("send-v2 optionsがありません")),
             "read" => self.read(request),
+            "reply" => self.reply(request),
+            "mailbox-list-v1" => self.mailbox_list(request),
             "internal-daemon-status" => Ok(Response::ok(format!(
                 "{}\n",
                 serde_json::json!({
@@ -443,6 +446,7 @@ impl Broker {
             ));
         };
         let options = request.send_options.clone().unwrap_or_default();
+        let external_source = options.from.clone();
         if let Some(skill) = options.skill.as_deref() {
             if !is_safe_token(skill) {
                 return Ok(Response::error(format!(
@@ -533,10 +537,18 @@ impl Broker {
         let from_agent = registered_sender
             .as_ref()
             .map(|(_, name)| name.clone())
-            .or(options.from)
+            .or(options.from.clone())
             .unwrap_or_else(|| "human".into());
         let reply_info = registered_sender.as_ref().and(from_info);
-        let brief = build_brief(addr, &from_agent, from_info, reply_info, &body);
+        let brief = build_brief(
+            addr,
+            &from_agent,
+            from_info,
+            reply_info,
+            &body,
+            external_source.is_some(),
+            0,
+        );
         if let Some((from_pane, _)) = registered_sender.as_ref() {
             self.tmux.mark_talk_sent(from_pane).await;
         }
@@ -559,6 +571,12 @@ impl Broker {
                 let id = match dispatch {
                     Dispatch::Deliver(id) | Dispatch::Queued(id) => id,
                 };
+                if external_source.is_some() {
+                    self.state.set_brief(
+                        id,
+                        build_brief(addr, &from_agent, from_info, reply_info, &body, true, id),
+                    );
+                }
                 let Some(stored) = self.state.message(id) else {
                     error!(%pane, id, "new message body missing before persistence");
                     if matches!(dispatch, Dispatch::Deliver(_)) {
@@ -570,6 +588,38 @@ impl Broker {
                     )));
                 };
                 let message = stored.message.clone();
+                let external_created_at = now_epoch();
+                let external_event =
+                    external_source
+                        .as_deref()
+                        .map(|source_label| ExternalMailboxEvent {
+                            id,
+                            created_at: external_created_at,
+                            mailbox: source_label.to_owned(),
+                            source_label: source_label.to_owned(),
+                            direction: MailboxDirection::Out,
+                            body: body.clone(),
+                            skill: options.skill.clone(),
+                            target_name: expected.clone(),
+                            target_pane: pane.clone(),
+                            reply_to: None,
+                        });
+                if let Some(event) = external_event.as_ref()
+                    && let Err(error) = self.journal.append(&Record::ExternalMailbox {
+                        event: event.clone(),
+                    })
+                {
+                    if matches!(dispatch, Dispatch::Deliver(_)) {
+                        self.state.set_state(&pane, AgentState::Idle);
+                    }
+                    self.state.discard_message(id);
+                    return Ok(Response::error(format!(
+                        "mailbox journal に書き込めず配達を続行できません: {error}"
+                    )));
+                }
+                if let Some(event) = external_event {
+                    self.state.add_mailbox_event(event);
+                }
                 if let Err(error) = self.journal.append(&Record::Enqueue {
                     pane: pane.clone(),
                     message,
@@ -678,6 +728,136 @@ impl Broker {
             self.state.consume(id);
         }
         Ok(Response::ok(brief))
+    }
+
+    fn reply(&mut self, request: Request) -> Result<Response> {
+        let Some(raw_id) = request.args.first() else {
+            return Ok(Response::error(
+                "usage: agent-talk reply <original-id> [body]",
+            ));
+        };
+        let Ok(original_id) = raw_id.trim_start_matches('#').parse::<u64>() else {
+            return Ok(Response::error(format!("message id が不正です: {raw_id}")));
+        };
+        let Some(pane) = request.pane.as_deref() else {
+            return Ok(Response::error(
+                "reply は登録済みのtmux pane内で実行してください",
+            ));
+        };
+        let Some(original) = self.state.external_event(original_id).cloned() else {
+            return Ok(Response::error(format!(
+                "external message #{original_id} が見つかりません"
+            )));
+        };
+        if original.direction != MailboxDirection::Out {
+            return Ok(Response::error("reply 対象は外部発のmessageのみです"));
+        }
+        let Some(agent_name) = self.state.agents.get(pane).map(|agent| agent.name.clone()) else {
+            return Ok(Response::error("reply 元paneが登録されていません"));
+        };
+        if original.target_pane != pane || original.target_name != agent_name {
+            return Ok(Response::error("このpaneはreply対象のagentではありません"));
+        }
+        let body = if request.args.len() > 1 {
+            request.args[1..].join(" ")
+        } else {
+            request.stdin
+        };
+        if body.is_empty() {
+            return Ok(Response::error("本文が空です"));
+        }
+        if body.len() > MAX_BODY_BYTES {
+            return Ok(Response::error(format!(
+                "本文がサイズ上限 ({} bytes) を超えています",
+                MAX_BODY_BYTES
+            )));
+        }
+        let id = self.state.allocate_id();
+        let event = ExternalMailboxEvent {
+            id,
+            created_at: now_epoch(),
+            mailbox: original.mailbox.clone(),
+            source_label: agent_name,
+            direction: MailboxDirection::In,
+            body,
+            skill: original.skill.clone(),
+            target_name: original.target_name,
+            target_pane: original.target_pane,
+            reply_to: Some(original_id),
+        };
+        self.journal.append(&Record::ExternalMailbox {
+            event: event.clone(),
+        })?;
+        self.state.add_mailbox_event(event);
+        Ok(Response::ok(format!("replied: #{id}\n")))
+    }
+
+    fn mailbox_list(&self, request: Request) -> Result<Response> {
+        if request.pane.is_some() {
+            return Ok(Response::error(
+                "mailbox-list-v1 は外部caller (TMUX_PANEなし) 専用です",
+            ));
+        }
+        let Some(mailbox) = request.args.first() else {
+            return Ok(Response::error(
+                "usage: agent-talk mailbox-list-v1 <mailbox> [--after <id>] [--limit <n>]",
+            ));
+        };
+        if !is_safe_token(mailbox) || !self.config.allowed_sources.contains(mailbox) {
+            return Ok(Response::error("mailbox が許可されていません"));
+        }
+        let mut after = None;
+        let mut limit = 100usize;
+        let mut seen_after = false;
+        let mut seen_limit = false;
+        let mut index = 1;
+        while index < request.args.len() {
+            let option = request.args[index].as_str();
+            let Some(value) = request.args.get(index + 1) else {
+                return Ok(Response::error(format!("{option} には値が必要です")));
+            };
+            match option {
+                "--after" => {
+                    if seen_after {
+                        return Ok(Response::error("--after は複数指定できません"));
+                    }
+                    seen_after = true;
+                    after = Some(
+                        value
+                            .parse::<u64>()
+                            .map_err(|_| anyhow::anyhow!("after id が不正です: {value}"))?,
+                    );
+                }
+                "--limit" => {
+                    if seen_limit {
+                        return Ok(Response::error("--limit は複数指定できません"));
+                    }
+                    seen_limit = true;
+                    limit = value
+                        .parse::<usize>()
+                        .map_err(|_| anyhow::anyhow!("limit が不正です: {value}"))?;
+                    if limit == 0 || limit > 500 {
+                        return Ok(Response::error("limit は1から500の範囲です"));
+                    }
+                }
+                _ => {
+                    return Ok(Response::error(format!(
+                        "不明なmailbox-listオプションです: {option}"
+                    )));
+                }
+            }
+            index += 2;
+        }
+        let events = self
+            .state
+            .mailbox_events(mailbox, after, limit)
+            .into_iter()
+            .map(ExternalMailboxView::from)
+            .collect::<Vec<_>>();
+        Ok(Response::ok(format!(
+            "{}\n",
+            serde_json::json!({"version": 1, "mailbox": mailbox, "events": events})
+        )))
     }
 
     async fn resolve(
@@ -968,25 +1148,93 @@ fn pretty(name: &str, state: AgentState, pane: &PaneInfo) -> String {
     )
 }
 
+#[derive(Debug, serde::Serialize)]
+struct ExternalMailboxView {
+    id: u64,
+    created_at: String,
+    mailbox: String,
+    source_label: String,
+    direction: MailboxDirection,
+    body: String,
+    skill: Option<String>,
+    target_name: String,
+    target_pane: String,
+    reply_to: Option<u64>,
+}
+
+impl From<ExternalMailboxEvent> for ExternalMailboxView {
+    fn from(event: ExternalMailboxEvent) -> Self {
+        Self {
+            id: event.id,
+            created_at: rfc3339(event.created_at),
+            mailbox: event.mailbox,
+            source_label: event.source_label,
+            direction: event.direction,
+            body: event.body,
+            skill: event.skill,
+            target_name: event.target_name,
+            target_pane: event.target_pane,
+            reply_to: event.reply_to,
+        }
+    }
+}
+
+fn now_epoch() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs() as i64)
+}
+
+fn rfc3339(epoch: i64) -> String {
+    let days = epoch.div_euclid(86_400);
+    let seconds = epoch.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        seconds / 3600,
+        (seconds % 3600) / 60,
+        seconds % 60
+    )
+}
+
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    (year + i64::from(month <= 2), month, day)
+}
+
 fn build_brief(
     addr: &str,
     from: &str,
     origin_info: Option<&PaneInfo>,
     reply_info: Option<&PaneInfo>,
     body: &str,
+    external: bool,
+    id: u64,
 ) -> String {
     let origin = origin_info
         .map(|pane| format!(" (session: {}, pane: {})", pane.session, pane.pane_id))
         .unwrap_or_default();
-    let reply = reply_info.map_or_else(
-        || "不要 (人間からの依頼。結果は自分の画面に表示すれば読まれる)".to_owned(),
-        |pane| {
-            format!(
-                "agent-talk send '{}' に返信本文を stdin で渡す (pane ID 指定は曖昧にならない)",
-                pane.pane_id
-            )
-        },
-    );
+    let reply = if external {
+        format!("agent-talk reply {id} に本文を渡す (このmessageへの返信)")
+    } else {
+        reply_info.map_or_else(
+            || "不要 (人間からの依頼。結果は自分の画面に表示すれば読まれる)".to_owned(),
+            |pane| {
+                format!(
+                    "agent-talk send '{}' に返信本文を stdin で渡す (pane ID 指定は曖昧にならない)",
+                    pane.pane_id
+                )
+            },
+        )
+    };
     format!(
         "# agent-talk 依頼書\n- from: {from}{origin}\n- to: {addr}\n- reply: {reply}\n\n{body}\n"
     )
@@ -1016,4 +1264,15 @@ fn init_logging(path: &Path, configured_level: &str) -> Result<()> {
         .try_init()
         .ok();
     Ok(())
+}
+
+#[cfg(test)]
+mod mailbox_tests {
+    use super::rfc3339;
+
+    #[test]
+    fn epoch_is_rendered_as_stable_utc_rfc3339() {
+        assert_eq!(rfc3339(0), "1970-01-01T00:00:00Z");
+        assert_eq!(rfc3339(86_401), "1970-01-02T00:00:01Z");
+    }
 }

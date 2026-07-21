@@ -21,7 +21,7 @@ pub async fn run(config: Config, mut command: String, args: Vec<String>) -> Resu
         command = "send-v2".into();
     }
     let mut stdin = String::new();
-    if matches!(command.as_str(), "send" | "send-v2") && args.len() <= 1 {
+    if matches!(command.as_str(), "send" | "send-v2" | "reply") && args.len() <= 1 {
         io::stdin().read_to_string(&mut stdin)?;
         while stdin.ends_with('\n') {
             stdin.pop();

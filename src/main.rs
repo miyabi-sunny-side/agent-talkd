@@ -19,6 +19,8 @@ const HELP: &str = r#"agent-talk: tmux 上の対話エージェント同士の�
   agent-talk update
   agent-talk ensure-daemon
   agent-talk daemon-status
+  agent-talk reply <original-id> [body]
+  agent-talk mailbox-list-v1 <mailbox> [--after <id>] [--limit <n>]
   agent-talk register <name>
   agent-talk unregister
   agent-talk busy | idle
@@ -104,6 +106,8 @@ async fn run() -> Result<i32> {
             | "resolve"
             | "send"
             | "read"
+            | "reply"
+            | "mailbox-list-v1"
             | "internal-daemon-status"
             | "internal-daemon-shutdown"
             | "internal-pane-exited"

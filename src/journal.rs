@@ -8,7 +8,7 @@ use std::{
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::state::{AgentState, BrokerState, Message};
+use crate::state::{AgentState, BrokerState, ExternalMailboxEvent, Message};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -38,6 +38,9 @@ pub enum Record {
     },
     Sequence {
         next_id: u64,
+    },
+    ExternalMailbox {
+        event: ExternalMailboxEvent,
     },
 }
 
@@ -174,6 +177,17 @@ impl Journal {
                 count += 1;
             }
         }
+        for events in state.mailboxes.values() {
+            for event in events {
+                write_record(
+                    &mut output,
+                    &Record::ExternalMailbox {
+                        event: event.clone(),
+                    },
+                )?;
+                count += 1;
+            }
+        }
         output.sync_all()?;
         fs::rename(&tmp, &self.path)?;
         sync_parent(&self.path)?;
@@ -216,6 +230,7 @@ fn replay(state: &mut BrokerState, record: Record) {
         Record::Complete { pane, id } => state.restore_complete(&pane, id),
         Record::Consumed { id } => state.consume(id),
         Record::Sequence { next_id } => state.restore_next_id(next_id),
+        Record::ExternalMailbox { event } => state.add_mailbox_event(event),
     }
 }
 

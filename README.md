@@ -72,6 +72,22 @@ set -g @plugin 'miyabi-sunny-side/agent-talkd'
 サーバー単位で自動起動し、既存デーモンの版が古ければ安全に交代します。
 インストール済みのversionは `agent-talk --version` で確認できます。
 
+外部連携は `--from` で許可された mailbox に送信し、`mailbox-list-v1` で
+read-only に取得できます。返信は agent pane 内で `agent-talk reply <id> 本文`
+を実行します。mailbox event は consume されず、各 mailbox の最新500件を保持します。
+`TMUX_PANE` なしは外部callerの誤用防止規約であり、実際のRPC境界は同一UIDのUnix
+socketです。
+
+`mailbox-list-v1` の安定JSON schema:
+
+```json
+{"version":1,"mailbox":"mobile","events":[{"id":12,"created_at":"2026-07-21T11:00:00Z","mailbox":"mobile","source_label":"mobile","direction":"out","body":"依頼","skill":"deliver","target_name":"claude","target_pane":"%1","reply_to":null}]}
+```
+
+`--after` は排他的ID、`--limit` は1〜500です。allowlistから外したmailboxの既存eventは
+保持されますが閲覧できず、再許可すると再び取得できます。旧daemonは新しい
+`reply`/`mailbox-list-v1` commandを未知commandとして失敗させ、別commandへ降格しません。
+
 `agent-talk update` は Linux x86_64 / macOS Apple Silicon の公開GitHub
 Releaseだけを対象に、タグ固定assetとSHA-256を検証して更新します。ローカル版が
 latest以上の場合はdowngradeせず、デーモンの版確認だけを行います。tmux serverが
