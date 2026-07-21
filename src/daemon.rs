@@ -26,7 +26,11 @@ use crate::{
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 
 enum Event {
-    Request(Request, oneshot::Sender<Response>),
+    Request {
+        request: Request,
+        reply: oneshot::Sender<Response>,
+        flushed: oneshot::Receiver<()>,
+    },
     PaneExited(String),
     ControlDisconnected,
     ServerCheck,
@@ -90,11 +94,22 @@ pub async fn run(config: Config) -> Result<()> {
     info!(source = "daemon", "started");
 
     let mut control_lost = false;
+    let mut shutdown_requested = false;
     while let Some(event) = rx.recv().await {
         match event {
-            Event::Request(request, reply) => {
+            Event::Request {
+                request,
+                reply,
+                flushed,
+            } => {
+                let shutdown = request.command == "internal-daemon-shutdown";
                 let response = broker.handle(request).await;
                 let _ = reply.send(response);
+                if shutdown {
+                    shutdown_requested = true;
+                    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), flushed).await;
+                    break;
+                }
             }
             Event::PaneExited(pane) => {
                 broker.remove_agent(&pane, "宛先が退出した").await;
@@ -118,10 +133,14 @@ pub async fn run(config: Config) -> Result<()> {
         }
     }
 
-    info!(
-        source = "tmux-control",
-        "stopping after control-mode disconnect"
-    );
+    if shutdown_requested {
+        info!(source = "lifecycle", "stopping after shutdown request");
+    } else {
+        info!(
+            source = "tmux-control",
+            "stopping after control-mode disconnect"
+        );
+    }
     tmux.remove_pane_exit_hook().await;
     let _ = control.kill().await;
     let _ = fs::remove_file(&broker.config.rpc_socket);
@@ -150,11 +169,20 @@ async fn serve_client(stream: UnixStream, tx: mpsc::Sender<Event>) -> Result<()>
     BufReader::new(reader).read_line(&mut line).await?;
     let request: Request = serde_json::from_str(&line)?;
     let (reply_tx, reply_rx) = oneshot::channel();
-    tx.send(Event::Request(request, reply_tx)).await?;
+    let (flushed_tx, flushed_rx) = oneshot::channel();
+    tx.send(Event::Request {
+        request,
+        reply: reply_tx,
+        flushed: flushed_rx,
+    })
+    .await?;
     let response = reply_rx.await?;
     let encoded = serde_json::to_vec(&response)?;
     writer.write_all(&encoded).await?;
     writer.write_all(b"\n").await?;
+    writer.flush().await?;
+    writer.shutdown().await?;
+    let _ = flushed_tx.send(());
     Ok(())
 }
 
@@ -188,6 +216,15 @@ impl Broker {
             "send-v2" if request.send_options.is_some() => self.send(request).await,
             "send-v2" => Ok(Response::error("send-v2 optionsがありません")),
             "read" => self.read(request),
+            "internal-daemon-status" => Ok(Response::ok(format!(
+                "{}\n",
+                serde_json::json!({
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "pid": std::process::id(),
+                    "ready": true,
+                })
+            ))),
+            "internal-daemon-shutdown" => Ok(Response::ok("")),
             "gc" | "watch" => Ok(Response::ok("")),
             "internal-pane-exited" => {
                 if let Some(pane) = request.args.first() {

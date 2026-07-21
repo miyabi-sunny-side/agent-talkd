@@ -9,6 +9,18 @@ agent-talkd は、tmux 上の対話エージェントへ作業中の入力を割
   queueを単一イベントループで所有します。
 - `agent-talk` の各CLIコマンドは、tmux socket名ごとのUnix domain socketを
   通じてdaemonへ1要求を送ります。daemonがなければ競合を避けて自動起動します。
+- `ensure-daemon` は同じtmux socketだけを対象に、実行中daemonの版を確認します。
+  同版なら何もせず、旧版は graceful shutdown を先に試し、旧RPCしかない場合だけ
+  Unix socket peer の UID/PID に限定して停止します。複数tmux serverを探索したり、
+  名前による全体 kill を行ったりしません。
+- `internal-daemon-status` と `internal-daemon-shutdown` は lifecycle 管理用のRPCです。
+  同じUIDのsocket利用者だけが呼べる既存のinternal RPCと同じ境界で、通常の利用者向け
+  コマンドではありません。
+- `update` は GitHub の公開 latest release をタグ固定で取得し、公開SHA-256の検証と
+  安全なtar展開を完了するまで現行実体を変更しません。同一ディレクトリでfsync済みの
+  stagingをatomic renameし、置換後の新binary自身で `ensure-daemon` を実行します。
+  GitHubへのHTTPSと同一チャネルのchecksumが供給チェーンの境界であり、checksumは
+  破損・部分ダウンロード検出を担います。
 - tmux control mode接続はtmuxサーバーの終了検知に使います。pane消滅はtmuxの
   通知だけでは全sessionを網羅できないため、global hookをwake-upとして
   tmuxの状態確定を短時間待ってからlive pane一覧と照合します。control mode
@@ -72,3 +84,7 @@ agentごとの記法は自由文字列ではなく `slash` または `dollar` �
 変えない限り完全には閉じられません。この区間の配送はbest-effortです。
 通信範囲は同一ホストのtmuxサーバー内に限定し、ネットワーク越しの配送と
 Windowsは対象外です。
+
+旧RPCにはquiesce機能がないため、旧daemonの交代直前に配達記録が進行中だった場合、
+ 新daemonがjournal上の同じ未読IDを再配達する可能性があります。journalの各記録は
+ fsync済みで、影響は呼び鈴が一時的に二重になる境界に限定されます。

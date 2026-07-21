@@ -40,7 +40,14 @@ pub struct Config {
 
 impl Config {
     pub fn discover() -> Result<Self> {
-        let tmux_socket = discover_tmux_socket()?;
+        Self::discover_optional()?
+            .context("tmux サーバーに接続できません (sandbox 内なら承認付きで再実行)")
+    }
+
+    pub fn discover_optional() -> Result<Option<Self>> {
+        let Some(tmux_socket) = discover_tmux_socket()? else {
+            return Ok(None);
+        };
         let name = socket_name(&tmux_socket);
         let runtime = env::var_os("XDG_RUNTIME_DIR")
             .map(PathBuf::from)
@@ -66,7 +73,7 @@ impl Config {
             .map(|value| parse_token_set("@agent_talkd_allowed_sources", &value))
             .transpose()?
             .unwrap_or_else(|| BTreeSet::from(["mobile".into()]));
-        Ok(Self {
+        Ok(Some(Self {
             tmux_socket,
             rpc_socket: env::var_os("AGENT_TALK_RPC_SOCKET")
                 .map(PathBuf::from)
@@ -78,7 +85,7 @@ impl Config {
             skill_syntax,
             allowed_skills,
             allowed_sources,
-        })
+        }))
     }
 }
 
@@ -149,28 +156,30 @@ fn home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/tmp"))
 }
 
-fn discover_tmux_socket() -> Result<String> {
+fn discover_tmux_socket() -> Result<Option<String>> {
     if let Some(value) = env::var_os("AGENT_TALK_TMUX_SOCKET") {
-        return Ok(value.to_string_lossy().into_owned());
+        return Ok(Some(value.to_string_lossy().into_owned()));
     }
     if let Ok(tmux) = env::var("TMUX")
         && let Some(socket) = tmux.split(',').next()
         && !socket.is_empty()
     {
-        return Ok(socket.to_owned());
+        return Ok(Some(socket.to_owned()));
     }
     let output = std::process::Command::new("tmux")
         .args(["display-message", "-p", "#{socket_path}"])
-        .output()
-        .context("cannot locate tmux server")?;
+        .output();
+    let Ok(output) = output else {
+        return Ok(None);
+    };
     if !output.status.success() {
-        bail!("tmux サーバーに接続できません (sandbox 内なら承認付きで再実行)");
+        return Ok(None);
     }
     let socket = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     if socket.is_empty() || Path::new(&socket).file_name().is_none() {
         bail!("tmux socket path is empty");
     }
-    Ok(socket)
+    Ok(Some(socket))
 }
 
 #[cfg(test)]

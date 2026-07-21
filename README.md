@@ -67,9 +67,15 @@ set -g @plugin 'miyabi-sunny-side/agent-talkd'
 ## CLI
 
 `register`, `unregister`, `busy`, `idle`, `turn-end`, `who`, `resolve`,
-`send`, `read` を提供します。互換用の `gc`, `watch` は no-op です。
-デーモンが未起動なら CLI が tmux サーバー単位で自動起動します。
+`send`, `read`, `update`, `ensure-daemon`, `daemon-status` を提供します。
+互換用の `gc`, `watch` は no-op です。デーモンが未起動なら CLI が tmux
+サーバー単位で自動起動し、既存デーモンの版が古ければ安全に交代します。
 インストール済みのversionは `agent-talk --version` で確認できます。
+
+`agent-talk update` は Linux x86_64 / macOS Apple Silicon の公開GitHub
+Releaseだけを対象に、タグ固定assetとSHA-256を検証して更新します。ローカル版が
+latest以上の場合はdowngradeせず、デーモンの版確認だけを行います。tmux serverが
+無い環境ではCLI更新を完了し、daemonは `not applicable` と表示します。
 
 `send` は `#<id>` を返し、受信側は呼び鈴に表示された
 `agent-talk read <id>` で依頼本文を取得します。`read` はcheckpointまでは

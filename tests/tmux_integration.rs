@@ -116,6 +116,24 @@ fn daemon_journal_read_recovery_and_pane_exit() {
         &["who"],
     ));
     assert!(startup.contains("claude     idle"));
+    let ensured = text(agent(
+        &socket,
+        &runtime,
+        &state,
+        &legacy_mail,
+        &panes[2],
+        &["ensure-daemon"],
+    ));
+    assert!(ensured.contains(&format!("daemon {} ready", env!("CARGO_PKG_VERSION"))));
+    let status = text(agent(
+        &socket,
+        &runtime,
+        &state,
+        &legacy_mail,
+        &panes[2],
+        &["daemon-status"],
+    ));
+    assert!(status.contains("\"ready\":true"));
     agent(
         &socket,
         &runtime,
@@ -373,7 +391,7 @@ fn daemon_journal_read_recovery_and_pane_exit() {
         &["unregister"],
     );
 
-    // Queued content survives SIGKILL and can be read after restart.
+    // Queued content survives a graceful daemon restart and can be read after restart.
     agent(
         &socket,
         &runtime,
@@ -408,7 +426,14 @@ fn daemon_journal_read_recovery_and_pane_exit() {
             .contains("first durable body")
     );
 
-    kill_daemon(&rpc);
+    agent(
+        &socket,
+        &runtime,
+        &state,
+        &legacy_mail,
+        &panes[0],
+        &["internal-daemon-shutdown"],
+    );
     thread::sleep(Duration::from_millis(200));
     let recovered = text(agent(
         &socket,
@@ -511,19 +536,6 @@ fn daemon_journal_read_recovery_and_pane_exit() {
     assert!(failure_brief.contains("# agent-talk 配達失敗通知"));
     assert!(failure_brief.contains(&format!("- original: #{second_id}")));
     assert!(failure_brief.contains("second unread body"));
-}
-
-fn kill_daemon(rpc: &Path) {
-    let owner = Command::new("fuser").arg(rpc).output().unwrap();
-    assert!(owner.status.success(), "fuser could not find daemon");
-    let daemon_pid: i32 = String::from_utf8(owner.stdout)
-        .unwrap()
-        .split_whitespace()
-        .next()
-        .unwrap()
-        .parse()
-        .unwrap();
-    assert_eq!(unsafe { libc::kill(daemon_pid, libc::SIGKILL) }, 0);
 }
 
 fn message_id(output: &str) -> u64 {

@@ -2,9 +2,11 @@ mod client;
 mod config;
 mod daemon;
 mod journal;
+mod lifecycle;
 mod protocol;
 mod state;
 mod tmux;
+mod update;
 
 use std::{env, process::ExitCode};
 
@@ -14,6 +16,9 @@ use config::Config;
 const HELP: &str = r#"agent-talk: tmux 上の対話エージェント同士の連絡係。
 
   agent-talk --version
+  agent-talk update
+  agent-talk ensure-daemon
+  agent-talk daemon-status
   agent-talk register <name>
   agent-talk unregister
   agent-talk busy | idle
@@ -48,6 +53,28 @@ async fn run() -> Result<i32> {
     }
     let args: Vec<_> = args.collect();
 
+    if command == "update" {
+        if !args.is_empty() {
+            eprint!("{HELP}");
+            return Ok(1);
+        }
+        return update::run().await;
+    }
+    if command == "ensure-daemon" {
+        if !args.is_empty() {
+            eprint!("{HELP}");
+            return Ok(1);
+        }
+        return lifecycle::run_ensure_command().await;
+    }
+    if command == "daemon-status" {
+        if !args.is_empty() {
+            eprint!("{HELP}");
+            return Ok(1);
+        }
+        return lifecycle::run_status_command().await;
+    }
+
     if matches!(
         command.as_str(),
         "register" | "unregister" | "busy" | "idle" | "turn-end"
@@ -77,6 +104,8 @@ async fn run() -> Result<i32> {
             | "resolve"
             | "send"
             | "read"
+            | "internal-daemon-status"
+            | "internal-daemon-shutdown"
             | "internal-pane-exited"
             | "internal-reconcile"
     );

@@ -11,7 +11,7 @@ else
 fi
 
 AGENT_TALK_TMUX_SOCKET="$(tmux display-message -p '#{socket_path}')" \
-  "$agent_talk" who >/dev/null 2>&1 || {
+  "$agent_talk" ensure-daemon >/dev/null 2>&1 || {
   tmux display-message "agent-talkd: デーモンを起動できません。ログを確認してください"
   exit 1
 }
