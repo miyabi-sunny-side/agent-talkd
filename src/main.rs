@@ -13,6 +13,7 @@ use config::Config;
 
 const HELP: &str = r#"agent-talk: tmux 上の対話エージェント同士の連絡係。
 
+  agent-talk --version
   agent-talk register <name>
   agent-talk unregister
   agent-talk busy | idle
@@ -41,6 +42,10 @@ async fn run() -> Result<i32> {
         eprint!("{HELP}");
         return Ok(1);
     };
+    if command == "--version" {
+        println!("agent-talk {}", env!("CARGO_PKG_VERSION"));
+        return Ok(0);
+    }
     let args: Vec<_> = args.collect();
 
     if matches!(

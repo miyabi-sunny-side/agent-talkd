@@ -69,6 +69,7 @@ set -g @plugin 'miyabi-sunny-side/agent-talkd'
 `register`, `unregister`, `busy`, `idle`, `turn-end`, `who`, `resolve`,
 `send`, `read` を提供します。互換用の `gc`, `watch` は no-op です。
 デーモンが未起動なら CLI が tmux サーバー単位で自動起動します。
+インストール済みのversionは `agent-talk --version` で確認できます。
 
 `send` は `#<id>` を返し、受信側は呼び鈴に表示された
 `agent-talk read <id>` で依頼本文を取得します。`read` はcheckpointまでは
