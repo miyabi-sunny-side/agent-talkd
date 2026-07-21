@@ -55,6 +55,24 @@ fn daemon_journal_read_recovery_and_pane_exit() {
         &name,
         &["set-option", "-g", "@agent_talkd_queue_limit", "1"],
     );
+    tmux(
+        &name,
+        &[
+            "set-option",
+            "-g",
+            "@agent_talkd_allowed_skills",
+            "deliver,commit",
+        ],
+    );
+    tmux(
+        &name,
+        &[
+            "set-option",
+            "-g",
+            "@agent_talkd_allowed_sources",
+            "mobile,human,system,claude",
+        ],
+    );
     let panes: Vec<_> = text(tmux(
         &name,
         &["list-panes", "-t", "test:agents", "-F", "#{pane_id}"],
@@ -162,6 +180,144 @@ fn daemon_journal_read_recovery_and_pane_exit() {
         &panes[1],
         &["turn-end"],
     );
+
+    // External source labels and runtime-specific skill prefixes are fixed by the daemon.
+    let mobile_send = text(agent(
+        &socket,
+        &runtime,
+        &state,
+        &legacy_mail,
+        &panes[2],
+        &[
+            "send",
+            "claude",
+            "--from",
+            "mobile",
+            "--skill",
+            "deliver",
+            "mobile-only-journal-body",
+        ],
+    ));
+    let mobile_id = message_id(&mobile_send);
+    let claude_screen = text(tmux(&name, &["capture-pane", "-p", "-t", &panes[1]]));
+    assert!(claude_screen.contains(&format!(
+        "/deliver [agent-talk] mobile から依頼が届きました。agent-talk read {mobile_id}"
+    )));
+    assert!(!claude_screen.contains("mobile-only-journal-body"));
+    let mobile_brief = text(agent(
+        &socket,
+        &runtime,
+        &state,
+        &legacy_mail,
+        &panes[1],
+        &["read", &mobile_id.to_string()],
+    ));
+    assert!(mobile_brief.contains("- from: mobile (session: test, pane:"));
+    assert!(mobile_brief.contains("- reply: 不要 (人間からの依頼。"));
+    assert!(mobile_brief.contains("mobile-only-journal-body"));
+    agent(
+        &socket,
+        &runtime,
+        &state,
+        &legacy_mail,
+        &panes[1],
+        &["turn-end"],
+    );
+
+    let codex_skill = text(agent(
+        &socket,
+        &runtime,
+        &state,
+        &legacy_mail,
+        &panes[2],
+        &["send", "codex", "--skill", "deliver", "codex skill body"],
+    ));
+    let codex_skill_id = message_id(&codex_skill);
+    let codex_screen = text(tmux(&name, &["capture-pane", "-p", "-t", &panes[0]]));
+    assert!(codex_screen.contains(&format!(
+        "$deliver [agent-talk] human から依頼が届きました。agent-talk read {codex_skill_id}"
+    )));
+    assert!(!codex_screen.contains("codex skill body"));
+    agent(
+        &socket,
+        &runtime,
+        &state,
+        &legacy_mail,
+        &panes[0],
+        &["read", &codex_skill_id.to_string()],
+    );
+    agent(
+        &socket,
+        &runtime,
+        &state,
+        &legacy_mail,
+        &panes[0],
+        &["turn-end"],
+    );
+
+    for (pane, args, expected) in [
+        (
+            panes[0].as_str(),
+            vec!["send", "claude", "--from", "mobile", "body"],
+            "登録agent paneから --from を上書きできません",
+        ),
+        (
+            panes[2].as_str(),
+            vec!["send", "claude", "--from", "system", "body"],
+            "予約済み",
+        ),
+        (
+            panes[2].as_str(),
+            vec!["send", "claude", "--from", "claude", "body"],
+            "予約済み",
+        ),
+        (
+            panes[2].as_str(),
+            vec!["send", "claude", "--skill", "Deliver", "body"],
+            "skill名は64文字以内",
+        ),
+        (
+            panes[2].as_str(),
+            vec!["send", "claude", "--skill", "danger", "body"],
+            "許可されていません",
+        ),
+    ] {
+        let rejected = agent_raw(&socket, &runtime, &state, &legacy_mail, pane, &args);
+        assert!(!rejected.status.success(), "{args:?}");
+        assert!(
+            String::from_utf8_lossy(&rejected.stderr).contains(expected),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&rejected.stderr)
+        );
+    }
+
+    agent(
+        &socket,
+        &runtime,
+        &state,
+        &legacy_mail,
+        &panes[2],
+        &["register", "cursor"],
+    );
+    let unmapped = agent_raw(
+        &socket,
+        &runtime,
+        &state,
+        &legacy_mail,
+        &panes[0],
+        &["send", "cursor", "--skill", "deliver", "body"],
+    );
+    assert!(!unmapped.status.success());
+    assert!(String::from_utf8_lossy(&unmapped.stderr).contains("skill記法"));
+    agent(
+        &socket,
+        &runtime,
+        &state,
+        &legacy_mail,
+        &panes[2],
+        &["unregister"],
+    );
+
     let oversized = agent_raw_stdin(
         &socket,
         &runtime,
@@ -232,7 +388,7 @@ fn daemon_journal_read_recovery_and_pane_exit() {
         &state,
         &legacy_mail,
         &panes[0],
-        &["send", "claude", "first durable body"],
+        &["send", "claude", "--skill", "deliver", "first durable body"],
     ));
     assert!(queued.starts_with("queued (busy) -> "));
     let queued_id = message_id(&queued);
@@ -289,6 +445,11 @@ fn daemon_journal_read_recovery_and_pane_exit() {
         &panes[1],
         &["turn-end"],
     );
+    let recovered_screen = text(tmux(&name, &["capture-pane", "-p", "-t", &panes[1]]));
+    assert!(recovered_screen.contains(&format!(
+        "/deliver [agent-talk] codex から依頼が届きました。agent-talk read {queued_id}"
+    )));
+    assert!(!recovered_screen.contains("first durable body"));
 
     // An unread message to an exited pane becomes a readable failure notice.
     agent(
@@ -419,6 +580,7 @@ fn agent_raw(
         .env("XDG_RUNTIME_DIR", runtime)
         .env("XDG_STATE_HOME", state)
         .env("AGENT_TALK_DIR", legacy_mail)
+        .env_remove("AGENT_TALK_RPC_SOCKET")
         .env("TMUX", format!("{socket},1,0"))
         .env("TMUX_PANE", pane)
         .output()
@@ -441,6 +603,7 @@ fn agent_raw_stdin(
         .env("XDG_RUNTIME_DIR", runtime)
         .env("XDG_STATE_HOME", state)
         .env("AGENT_TALK_DIR", legacy_mail)
+        .env_remove("AGENT_TALK_RPC_SOCKET")
         .env("TMUX", format!("{socket},1,0"))
         .env("TMUX_PANE", pane)
         .stdin(Stdio::piped())

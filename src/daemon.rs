@@ -16,7 +16,7 @@ use tokio::{
 use tracing::{error, info, warn};
 
 use crate::{
-    config::Config,
+    config::{Config, is_safe_token},
     journal::{Journal, Record},
     protocol::{Request, Response},
     state::{AgentState, BrokerState, Dispatch, Message},
@@ -181,7 +181,12 @@ impl Broker {
             "turn-end" => self.turn_end(request.pane).await,
             "who" => self.who().await,
             "resolve" => self.resolve_command(request).await,
-            "send" => self.send(request).await,
+            "send" if request.send_options.is_none() => self.send(request).await,
+            "send" => Ok(Response::error(
+                "send optionsにはsend-v2 protocolが必要です",
+            )),
+            "send-v2" if request.send_options.is_some() => self.send(request).await,
+            "send-v2" => Ok(Response::error("send-v2 optionsがありません")),
             "read" => self.read(request),
             "gc" | "watch" => Ok(Response::ok("")),
             "internal-pane-exited" => {
@@ -397,12 +402,70 @@ impl Broker {
     async fn send(&mut self, request: Request) -> Result<Response> {
         let Some(addr) = request.args.first() else {
             return Ok(Response::error(
-                "usage: agent-talk send [scope/]<name> [message]",
+                "usage: agent-talk send [scope/]<name> [--from <source>] [--skill <name>] [--] [message]",
             ));
         };
+        let options = request.send_options.clone().unwrap_or_default();
+        if let Some(skill) = options.skill.as_deref() {
+            if !is_safe_token(skill) {
+                return Ok(Response::error(format!(
+                    "skill名は64文字以内の小文字英数字と : _ - のみです: '{skill}'"
+                )));
+            }
+            if self
+                .config
+                .allowed_skills
+                .as_ref()
+                .is_some_and(|allowed| !allowed.contains(skill))
+            {
+                return Ok(Response::error(format!(
+                    "skill '{skill}' は @agent_talkd_allowed_skills で許可されていません"
+                )));
+            }
+        }
+        let registered_sender = request.pane.as_deref().and_then(|pane| {
+            self.state
+                .agents
+                .get(pane)
+                .map(|agent| (pane.to_owned(), agent.name.clone()))
+        });
+        if let Some(source) = options.from.as_deref() {
+            if registered_sender.is_some() {
+                return Ok(Response::error(
+                    "登録agent paneから --from を上書きできません",
+                ));
+            }
+            if !is_safe_token(source) {
+                return Ok(Response::error(format!(
+                    "送信元ラベルは64文字以内の小文字英数字と : _ - のみです: '{source}'"
+                )));
+            }
+            if !self.config.allowed_sources.contains(source) {
+                return Ok(Response::error(format!(
+                    "送信元 '{source}' は @agent_talkd_allowed_sources で許可されていません"
+                )));
+            }
+            if matches!(source, "human" | "system")
+                || self.state.agents.values().any(|agent| agent.name == source)
+            {
+                return Ok(Response::error(format!(
+                    "送信元 '{source}' は予約済みのため指定できません"
+                )));
+            }
+        }
         let (pane, expected) = match self.resolve(addr, request.pane.as_deref()).await {
             Ok(hit) => hit,
             Err(response) => return Ok(response),
+        };
+        let skill_prefix = if let Some(skill) = options.skill.as_deref() {
+            let Some(syntax) = self.config.skill_syntax.get(&expected) else {
+                return Ok(Response::error(format!(
+                    "agent '{expected}' のskill記法が @agent_talkd_skill_syntax にありません"
+                )));
+            };
+            format!("{}{skill} ", syntax.prefix())
+        } else {
+            String::new()
         };
         let body = if request.args.len() > 1 {
             request.args[1..].join(" ")
@@ -426,19 +489,23 @@ impl Broker {
         }
 
         let panes = self.tmux.panes().await?;
-        let from_pane = request.pane.as_deref();
-        let from_agent = from_pane
-            .and_then(|pane| self.state.agents.get(pane))
-            .map(|agent| agent.name.clone())
+        let from_info = request
+            .pane
+            .as_deref()
+            .and_then(|id| panes.iter().find(|p| p.pane_id == id));
+        let from_agent = registered_sender
+            .as_ref()
+            .map(|(_, name)| name.clone())
+            .or(options.from)
             .unwrap_or_else(|| "human".into());
-        let from_info = from_pane.and_then(|id| panes.iter().find(|p| p.pane_id == id));
-        let brief = build_brief(addr, &from_agent, from_info, &body);
-        if from_agent != "human"
-            && let Some(from_pane) = from_pane
-        {
+        let reply_info = registered_sender.as_ref().and(from_info);
+        let brief = build_brief(addr, &from_agent, from_info, reply_info, &body);
+        if let Some((from_pane, _)) = registered_sender.as_ref() {
             self.tmux.mark_talk_sent(from_pane).await;
         }
-        let sender = from_pane.unwrap_or("human").to_owned();
+        let sender = registered_sender
+            .map(|(pane, _)| pane)
+            .unwrap_or_else(|| "human".into());
         let dispatch = self.state.dispatch(
             &pane,
             sender,
@@ -446,7 +513,7 @@ impl Broker {
             &expected,
             |id| {
                 format!(
-                    "[agent-talk] {from_agent} から依頼が届きました。agent-talk read {id} で本文を確認して対応してください。"
+                    "{skill_prefix}[agent-talk] {from_agent} から依頼が届きました。agent-talk read {id} で本文を確認して対応してください。"
                 )
             },
         );
@@ -864,23 +931,25 @@ fn pretty(name: &str, state: AgentState, pane: &PaneInfo) -> String {
     )
 }
 
-fn build_brief(addr: &str, from: &str, info: Option<&PaneInfo>, body: &str) -> String {
-    let origin = info
+fn build_brief(
+    addr: &str,
+    from: &str,
+    origin_info: Option<&PaneInfo>,
+    reply_info: Option<&PaneInfo>,
+    body: &str,
+) -> String {
+    let origin = origin_info
         .map(|pane| format!(" (session: {}, pane: {})", pane.session, pane.pane_id))
         .unwrap_or_default();
-    let reply = if from != "human" {
-        info.map_or(
-            "不要 (人間からの依頼。結果は自分の画面に表示すれば読まれる)".to_owned(),
-            |pane| {
-                format!(
-                    "agent-talk send '{}' に返信本文を stdin で渡す (pane ID 指定は曖昧にならない)",
-                    pane.pane_id
-                )
-            },
-        )
-    } else {
-        "不要 (人間からの依頼。結果は自分の画面に表示すれば読まれる)".to_owned()
-    };
+    let reply = reply_info.map_or_else(
+        || "不要 (人間からの依頼。結果は自分の画面に表示すれば読まれる)".to_owned(),
+        |pane| {
+            format!(
+                "agent-talk send '{}' に返信本文を stdin で渡す (pane ID 指定は曖昧にならない)",
+                pane.pane_id
+            )
+        },
+    );
     format!(
         "# agent-talk 依頼書\n- from: {from}{origin}\n- to: {addr}\n- reply: {reply}\n\n{body}\n"
     )

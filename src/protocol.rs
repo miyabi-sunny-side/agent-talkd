@@ -1,11 +1,19 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SendOptions {
+    pub from: Option<String>,
+    pub skill: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Request {
     pub command: String,
     pub args: Vec<String>,
     pub stdin: String,
     pub pane: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_options: Option<SendOptions>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,5 +38,19 @@ impl Response {
             stdout: String::new(),
             stderr: format!("agent-talk: {}\n", stderr.into()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_legacy_request_without_send_options() {
+        let request: Request = serde_json::from_str(
+            r#"{"command":"send","args":["claude","body"],"stdin":"","pane":"%1"}"#,
+        )
+        .unwrap();
+        assert!(request.send_options.is_none());
     }
 }

@@ -77,9 +77,31 @@ set -g @plugin 'miyabi-sunny-side/agent-talkd'
 のjournalに保存します。従来の `~/.cache/agent-talk/*.md` は新規作成せず、
 既存ファイルも自動削除しません。
 
+外部クライアントは `send` の宛先直後に送信元ラベルとスキルを指定できます。
+オプションより後の本文が `--` で始まる場合は、その前に `--` を置きます。
+
+```sh
+printf '%s\n' '依頼本文' | agent-talk send claude --from mobile --skill deliver
+agent-talk send codex --skill deliver -- '--literal body'
+```
+
+`--skill` は宛先のagent種別に応じ、Claudeでは `/deliver `、Codexでは
+`$deliver ` のような固定呼び出しを呼び鈴の先頭へ付けます。依頼本文は従来どおり
+journalだけに保存され、tmuxへの入力には含まれません。`--from` と `--skill` は
+daemonでも検証され、未許可値や記法未設定のagent宛は配達せずエラーにします。
+`--from` は同一ユーザーで動くローカルクライアントが自己申告する表示ラベルです。
+認証済みの送信元情報ではないため、認可や監査の判断には使用しないでください。
+
 設定は tmux の `@agent_talkd_log_level`（既定 `info`）と
 `@agent_talkd_queue_limit`（pane ごとの通常メッセージ上限、既定 `1000`）
-で指定します。
+で指定します。追加の送信設定は次のglobal optionで指定します。
+
+- `@agent_talkd_skill_syntax`: agent名と記法の対応。形式は
+  `claude=slash,codex=dollar`。この2件は既定値で、設定値は追加・上書きされます。
+- `@agent_talkd_allowed_skills`: 許可するスキル名のカンマ区切り。未設定時は
+  文字種・長さ検証のみです。
+- `@agent_talkd_allowed_sources`: 許可する外部送信元ラベルのカンマ区切り。
+  既定は `mobile` です。`human`、`system`、登録中のagent名は指定できません。
 
 ## pane 終了検知
 
