@@ -106,6 +106,7 @@ latest以上の場合はdowngradeせず、デーモンの版確認だけを行�
 ```sh
 printf '%s\n' '依頼本文' | agent-talk send claude --from mobile --skill deliver
 agent-talk send codex --skill deliver -- '--literal body'
+agent-talk send claude --no-reply '確認してください。返信は不要です。'
 ```
 
 `--skill` は宛先のagent種別に応じ、Claudeでは `/deliver `、Codexでは
@@ -114,6 +115,10 @@ journalだけに保存され、tmuxへの入力には含まれません。`--fro
 daemonでも検証され、未許可値や記法未設定のagent宛は配達せずエラーにします。
 `--from` は同一ユーザーで動くローカルクライアントが自己申告する表示ラベルです。
 認証済みの送信元情報ではないため、認可や監査の判断には使用しないでください。
+`--no-reply` は agent 間の一方向連絡用で、返信不要の brief と呼び鈴を生成します。
+重大な実害を防ぐ異議に限り、skill側の判断で1通だけ返信できます。`--from` との併用は
+拒否され、外部mailboxの `reply <id>` 契約は変わりません。未対応の旧daemonへは
+`send-v2` の未知commandとして失敗し、通常送信へ降格しません。
 
 設定は tmux の `@agent_talkd_log_level`（既定 `info`）と
 `@agent_talkd_queue_limit`（pane ごとの通常メッセージ上限、既定 `1000`）

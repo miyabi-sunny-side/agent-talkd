@@ -447,6 +447,11 @@ impl Broker {
         };
         let options = request.send_options.clone().unwrap_or_default();
         let external_source = options.from.clone();
+        if external_source.is_some() && options.no_reply {
+            return Ok(Response::error(
+                "--no-reply は外部mailbox送信 (--from) には使えません",
+            ));
+        }
         if let Some(skill) = options.skill.as_deref() {
             if !is_safe_token(skill) {
                 return Ok(Response::error(format!(
@@ -540,15 +545,14 @@ impl Broker {
             .or(options.from.clone())
             .unwrap_or_else(|| "human".into());
         let reply_info = registered_sender.as_ref().and(from_info);
-        let brief = build_brief(
-            addr,
-            &from_agent,
-            from_info,
-            reply_info,
-            &body,
-            external_source.is_some(),
-            0,
-        );
+        let brief_mode = if external_source.is_some() {
+            BriefMode::External(0)
+        } else if options.no_reply {
+            BriefMode::NoReply
+        } else {
+            BriefMode::Normal
+        };
+        let brief = build_brief(addr, &from_agent, from_info, reply_info, &body, brief_mode);
         if let Some((from_pane, _)) = registered_sender.as_ref() {
             self.tmux.mark_talk_sent(from_pane).await;
         }
@@ -561,9 +565,15 @@ impl Broker {
             brief,
             &expected,
             |id| {
-                format!(
-                    "{skill_prefix}[agent-talk] {from_agent} から依頼が届きました。agent-talk read {id} で本文を確認して対応してください。"
-                )
+                if options.no_reply {
+                    format!(
+                        "{skill_prefix}[agent-talk] {from_agent} から連絡が届きました。agent-talk read {id} で本文を確認してください。返信は不要です。"
+                    )
+                } else {
+                    format!(
+                        "{skill_prefix}[agent-talk] {from_agent} から依頼が届きました。agent-talk read {id} で本文を確認して対応してください。"
+                    )
+                }
             },
         );
         match dispatch {
@@ -574,7 +584,14 @@ impl Broker {
                 if external_source.is_some() {
                     self.state.set_brief(
                         id,
-                        build_brief(addr, &from_agent, from_info, reply_info, &body, true, id),
+                        build_brief(
+                            addr,
+                            &from_agent,
+                            from_info,
+                            reply_info,
+                            &body,
+                            BriefMode::External(id),
+                        ),
                     );
                 }
                 let Some(stored) = self.state.message(id) else {
@@ -1210,22 +1227,31 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
     (year + i64::from(month <= 2), month, day)
 }
 
+enum BriefMode {
+    Normal,
+    NoReply,
+    External(u64),
+}
+
 fn build_brief(
     addr: &str,
     from: &str,
     origin_info: Option<&PaneInfo>,
     reply_info: Option<&PaneInfo>,
     body: &str,
-    external: bool,
-    id: u64,
+    mode: BriefMode,
 ) -> String {
     let origin = origin_info
         .map(|pane| format!(" (session: {}, pane: {})", pane.session, pane.pane_id))
         .unwrap_or_default();
-    let reply = if external {
-        format!("agent-talk reply {id} に本文を渡す (このmessageへの返信)")
-    } else {
-        reply_info.map_or_else(
+    let reply = match mode {
+        BriefMode::External(id) => {
+            format!("agent-talk reply {id} に本文を渡す (このmessageへの返信)")
+        }
+        BriefMode::NoReply => {
+            "原則不要 (一方向の連絡。重大な実害を防ぐ異議がある場合のみ1通だけ返信可)".to_owned()
+        }
+        BriefMode::Normal => reply_info.map_or_else(
             || "不要 (人間からの依頼。結果は自分の画面に表示すれば読まれる)".to_owned(),
             |pane| {
                 format!(
@@ -1233,7 +1259,7 @@ fn build_brief(
                     pane.pane_id
                 )
             },
-        )
+        ),
     };
     format!(
         "# agent-talk 依頼書\n- from: {from}{origin}\n- to: {addr}\n- reply: {reply}\n\n{body}\n"

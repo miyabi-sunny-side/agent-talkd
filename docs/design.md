@@ -73,6 +73,12 @@ identityとは分離します。登録agentからのラベル上書きと予約�
 ただしRPCのpane情報を含め、同一ユーザーで動くクライアントからの自己申告です。
 送信元の真正性を保証する認証境界ではなく、認可や監査には使用しません。
 
+`send --no-reply` は agent 間の一方向連絡を表す送信オプションです。journal/stateの
+schemaは変更せず、既存Messageに生成済みのbrief/bellを保存します。既定の送信文言は
+byte単位で維持し、no-reply時だけ「返信は不要」と明示します。完全な返信禁止ではなく、
+重大な実害を防ぐ異議のみ1通可という運用判断はskill側が担います。外部mailboxの
+`--from`との併用は拒否します。
+
 ## External mailbox
 
 `send --from <label>` は通常のpane配達と同じIDを持つ `direction=out` eventを

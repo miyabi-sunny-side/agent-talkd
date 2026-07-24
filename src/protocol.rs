@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 pub struct SendOptions {
     pub from: Option<String>,
     pub skill: Option<String>,
+    #[serde(default)]
+    pub no_reply: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,5 +54,8 @@ mod tests {
         )
         .unwrap();
         assert!(request.send_options.is_none());
+
+        let options: SendOptions = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(!options.no_reply);
     }
 }

@@ -73,6 +73,15 @@ fn daemon_journal_read_recovery_and_pane_exit() {
             "mobile,human,system,claude",
         ],
     );
+    tmux(
+        &name,
+        &[
+            "set-option",
+            "-g",
+            "@agent_talkd_skill_syntax",
+            "claude=slash,codex=dollar",
+        ],
+    );
     let panes: Vec<_> = text(tmux(
         &name,
         &["list-panes", "-t", "test:agents", "-F", "#{pane_id}"],
@@ -325,7 +334,12 @@ fn daemon_journal_read_recovery_and_pane_exit() {
         &panes[0],
         &["send", "cursor", "--skill", "deliver", "body"],
     );
-    assert!(!unmapped.status.success());
+    assert!(
+        !unmapped.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&unmapped.stdout),
+        String::from_utf8_lossy(&unmapped.stderr)
+    );
     assert!(String::from_utf8_lossy(&unmapped.stderr).contains("skill記法"));
     agent(
         &socket,
@@ -368,6 +382,59 @@ fn daemon_journal_read_recovery_and_pane_exit() {
         &legacy_mail,
         &panes[2],
         &["register", "claude"],
+    );
+
+    let no_reply_send = text(agent(
+        &socket,
+        &runtime,
+        &state,
+        &legacy_mail,
+        &panes[2],
+        &["send", panes[0].as_str(), "--no-reply", "one-way body"],
+    ));
+    let no_reply_id = message_id(&no_reply_send);
+    let no_reply_brief = text(agent(
+        &socket,
+        &runtime,
+        &state,
+        &legacy_mail,
+        &panes[0],
+        &["read", &no_reply_id.to_string()],
+    ));
+    assert!(
+        no_reply_brief
+            .contains("原則不要 (一方向の連絡。重大な実害を防ぐ異議がある場合のみ1通だけ返信可)")
+    );
+    let no_reply_bell = text(tmux(&name, &["capture-pane", "-p", "-t", &panes[0]]));
+    assert!(
+        no_reply_bell.contains("[agent-talk] claude から連絡が届きました。"),
+        "pane={no_reply_bell}"
+    );
+    agent(
+        &socket,
+        &runtime,
+        &state,
+        &legacy_mail,
+        &panes[0],
+        &["turn-end"],
+    );
+    let rejected_external = agent_external_raw(
+        &socket,
+        &runtime,
+        &state,
+        &legacy_mail,
+        &[
+            "send",
+            panes[1].as_str(),
+            "--from",
+            "mobile",
+            "--no-reply",
+            "bad",
+        ],
+    );
+    assert!(!rejected_external.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected_external.stderr).contains("--no-reply は外部mailbox送信")
     );
 
     // External mailbox events are journaled without exposing pane-to-pane traffic.
@@ -660,6 +727,22 @@ fn agent_raw(
 }
 
 fn agent_external(
+    socket: &str,
+    runtime: &Path,
+    state: &Path,
+    legacy_mail: &Path,
+    args: &[&str],
+) -> Output {
+    let output = agent_external_raw(socket, runtime, state, legacy_mail, args);
+    assert!(
+        output.status.success(),
+        "agent-talk external {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
+}
+
+fn agent_external_raw(
     socket: &str,
     runtime: &Path,
     state: &Path,

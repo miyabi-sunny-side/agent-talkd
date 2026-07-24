@@ -68,6 +68,14 @@ fn parse_send_args(args: Vec<String>) -> Result<(Vec<String>, Option<SendOptions
                 has_options = true;
                 index += 2;
             }
+            "--no-reply" => {
+                if options.no_reply {
+                    bail!("--no-reply は複数指定できません");
+                }
+                options.no_reply = true;
+                has_options = true;
+                index += 1;
+            }
             value if value.starts_with("--") => bail!("不明なsendオプションです: {value}"),
             _ => {
                 parsed.extend(args[index..].iter().cloned());
@@ -132,6 +140,43 @@ mod tests {
         .unwrap();
         assert_eq!(args, ["claude", "--skill", "literal"]);
         assert!(options.is_none());
+    }
+
+    #[test]
+    fn parses_no_reply_with_other_options_and_inline_body() {
+        let (args, options) = parse_send_args(vec![
+            "claude".into(),
+            "--from".into(),
+            "mobile".into(),
+            "--no-reply".into(),
+            "body".into(),
+        ])
+        .unwrap();
+        assert_eq!(args, ["claude", "body"]);
+        let options = options.unwrap();
+        assert!(options.no_reply);
+        assert_eq!(options.from.as_deref(), Some("mobile"));
+    }
+
+    #[test]
+    fn rejects_duplicate_no_reply_and_preserves_option_like_stdin_body() {
+        assert!(
+            parse_send_args(vec![
+                "claude".into(),
+                "--no-reply".into(),
+                "--no-reply".into(),
+            ])
+            .is_err()
+        );
+        let (args, options) = parse_send_args(vec![
+            "claude".into(),
+            "--no-reply".into(),
+            "--".into(),
+            "--literal".into(),
+        ])
+        .unwrap();
+        assert_eq!(args, ["claude", "--literal"]);
+        assert!(options.unwrap().no_reply);
     }
 
     #[tokio::test]
