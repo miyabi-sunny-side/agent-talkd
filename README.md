@@ -71,6 +71,7 @@ set -g @plugin 'miyabi-sunny-side/agent-talkd'
 互換用の `gc`, `watch` は no-op です。デーモンが未起動なら CLI が tmux
 サーバー単位で自動起動し、既存デーモンの版が古ければ安全に交代します。
 インストール済みのversionは `agent-talk --version` で確認できます。
+各サブコマンドの使い方は `agent-talk <command> --help` で確認できます。
 
 外部連携は `--from` で許可された mailbox に送信し、`mailbox-list-v1` で
 read-only に取得できます。返信は agent pane 内で `agent-talk reply <id> 本文`

@@ -1,6 +1,7 @@
 mod client;
 mod config;
 mod daemon;
+mod help;
 mod journal;
 mod lifecycle;
 mod protocol;
@@ -12,26 +13,6 @@ use std::{env, process::ExitCode};
 
 use anyhow::Result;
 use config::Config;
-
-const HELP: &str = r#"agent-talk: tmux 上の対話エージェント同士の連絡係。
-
-  agent-talk --version
-  agent-talk update
-  agent-talk ensure-daemon
-  agent-talk daemon-status
-  agent-talk reply <original-id> [body]
-  agent-talk mailbox-list-v1 <mailbox> [--after <id>] [--limit <n>]
-  agent-talk register <name>
-  agent-talk unregister
-  agent-talk busy | idle
-  agent-talk turn-end
-  agent-talk who
-  agent-talk gc
-  agent-talk resolve <addr>
-  agent-talk send <addr> [--from <source>] [--skill <name>] [--] [message]
-  agent-talk send <addr> [--no-reply] [--] [message]
-  agent-talk read <id>
-"#;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -47,32 +28,42 @@ async fn main() -> ExitCode {
 async fn run() -> Result<i32> {
     let mut args = env::args().skip(1);
     let Some(command) = args.next() else {
-        eprint!("{HELP}");
+        eprint!("{}", help::GLOBAL);
         return Ok(1);
     };
+    let args: Vec<_> = args.collect();
+    if command == "--help" && args.is_empty() {
+        print!("{}", help::GLOBAL);
+        return Ok(0);
+    }
+    if args.first().is_some_and(|arg| arg == "--help") {
+        if let Some(text) = help::command(&command) {
+            println!("{text}");
+            return Ok(0);
+        }
+    }
     if command == "--version" {
         println!("agent-talk {}", env!("CARGO_PKG_VERSION"));
         return Ok(0);
     }
-    let args: Vec<_> = args.collect();
 
     if command == "update" {
         if !args.is_empty() {
-            eprint!("{HELP}");
+            eprint!("{}", help::GLOBAL);
             return Ok(1);
         }
         return update::run().await;
     }
     if command == "ensure-daemon" {
         if !args.is_empty() {
-            eprint!("{HELP}");
+            eprint!("{}", help::GLOBAL);
             return Ok(1);
         }
         return lifecycle::run_ensure_command().await;
     }
     if command == "daemon-status" {
         if !args.is_empty() {
-            eprint!("{HELP}");
+            eprint!("{}", help::GLOBAL);
             return Ok(1);
         }
         return lifecycle::run_status_command().await;
@@ -94,28 +85,8 @@ async fn run() -> Result<i32> {
         daemon::run(config).await?;
         return Ok(0);
     }
-    let known = matches!(
-        command.as_str(),
-        "register"
-            | "unregister"
-            | "busy"
-            | "idle"
-            | "turn-end"
-            | "who"
-            | "gc"
-            | "watch"
-            | "resolve"
-            | "send"
-            | "read"
-            | "reply"
-            | "mailbox-list-v1"
-            | "internal-daemon-status"
-            | "internal-daemon-shutdown"
-            | "internal-pane-exited"
-            | "internal-reconcile"
-    );
-    if !known {
-        eprint!("{HELP}");
+    if !help::is_known(&command) {
+        eprint!("{}", help::GLOBAL);
         return Ok(1);
     }
     client::run(config, command, args).await

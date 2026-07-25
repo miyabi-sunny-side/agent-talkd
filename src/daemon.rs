@@ -18,6 +18,7 @@ use tracing::{error, info, warn};
 
 use crate::{
     config::{Config, is_safe_token},
+    help,
     journal::{Journal, Record},
     protocol::{Request, Response},
     state::{AgentState, BrokerState, Dispatch, ExternalMailboxEvent, MailboxDirection, Message},
@@ -258,7 +259,7 @@ impl Broker {
             return Ok(Response::ok(""));
         };
         let Some(name) = request.args.first() else {
-            return Ok(Response::error("usage: agent-talk register <name>"));
+            return Ok(Response::error(help::usage("register")));
         };
         if !name
             .chars()
@@ -429,9 +430,7 @@ impl Broker {
 
     async fn resolve_command(&self, request: Request) -> Result<Response> {
         let Some(addr) = request.args.first() else {
-            return Ok(Response::error(
-                "usage: agent-talk resolve [scope/]<name> | %pane",
-            ));
+            return Ok(Response::error(help::usage("resolve")));
         };
         match self.resolve(addr, request.pane.as_deref()).await {
             Ok((pane, _)) => Ok(Response::ok(format!("{pane}\n"))),
@@ -441,9 +440,7 @@ impl Broker {
 
     async fn send(&mut self, request: Request) -> Result<Response> {
         let Some(addr) = request.args.first() else {
-            return Ok(Response::error(
-                "usage: agent-talk send [scope/]<name> [--from <source>] [--skill <name>] [--] [message]",
-            ));
+            return Ok(Response::error(help::usage("send")));
         };
         let options = request.send_options.clone().unwrap_or_default();
         let external_source = options.from.clone();
@@ -718,7 +715,7 @@ impl Broker {
 
     fn read(&mut self, request: Request) -> Result<Response> {
         let Some(raw_id) = request.args.first() else {
-            return Ok(Response::error("usage: agent-talk read <id>"));
+            return Ok(Response::error(help::usage("read")));
         };
         let Ok(id) = raw_id.trim_start_matches('#').parse::<u64>() else {
             return Ok(Response::error(format!("message id が不正です: {raw_id}")));
@@ -749,9 +746,7 @@ impl Broker {
 
     fn reply(&mut self, request: Request) -> Result<Response> {
         let Some(raw_id) = request.args.first() else {
-            return Ok(Response::error(
-                "usage: agent-talk reply <original-id> [body]",
-            ));
+            return Ok(Response::error(help::usage("reply")));
         };
         let Ok(original_id) = raw_id.trim_start_matches('#').parse::<u64>() else {
             return Ok(Response::error(format!("message id が不正です: {raw_id}")));
@@ -816,9 +811,7 @@ impl Broker {
             ));
         }
         let Some(mailbox) = request.args.first() else {
-            return Ok(Response::error(
-                "usage: agent-talk mailbox-list-v1 <mailbox> [--after <id>] [--limit <n>]",
-            ));
+            return Ok(Response::error(help::usage("mailbox-list-v1")));
         };
         if !is_safe_token(mailbox) || !self.config.allowed_sources.contains(mailbox) {
             return Ok(Response::error("mailbox が許可されていません"));
