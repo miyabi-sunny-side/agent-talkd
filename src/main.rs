@@ -5,6 +5,7 @@ mod help;
 mod journal;
 mod lifecycle;
 mod protocol;
+mod run;
 mod state;
 mod tmux;
 mod update;
@@ -67,6 +68,9 @@ async fn run() -> Result<i32> {
             return Ok(1);
         }
         return lifecycle::run_status_command().await;
+    }
+    if command == "run" {
+        return run::run(args).await;
     }
 
     if matches!(

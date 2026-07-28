@@ -66,12 +66,19 @@ set -g @plugin 'miyabi-sunny-side/agent-talkd'
 
 ## CLI
 
-`register`, `unregister`, `busy`, `idle`, `turn-end`, `who`, `resolve`,
+`run`, `register`, `unregister`, `busy`, `idle`, `turn-end`, `who`, `resolve`,
 `send`, `read`, `update`, `ensure-daemon`, `daemon-status` を提供します。
 互換用の `gc`, `watch` は no-op です。デーモンが未起動なら CLI が tmux
 サーバー単位で自動起動し、既存デーモンの版が古ければ安全に交代します。
 インストール済みのversionは `agent-talk --version` で確認できます。
 各サブコマンドの使い方は `agent-talk <command> --help` で確認できます。
+
+`run` は子プロセスの実行中だけ現在のpaneを登録し、終了時に登録解除します。
+たとえば `_agent_talk_run codex codex "$@"` は次のように置き換えられます。
+
+```sh
+agent-talk run codex codex "$@"
+```
 
 外部連携は `--from` で許可された mailbox に送信し、`mailbox-list-v1` で
 read-only に取得できます。返信は agent pane 内で `agent-talk reply <id> 本文`

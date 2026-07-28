@@ -1,9 +1,15 @@
-use std::process::{Command, Stdio};
+use std::{
+    fs,
+    io::{BufRead, BufReader},
+    os::unix::{fs::PermissionsExt, process::CommandExt},
+    process::{Command, Stdio},
+};
 
 const COMMANDS: &[&str] = &[
     "update",
     "ensure-daemon",
     "daemon-status",
+    "run",
     "register",
     "unregister",
     "busy",
@@ -82,4 +88,103 @@ fn version_is_available_without_tmux_or_daemon() {
         format!("agent-talk {}\n", env!("CARGO_PKG_VERSION"))
     );
     assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn run_transparently_executes_child_and_returns_its_status() {
+    let output = isolated()
+        .args([
+            "run",
+            "demo",
+            "sh",
+            "-c",
+            "printf '<%s>|<%s>' \"$1\" \"$2\"; exit 7",
+            "sh",
+            "--literal",
+            "two words",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(7));
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "<--literal>|<two words>"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn run_preserves_child_sigint_behavior() {
+    let output = isolated()
+        .args(["run", "demo", "sh", "-c", "kill -INT $$"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(130));
+}
+
+#[test]
+fn run_survives_foreground_sigint_and_returns_child_status() {
+    let mut command = isolated();
+    command
+        .args([
+            "run",
+            "demo",
+            "sh",
+            "-c",
+            "printf 'ready\\n'; while :; do sleep 1; done",
+        ])
+        .process_group(0)
+        .stdout(Stdio::piped());
+    let mut child = command.spawn().unwrap();
+    let mut ready = String::new();
+    BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut ready)
+        .unwrap();
+    assert_eq!(ready, "ready\n");
+
+    let result = unsafe { libc::kill(-(child.id() as i32), libc::SIGINT) };
+    assert_eq!(result, 0);
+    assert_eq!(child.wait().unwrap().code(), Some(130));
+}
+
+#[test]
+fn run_reports_usage_and_spawn_failures_without_contacting_a_daemon() {
+    let root = tempfile::tempdir().unwrap();
+    let rpc_socket = root.path().join("daemon.sock");
+
+    let missing_args = isolated()
+        .arg("run")
+        .env("AGENT_TALK_RPC_SOCKET", &rpc_socket)
+        .output()
+        .unwrap();
+    assert_eq!(missing_args.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8(missing_args.stderr).unwrap(),
+        "usage: agent-talk run <name> <executable> [args...]\n"
+    );
+
+    let missing_executable = isolated()
+        .args(["run", "demo", "agent-talk-command-that-does-not-exist"])
+        .env("AGENT_TALK_RPC_SOCKET", &rpc_socket)
+        .output()
+        .unwrap();
+    assert_eq!(missing_executable.status.code(), Some(127));
+    assert!(
+        String::from_utf8(missing_executable.stderr)
+            .unwrap()
+            .contains("agent-talk-command-that-does-not-exist")
+    );
+
+    let not_executable = root.path().join("not-executable");
+    fs::write(&not_executable, "#!/bin/sh\n").unwrap();
+    fs::set_permissions(&not_executable, fs::Permissions::from_mode(0o644)).unwrap();
+    let permission_denied = isolated()
+        .args(["run", "demo"])
+        .arg(&not_executable)
+        .output()
+        .unwrap();
+    assert_eq!(permission_denied.status.code(), Some(126));
+    assert!(!rpc_socket.exists());
 }

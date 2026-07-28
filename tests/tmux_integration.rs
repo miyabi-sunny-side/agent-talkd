@@ -152,6 +152,84 @@ fn daemon_journal_read_recovery_and_pane_exit() {
         &["register", "codex"],
     );
 
+    // run keeps the pane registered only for the child process lifetime.
+    let ready = root.path().join("run-ready");
+    let stop = root.path().join("run-stop");
+    let binary = env!("CARGO_BIN_EXE_agent-talk");
+    let mut runner = Command::new(binary)
+        .args([
+            "run",
+            "runner",
+            "sh",
+            "-c",
+            "touch \"$1\"; while [ ! -e \"$2\" ]; do sleep 0.05; done",
+            "sh",
+        ])
+        .arg(&ready)
+        .arg(&stop)
+        .env("AGENT_TALK_TMUX_SOCKET", &socket)
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env("XDG_STATE_HOME", &state)
+        .env("AGENT_TALK_DIR", &legacy_mail)
+        .env_remove("AGENT_TALK_RPC_SOCKET")
+        .env("TMUX", format!("{socket},1,0"))
+        .env("TMUX_PANE", &panes[2])
+        .spawn()
+        .unwrap();
+    wait_for(|| ready.exists());
+    let during_run = text(agent(
+        &socket,
+        &runtime,
+        &state,
+        &legacy_mail,
+        &panes[0],
+        &["who"],
+    ));
+    assert!(during_run.contains("runner"));
+    fs::write(&stop, "stop").unwrap();
+    assert!(runner.wait().unwrap().success());
+    let after_run = text(agent(
+        &socket,
+        &runtime,
+        &state,
+        &legacy_mail,
+        &panes[0],
+        &["who"],
+    ));
+    assert!(!after_run.contains("runner"));
+
+    // A failed registration stays silent and does not block the child.
+    let registration_failure = agent_raw(
+        &socket,
+        &runtime,
+        &state,
+        &legacy_mail,
+        &panes[2],
+        &["run", "bad/name", "sh", "-c", "exit 7"],
+    );
+    assert_eq!(registration_failure.status.code(), Some(7));
+    assert!(registration_failure.stderr.is_empty());
+
+    // A registered pane is cleaned up even when the executable cannot start.
+    let spawn_failure = agent_raw(
+        &socket,
+        &runtime,
+        &state,
+        &legacy_mail,
+        &panes[2],
+        &["run", "runner", "agent-talk-command-that-does-not-exist"],
+    );
+    assert_eq!(spawn_failure.status.code(), Some(127));
+    let after_spawn_failure = text(agent(
+        &socket,
+        &runtime,
+        &state,
+        &legacy_mail,
+        &panes[0],
+        &["who"],
+    ));
+    assert!(!after_spawn_failure.contains("runner"));
+
     // Immediate messages are journal-backed and read is non-destructive.
     let human_send = text(agent(
         &socket,
@@ -808,4 +886,12 @@ fn tmux(name: &str, args: &[&str]) -> Output {
 
 fn text(output: Output) -> String {
     String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+fn wait_for(mut condition: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !condition() {
+        assert!(Instant::now() < deadline, "condition timed out");
+        thread::sleep(Duration::from_millis(50));
+    }
 }

@@ -10,6 +10,7 @@ pub const GLOBAL: &str = r#"agent-talk: tmux 上の対話エージェント同�
   agent-talk update
   agent-talk ensure-daemon
   agent-talk daemon-status
+  agent-talk run <name> <executable> [args...]
   agent-talk reply <original-id> [body]
   agent-talk mailbox-list-v1 <mailbox> [--after <id>] [--limit <n>]
   agent-talk register <name>
@@ -36,6 +37,10 @@ pub const COMMANDS: &[CommandHelp] = &[
     CommandHelp {
         command: "daemon-status",
         text: "usage: agent-talk daemon-status\n\n対象daemonのversionとready状態を表示します。",
+    },
+    CommandHelp {
+        command: "run",
+        text: "usage: agent-talk run <name> <executable> [args...]\n\n実行中だけ現在のpaneをagent名で登録します。",
     },
     CommandHelp {
         command: "register",
@@ -138,6 +143,7 @@ mod tests {
             "update",
             "ensure-daemon",
             "daemon-status",
+            "run",
             "register",
             "unregister",
             "busy",
