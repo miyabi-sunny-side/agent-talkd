@@ -145,10 +145,10 @@ daemonでも検証され、未許可値や記法未設定のagent宛は配達せ
 
 ## pane 終了検知
 
-tmux control mode は専用 `_agent_talkd` セッションへ接続し、tmux サーバーの
-終了を検知します。tmux 3.6b では別セッションの pane 終了通知が control
-client に届かないため、global `pane-exited[987]` および kill 系 hook を
-wake-up として併用し、daemon が live pane 一覧と照合します。
+global `pane-exited[987]` および kill 系 hook を wake-up として使用し、daemon が
+live pane 一覧と照合します。tmux サーバーの終了・再起動はserver PIDを使った2秒間隔の
+health checkで検知し、一過性の実行失敗は1回だけ許容します。監視専用のtmux sessionは
+作成しません。
 
 ## テスト
 

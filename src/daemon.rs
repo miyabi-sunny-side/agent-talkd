@@ -8,7 +8,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
@@ -20,12 +20,75 @@ use crate::{
     config::{Config, is_safe_token},
     help,
     journal::{Journal, Record},
-    protocol::{Request, Response},
+    protocol::{Request, Response, SendOptions},
     state::{AgentState, BrokerState, Dispatch, ExternalMailboxEvent, MailboxDirection, Message},
-    tmux::{ControlEvent, PaneInfo, Tmux},
+    tmux::{PaneInfo, Tmux},
 };
 
 const MAX_BODY_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug)]
+struct ConversationSend {
+    no_reply: bool,
+}
+
+#[derive(Debug)]
+struct AuthoritySend {
+    source: Option<String>,
+    skill: Option<String>,
+    no_reply: bool,
+}
+
+#[derive(Debug)]
+enum SendIntent {
+    Conversation(ConversationSend),
+    Authority(AuthoritySend),
+}
+
+impl SendIntent {
+    fn classify(options: SendOptions, registered: bool) -> std::result::Result<Self, &'static str> {
+        if registered && options.skill.is_some() {
+            return Err("登録agent paneから --skill は指定できません");
+        }
+        if registered && options.from.is_some() {
+            return Err("登録agent paneから --from を上書きできません");
+        }
+        if options.from.is_some() || options.skill.is_some() {
+            if options.from.is_some() && options.no_reply {
+                return Err("--no-reply は外部mailbox送信 (--from) には使えません");
+            }
+            return Ok(Self::Authority(AuthoritySend {
+                source: options.from,
+                skill: options.skill,
+                no_reply: options.no_reply,
+            }));
+        }
+        Ok(Self::Conversation(ConversationSend {
+            no_reply: options.no_reply,
+        }))
+    }
+
+    fn no_reply(&self) -> bool {
+        match self {
+            Self::Conversation(send) => send.no_reply,
+            Self::Authority(send) => send.no_reply,
+        }
+    }
+
+    fn source(&self) -> Option<&str> {
+        match self {
+            Self::Conversation(_) => None,
+            Self::Authority(send) => send.source.as_deref(),
+        }
+    }
+
+    fn skill(&self) -> Option<&str> {
+        match self {
+            Self::Conversation(_) => None,
+            Self::Authority(send) => send.skill.as_deref(),
+        }
+    }
+}
 
 enum Event {
     Request {
@@ -33,8 +96,6 @@ enum Event {
         reply: oneshot::Sender<Response>,
         flushed: oneshot::Receiver<()>,
     },
-    PaneExited(String),
-    ControlDisconnected,
     ServerCheck,
 }
 
@@ -55,25 +116,16 @@ pub async fn run(config: Config) -> Result<()> {
         .with_context(|| format!("cannot bind {}", config.rpc_socket.display()))?;
 
     let tmux = Tmux::new(config.tmux_socket.clone());
+    let server_pid = tmux.server_pid().await?;
     let executable = env::current_exe()?;
     tmux.install_pane_exit_hook(&executable, &config.rpc_socket)
         .await?;
-    let (control_tx, mut control_rx) = mpsc::channel(32);
-    let mut control = tmux.start_control(control_tx).await?;
+    ensure!(
+        tmux.server_pid().await? == server_pid,
+        "tmux server changed during daemon startup"
+    );
     let (tx, mut rx) = mpsc::channel::<Event>(64);
     spawn_accept_loop(listener, tx.clone());
-    let event_tx = tx.clone();
-    tokio::spawn(async move {
-        while let Some(event) = control_rx.recv().await {
-            let mapped = match event {
-                ControlEvent::PaneExited(pane) => Event::PaneExited(pane),
-                ControlEvent::Disconnected => Event::ControlDisconnected,
-            };
-            if event_tx.send(mapped).await.is_err() {
-                break;
-            }
-        }
-    });
     let health_tx = tx.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
@@ -95,8 +147,8 @@ pub async fn run(config: Config) -> Result<()> {
     broker.reconcile(true).await;
     info!(source = "daemon", "started");
 
-    let mut control_lost = false;
     let mut shutdown_requested = false;
+    let mut failed_health_checks = 0_u8;
     while let Some(event) = rx.recv().await {
         match event {
             Event::Request {
@@ -113,38 +165,30 @@ pub async fn run(config: Config) -> Result<()> {
                     break;
                 }
             }
-            Event::PaneExited(pane) => {
-                broker.remove_agent(&pane, "宛先が退出した").await;
-            }
-            Event::ControlDisconnected => {
-                if tmux.server_is_alive().await {
-                    control_lost = true;
+            Event::ServerCheck => match tmux.server_pid().await {
+                Ok(pid) if pid == server_pid => failed_health_checks = 0,
+                Ok(_) => break,
+                Err(error) => {
+                    failed_health_checks += 1;
+                    if failed_health_checks >= 2 {
+                        break;
+                    }
                     warn!(
-                        source = "tmux-control",
-                        "control mode disconnected while server is alive; using health checks"
+                        %error,
+                        source = "tmux-health",
+                        "tmux health check failed; retrying"
                     );
-                } else {
-                    break;
                 }
-            }
-            Event::ServerCheck => {
-                if control_lost && !tmux.server_is_alive().await {
-                    break;
-                }
-            }
+            },
         }
     }
 
     if shutdown_requested {
         info!(source = "lifecycle", "stopping after shutdown request");
     } else {
-        info!(
-            source = "tmux-control",
-            "stopping after control-mode disconnect"
-        );
+        info!(source = "tmux-health", "stopping after tmux server exit");
     }
     tmux.remove_pane_exit_hook().await;
-    let _ = control.kill().await;
     let _ = fs::remove_file(&broker.config.rpc_socket);
     Ok(())
 }
@@ -442,30 +486,21 @@ impl Broker {
         let Some(addr) = request.args.first() else {
             return Ok(Response::error(help::usage("send")));
         };
-        let options = request.send_options.clone().unwrap_or_default();
         let registered_sender = request.pane.as_deref().and_then(|pane| {
             self.state
                 .agents
                 .get(pane)
                 .map(|agent| (pane.to_owned(), agent.name.clone()))
         });
-        if registered_sender.is_some() && options.skill.is_some() {
-            return Ok(Response::error(
-                "登録agent paneから --skill は指定できません",
-            ));
-        }
-        if registered_sender.is_some() && options.from.is_some() {
-            return Ok(Response::error(
-                "登録agent paneから --from を上書きできません",
-            ));
-        }
-        let external_source = options.from.clone();
-        if external_source.is_some() && options.no_reply {
-            return Ok(Response::error(
-                "--no-reply は外部mailbox送信 (--from) には使えません",
-            ));
-        }
-        if let Some(skill) = options.skill.as_deref() {
+        let intent = match SendIntent::classify(
+            request.send_options.unwrap_or_default(),
+            registered_sender.is_some(),
+        ) {
+            Ok(intent) => intent,
+            Err(error) => return Ok(Response::error(error)),
+        };
+        let external_source = intent.source().map(str::to_owned);
+        if let Some(skill) = intent.skill() {
             if !is_safe_token(skill) {
                 return Ok(Response::error(format!(
                     "skill名は64文字以内の小文字英数字と : _ - のみです: '{skill}'"
@@ -482,7 +517,7 @@ impl Broker {
                 )));
             }
         }
-        if let Some(source) = options.from.as_deref() {
+        if let Some(source) = intent.source() {
             if !is_safe_token(source) {
                 return Ok(Response::error(format!(
                     "送信元ラベルは64文字以内の小文字英数字と : _ - のみです: '{source}'"
@@ -505,7 +540,7 @@ impl Broker {
             Ok(hit) => hit,
             Err(response) => return Ok(response),
         };
-        let skill_prefix = if let Some(skill) = options.skill.as_deref() {
+        let skill_prefix = if let Some(skill) = intent.skill() {
             let Some(syntax) = self.config.skill_syntax.get(&expected) else {
                 return Ok(Response::error(format!(
                     "agent '{expected}' のskill記法が @agent_talkd_skill_syntax にありません"
@@ -544,12 +579,12 @@ impl Broker {
         let from_agent = registered_sender
             .as_ref()
             .map(|(_, name)| name.clone())
-            .or(options.from.clone())
+            .or_else(|| intent.source().map(str::to_owned))
             .unwrap_or_else(|| "human".into());
         let reply_info = registered_sender.as_ref().and(from_info);
         let brief_mode = if external_source.is_some() {
             BriefMode::External(0)
-        } else if options.no_reply {
+        } else if intent.no_reply() {
             BriefMode::NoReply
         } else {
             BriefMode::Normal
@@ -567,7 +602,7 @@ impl Broker {
             brief,
             &expected,
             |id| {
-                if options.no_reply {
+                if intent.no_reply() {
                     format!(
                         "{skill_prefix}[agent-talk] {from_agent} から連絡が届きました。agent-talk read {id} で本文を確認してください。返信は不要です。"
                     )
@@ -618,7 +653,7 @@ impl Broker {
                             source_label: source_label.to_owned(),
                             direction: MailboxDirection::Out,
                             body: body.clone(),
-                            skill: options.skill.clone(),
+                            skill: intent.skill().map(str::to_owned),
                             target_name: expected.clone(),
                             target_pane: pane.clone(),
                             reply_to: None,
@@ -1291,12 +1326,96 @@ fn init_logging(path: &Path, configured_level: &str) -> Result<()> {
 }
 
 #[cfg(test)]
-mod mailbox_tests {
-    use super::rfc3339;
+mod tests {
+    use super::{SendIntent, SendOptions, rfc3339};
 
     #[test]
     fn epoch_is_rendered_as_stable_utc_rfc3339() {
         assert_eq!(rfc3339(0), "1970-01-01T00:00:00Z");
         assert_eq!(rfc3339(86_401), "1970-01-02T00:00:01Z");
+    }
+
+    #[test]
+    fn send_intent_separates_conversation_from_authority() {
+        let conversation = SendIntent::classify(
+            SendOptions {
+                no_reply: true,
+                ..SendOptions::default()
+            },
+            true,
+        )
+        .unwrap();
+        assert!(matches!(conversation, SendIntent::Conversation(_)));
+        assert!(conversation.no_reply());
+        assert_eq!(conversation.source(), None);
+        assert_eq!(conversation.skill(), None);
+
+        let authority = SendIntent::classify(
+            SendOptions {
+                from: Some("mobile".into()),
+                skill: Some("deliver".into()),
+                no_reply: false,
+            },
+            false,
+        )
+        .unwrap();
+        assert!(matches!(authority, SendIntent::Authority(_)));
+        assert_eq!(authority.source(), Some("mobile"));
+        assert_eq!(authority.skill(), Some("deliver"));
+        assert!(!authority.no_reply());
+
+        let skill_no_reply = SendIntent::classify(
+            SendOptions {
+                skill: Some("deliver".into()),
+                no_reply: true,
+                ..SendOptions::default()
+            },
+            false,
+        )
+        .unwrap();
+        assert!(matches!(skill_no_reply, SendIntent::Authority(_)));
+        assert_eq!(skill_no_reply.source(), None);
+        assert_eq!(skill_no_reply.skill(), Some("deliver"));
+        assert!(skill_no_reply.no_reply());
+    }
+
+    #[test]
+    fn registered_sender_cannot_construct_authority_intent() {
+        let skill = SendIntent::classify(
+            SendOptions {
+                skill: Some("deliver".into()),
+                ..SendOptions::default()
+            },
+            true,
+        );
+        assert_eq!(
+            skill.unwrap_err(),
+            "登録agent paneから --skill は指定できません"
+        );
+
+        let source = SendIntent::classify(
+            SendOptions {
+                from: Some("mobile".into()),
+                ..SendOptions::default()
+            },
+            true,
+        );
+        assert_eq!(
+            source.unwrap_err(),
+            "登録agent paneから --from を上書きできません"
+        );
+
+        let external_no_reply = SendIntent::classify(
+            SendOptions {
+                from: Some("mobile".into()),
+                no_reply: true,
+                ..SendOptions::default()
+            },
+            false,
+        );
+        assert_eq!(
+            external_no_reply.unwrap_err(),
+            "--no-reply は外部mailbox送信 (--from) には使えません"
+        );
     }
 }

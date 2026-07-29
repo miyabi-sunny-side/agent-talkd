@@ -134,6 +134,8 @@ fn daemon_journal_read_recovery_and_pane_exit() {
         &["ensure-daemon"],
     ));
     assert!(ensured.contains(&format!("daemon {} ready", env!("CARGO_PKG_VERSION"))));
+    let sessions = text(tmux(&name, &["list-sessions", "-F", "#{session_name}"]));
+    assert_eq!(sessions, "test");
     let status = text(agent(
         &socket,
         &runtime,
@@ -761,6 +763,17 @@ fn daemon_journal_read_recovery_and_pane_exit() {
     assert!(failure_brief.contains("# agent-talk 配達失敗通知"));
     assert!(failure_brief.contains(&format!("- original: #{second_id}")));
     assert!(failure_brief.contains("second unread body"));
+
+    let sessions = text(tmux(&name, &["list-sessions", "-F", "#{session_name}"]));
+    assert_eq!(sessions, "test");
+
+    // A replacement server on the same socket cannot inherit the old daemon.
+    tmux(&name, &["kill-server"]);
+    tmux_eventually(
+        &name,
+        &["new-session", "-d", "-s", "replacement", "sleep 30"],
+    );
+    wait_for(|| !rpc.exists());
 }
 
 fn message_id(output: &str) -> u64 {
@@ -902,6 +915,27 @@ fn tmux(name: &str, args: &[&str]) -> Output {
         String::from_utf8_lossy(&output.stderr)
     );
     output
+}
+
+fn tmux_eventually(name: &str, args: &[&str]) -> Output {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let output = Command::new("tmux")
+            .arg("-L")
+            .arg(name)
+            .args(args)
+            .output()
+            .unwrap();
+        if output.status.success() {
+            return output;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "tmux failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn text(output: Output) -> String {

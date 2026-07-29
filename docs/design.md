@@ -21,11 +21,10 @@ agent-talkd は、tmux 上の対話エージェントへ作業中の入力を割
   stagingをatomic renameし、置換後の新binary自身で `ensure-daemon` を実行します。
   GitHubへのHTTPSと同一チャネルのchecksumが供給チェーンの境界であり、checksumは
   破損・部分ダウンロード検出を担います。
-- tmux control mode接続はtmuxサーバーの終了検知に使います。pane消滅はtmuxの
-  通知だけでは全sessionを網羅できないため、global hookをwake-upとして
-  tmuxの状態確定を短時間待ってからlive pane一覧と照合します。control mode
-  だけが切断された場合はdaemonを維持し、低頻度のhealth checkでtmuxサーバー
-  終了を検知します。hookにはdaemonのRPC socket絶対パスを渡し、tmux serverと
+- pane消滅はglobal hookをwake-upとして、tmuxの状態確定を短時間待ってからlive pane
+  一覧と照合します。tmuxサーバーの終了・再起動はserver PIDを使った2秒間隔のhealth
+  checkで検知し、一過性の実行失敗は1回だけ許容します。監視用のtmux sessionやcontrol
+  mode clientは作成しません。hookにはdaemonのRPC socket絶対パスを渡し、tmux serverと
   CLIの環境変数が異なっても同じdaemonへ接続します。
 
 ## 状態と配送

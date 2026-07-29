@@ -1,10 +1,8 @@
-use std::{path::Path, process::Stdio};
+use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use tokio::{
-    io::{AsyncBufReadExt, BufReader},
-    process::{Child, Command},
-    sync::mpsc,
+    process::Command,
     time::{Duration, sleep},
 };
 
@@ -17,12 +15,6 @@ pub struct PaneInfo {
     pub window_index: String,
     pub pane_index: String,
     pub agent: Option<String>,
-}
-
-#[derive(Debug)]
-pub enum ControlEvent {
-    PaneExited(String),
-    Disconnected,
 }
 
 #[derive(Clone)]
@@ -126,43 +118,12 @@ impl Tmux {
         }
     }
 
-    pub async fn start_control(&self, tx: mpsc::Sender<ControlEvent>) -> Result<Child> {
-        self.run(["list-sessions"]).await?;
-        let mut child = Command::new("tmux")
-            .args([
-                "-C",
-                "-S",
-                &self.socket,
-                "new-session",
-                "-A",
-                "-s",
-                "_agent_talkd",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .context("cannot start tmux control mode")?;
-        let stdout = child.stdout.take().context("tmux control stdout missing")?;
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(stdout).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                // tmux 3.6b does not emit this for panes outside the control
-                // session. Keep it as a forward-compatible fast path; global
-                // hooks trigger a full reconciliation on current releases.
-                if let Some(rest) = line.strip_prefix("%pane-exited ") {
-                    let pane = rest.split_whitespace().next().unwrap_or(rest);
-                    let _ = tx.send(ControlEvent::PaneExited(pane.to_owned())).await;
-                }
-            }
-            let _ = tx.send(ControlEvent::Disconnected).await;
-        });
-        Ok(child)
-    }
-
-    pub async fn server_is_alive(&self) -> bool {
-        self.run(["list-sessions"]).await.is_ok()
+    pub async fn server_pid(&self) -> Result<u32> {
+        self.run(["display-message", "-p", "#{pid}"])
+            .await?
+            .trim()
+            .parse()
+            .context("invalid tmux server pid")
     }
 
     async fn run<I, S>(&self, args: I) -> Result<String>
