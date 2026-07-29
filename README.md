@@ -117,6 +117,10 @@ agent-talk send codex --skill deliver -- '--literal body'
 agent-talk send claude --no-reply '確認してください。返信は不要です。'
 ```
 
+登録中のagent paneは `--from` と `--skill` を指定できません。2つ目の例は未登録の
+human caller向けです。外部クライアントは許可された `--from` と組み合わせて
+`--skill` を指定します。
+
 `--skill` は宛先のagent種別に応じ、Claudeでは `/deliver `、Codexでは
 `$deliver ` のような固定呼び出しを呼び鈴の先頭へ付けます。依頼本文は従来どおり
 journalだけに保存され、tmuxへの入力には含まれません。`--from` と `--skill` は

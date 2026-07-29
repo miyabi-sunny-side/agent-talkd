@@ -443,6 +443,22 @@ impl Broker {
             return Ok(Response::error(help::usage("send")));
         };
         let options = request.send_options.clone().unwrap_or_default();
+        let registered_sender = request.pane.as_deref().and_then(|pane| {
+            self.state
+                .agents
+                .get(pane)
+                .map(|agent| (pane.to_owned(), agent.name.clone()))
+        });
+        if registered_sender.is_some() && options.skill.is_some() {
+            return Ok(Response::error(
+                "登録agent paneから --skill は指定できません",
+            ));
+        }
+        if registered_sender.is_some() && options.from.is_some() {
+            return Ok(Response::error(
+                "登録agent paneから --from を上書きできません",
+            ));
+        }
         let external_source = options.from.clone();
         if external_source.is_some() && options.no_reply {
             return Ok(Response::error(
@@ -466,18 +482,7 @@ impl Broker {
                 )));
             }
         }
-        let registered_sender = request.pane.as_deref().and_then(|pane| {
-            self.state
-                .agents
-                .get(pane)
-                .map(|agent| (pane.to_owned(), agent.name.clone()))
-        });
         if let Some(source) = options.from.as_deref() {
-            if registered_sender.is_some() {
-                return Ok(Response::error(
-                    "登録agent paneから --from を上書きできません",
-                ));
-            }
             if !is_safe_token(source) {
                 return Ok(Response::error(format!(
                     "送信元ラベルは64文字以内の小文字英数字と : _ - のみです: '{source}'"

@@ -360,6 +360,28 @@ fn daemon_journal_read_recovery_and_pane_exit() {
         &["turn-end"],
     );
 
+    let claude_screen_before_peer_skill =
+        text(tmux(&name, &["capture-pane", "-p", "-t", &panes[1]]));
+    for args in [
+        vec!["send", "claude", "--skill", "deliver", "peer body"],
+        vec!["send", "claude", "--skill", "Deliver", "peer body"],
+    ] {
+        let rejected = agent_raw(&socket, &runtime, &state, &legacy_mail, &panes[0], &args);
+        assert!(!rejected.status.success(), "{args:?}");
+        assert!(
+            String::from_utf8_lossy(&rejected.stderr)
+                .contains("登録agent paneから --skill は指定できません"),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&rejected.stderr)
+        );
+    }
+    let claude_screen_after_peer_skill =
+        text(tmux(&name, &["capture-pane", "-p", "-t", &panes[1]]));
+    assert_eq!(
+        claude_screen_after_peer_skill, claude_screen_before_peer_skill,
+        "rejected peer skill must not ring the target doorbell"
+    );
+
     for (pane, args, expected) in [
         (
             panes[0].as_str(),
@@ -404,12 +426,11 @@ fn daemon_journal_read_recovery_and_pane_exit() {
         &panes[2],
         &["register", "cursor"],
     );
-    let unmapped = agent_raw(
+    let unmapped = agent_external_raw(
         &socket,
         &runtime,
         &state,
         &legacy_mail,
-        &panes[0],
         &["send", "cursor", "--skill", "deliver", "body"],
     );
     assert!(
@@ -605,12 +626,11 @@ fn daemon_journal_read_recovery_and_pane_exit() {
         &panes[1],
         &["busy"],
     );
-    let queued = text(agent(
+    let queued = text(agent_external(
         &socket,
         &runtime,
         &state,
         &legacy_mail,
-        &panes[0],
         &["send", "claude", "--skill", "deliver", "first durable body"],
     ));
     assert!(queued.starts_with("queued (busy) -> "));
@@ -677,7 +697,7 @@ fn daemon_journal_read_recovery_and_pane_exit() {
     );
     let recovered_screen = text(tmux(&name, &["capture-pane", "-p", "-t", &panes[1]]));
     assert!(recovered_screen.contains(&format!(
-        "/deliver [agent-talk] codex から依頼が届きました。agent-talk read {queued_id}"
+        "/deliver [agent-talk] human から依頼が届きました。agent-talk read {queued_id}"
     )));
     assert!(!recovered_screen.contains("first durable body"));
 
