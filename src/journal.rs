@@ -407,6 +407,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn checkpoint_keeps_consumed_queue_then_drops_failed_original() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("queue.journal");

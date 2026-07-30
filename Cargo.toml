@@ -2,7 +2,7 @@
 name = "agent-talkd"
 version = "0.6.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.96"
 description = "A tmux-native message broker for interactive coding agents"
 license = "MIT"
 repository = "https://github.com/miyabi-sunny-side/agent-talkd"
@@ -28,6 +28,10 @@ tempfile = "3.27"
 tokio = { version = "1.49", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
 
 [profile.release]
 lto = true

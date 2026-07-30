@@ -78,20 +78,15 @@ pub async fn run_status_command() -> Result<i32> {
 }
 
 pub async fn request(config: &Config, request: &Request) -> Result<Response> {
-    match request_once(config, request).await {
-        Ok(response) => Ok(response),
-        Err(_) => {
-            ensure_daemon(config).await.map_err(|error| {
-                anyhow::anyhow!(
-                    "デーモンに接続できません (sandbox 内なら承認付きで再実行): {error}"
-                )
-            })?;
-            request_once(config, request).await.map_err(|error| {
-                anyhow::anyhow!(
-                    "デーモンに接続できません (sandbox 内なら承認付きで再実行): {error}"
-                )
-            })
-        }
+    if let Ok(response) = request_once(config, request).await {
+        Ok(response)
+    } else {
+        ensure_daemon(config).await.map_err(|error| {
+            anyhow::anyhow!("デーモンに接続できません (sandbox 内なら承認付きで再実行): {error}")
+        })?;
+        request_once(config, request).await.map_err(|error| {
+            anyhow::anyhow!("デーモンに接続できません (sandbox 内なら承認付きで再実行): {error}")
+        })
     }
 }
 
@@ -184,7 +179,7 @@ async fn probe(config: &Config) -> Result<Probe> {
     if response.code == 0 {
         let status: DaemonStatus = serde_json::from_str(response.stdout.trim())
             .context("daemon returned an invalid status response")?;
-        if status.pid != pid as u32 {
+        if status.pid != pid.cast_unsigned() {
             bail!("daemon status pid does not match socket peer");
         }
         return Ok(Probe::Current(status));

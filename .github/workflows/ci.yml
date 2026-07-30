@@ -15,7 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.96.0
         with:
           components: clippy, rustfmt
 
@@ -28,13 +28,16 @@ jobs:
         run: tmux -V
 
       - name: Check formatting
-        run: cargo fmt -- --check
+        run: cargo fmt --check
 
       - name: Run Clippy
-        run: cargo clippy --all-targets --locked -- -D warnings
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
       - name: Run tests
         run: cargo test --locked
+
+      - name: Build release binary
+        run: cargo build --locked --release
 
       - name: Run real tmux integration test
         run: cargo test --locked --test tmux_integration -- --ignored

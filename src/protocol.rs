@@ -55,7 +55,7 @@ mod tests {
         .unwrap();
         assert!(request.send_options.is_none());
 
-        let options: SendOptions = serde_json::from_str(r#"{}"#).unwrap();
+        let options: SendOptions = serde_json::from_str(r"{}").unwrap();
         assert!(!options.no_reply);
     }
 }

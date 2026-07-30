@@ -3,7 +3,7 @@ pub struct CommandHelp {
     pub text: &'static str,
 }
 
-pub const GLOBAL: &str = r#"agent-talk: tmux 上の対話エージェント同士の連絡係。
+pub const GLOBAL: &str = r"agent-talk: tmux 上の対話エージェント同士の連絡係。
 
   agent-talk --version
   agent-talk <command> --help
@@ -23,7 +23,7 @@ pub const GLOBAL: &str = r#"agent-talk: tmux 上の対話エージェント同�
   agent-talk send <addr> [--from <source>] [--skill <name>] [--] [message]
   agent-talk send <addr> [--no-reply] [--] [message]
   agent-talk read <id>
-"#;
+";
 
 pub const COMMANDS: &[CommandHelp] = &[
     CommandHelp {

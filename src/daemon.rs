@@ -1,6 +1,7 @@
 use std::{
     env,
     ffi::OsStr,
+    fmt::Write as _,
     fs::{self, OpenOptions},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::Path,
@@ -261,9 +262,9 @@ impl Broker {
             )),
             "send-v2" if request.send_options.is_some() => self.send(request).await,
             "send-v2" => Ok(Response::error("send-v2 optionsがありません")),
-            "read" => self.read(request),
+            "read" => self.read(&request),
             "reply" => self.reply(request),
-            "mailbox-list-v1" => self.mailbox_list(request),
+            "mailbox-list-v1" => self.mailbox_list(&request),
             "internal-daemon-status" => Ok(Response::ok(format!(
                 "{}\n",
                 serde_json::json!({
@@ -272,8 +273,7 @@ impl Broker {
                     "ready": true,
                 })
             ))),
-            "internal-daemon-shutdown" => Ok(Response::ok("")),
-            "gc" | "watch" => Ok(Response::ok("")),
+            "internal-daemon-shutdown" | "gc" | "watch" => Ok(Response::ok("")),
             "internal-pane-exited" => {
                 if let Some(pane) = request.args.first() {
                     self.remove_agent(pane, "宛先が退出した").await;
@@ -457,8 +457,9 @@ impl Broker {
         let mut output = String::new();
         for pane in panes {
             if let Some(agent) = self.state.agents.get(&pane.pane_id) {
-                output.push_str(&format!(
-                    "{:<10} {:<5} {}:{}.{} ({})  {}\n",
+                let _ = writeln!(
+                    output,
+                    "{:<10} {:<5} {}:{}.{} ({})  {}",
                     agent.name,
                     agent.state.as_str(),
                     pane.session,
@@ -466,7 +467,7 @@ impl Broker {
                     pane.pane_index,
                     pane.pane_id,
                     pane.cwd
-                ));
+                );
             }
         }
         Ok(Response::ok(output))
@@ -482,6 +483,7 @@ impl Broker {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn send(&mut self, request: Request) -> Result<Response> {
         let Some(addr) = request.args.first() else {
             return Ok(Response::error(help::usage("send")));
@@ -560,8 +562,7 @@ impl Broker {
         }
         if body.len() > MAX_BODY_BYTES {
             return Ok(Response::error(format!(
-                "本文がサイズ上限 ({} bytes) を超えています",
-                MAX_BODY_BYTES
+                "本文がサイズ上限 ({MAX_BODY_BYTES} bytes) を超えています"
             )));
         }
         if self.state.is_busy(&pane) && self.state.queue_len(&pane) >= self.config.queue_limit {
@@ -593,9 +594,7 @@ impl Broker {
         if let Some((from_pane, _)) = registered_sender.as_ref() {
             self.tmux.mark_talk_sent(from_pane).await;
         }
-        let sender = registered_sender
-            .map(|(pane, _)| pane)
-            .unwrap_or_else(|| "human".into());
+        let sender = registered_sender.map_or_else(|| "human".into(), |(pane, _)| pane);
         let dispatch = self.state.dispatch(
             &pane,
             sender,
@@ -698,8 +697,7 @@ impl Broker {
                 }) {
                     self.state.set_state(&pane, AgentState::Idle);
                     return Ok(Response::error(format!(
-                        "配達状態を書き込めず配達できません (#{}): {error}",
-                        id
+                        "配達状態を書き込めず配達できません (#{id}): {error}"
                     )));
                 }
                 let Some(stored) = self.state.message(id) else {
@@ -753,7 +751,7 @@ impl Broker {
         }
     }
 
-    fn read(&mut self, request: Request) -> Result<Response> {
+    fn read(&mut self, request: &Request) -> Result<Response> {
         let Some(raw_id) = request.args.first() else {
             return Ok(Response::error(help::usage("read")));
         };
@@ -820,8 +818,7 @@ impl Broker {
         }
         if body.len() > MAX_BODY_BYTES {
             return Ok(Response::error(format!(
-                "本文がサイズ上限 ({} bytes) を超えています",
-                MAX_BODY_BYTES
+                "本文がサイズ上限 ({MAX_BODY_BYTES} bytes) を超えています"
             )));
         }
         let id = self.state.allocate_id();
@@ -844,7 +841,7 @@ impl Broker {
         Ok(Response::ok(format!("replied: #{id}\n")))
     }
 
-    fn mailbox_list(&self, request: Request) -> Result<Response> {
+    fn mailbox_list(&self, request: &Request) -> Result<Response> {
         if request.pane.is_some() {
             return Ok(Response::error(
                 "mailbox-list-v1 は外部caller (TMUX_PANEなし) 専用です",
@@ -956,10 +953,10 @@ impl Broker {
                 .copied()
                 .filter(|(pane, _)| pane.window_id == origin.window_id)
                 .collect();
-            if !same_window.is_empty() {
-                candidates = same_window;
-            } else {
+            if same_window.is_empty() {
                 candidates.retain(|(pane, _)| pane.session == origin.session);
+            } else {
+                candidates = same_window;
             }
         }
         match candidates.as_slice() {
@@ -1020,6 +1017,7 @@ impl Broker {
         true
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn notify_failures(
         &mut self,
         messages: Vec<Message>,
@@ -1162,22 +1160,22 @@ impl Broker {
             let Some(name) = pane.agent.as_ref() else {
                 continue;
             };
-            let state = AgentState::Idle;
+            let initial_state = AgentState::Idle;
             if self
                 .journal
                 .append(&Record::Register {
                     pane: pane.pane_id.clone(),
                     name: name.clone(),
-                    state,
+                    state: initial_state,
                 })
                 .is_ok()
             {
                 self.state
-                    .restore_agent(pane.pane_id.clone(), name.clone(), state);
+                    .restore_agent(pane.pane_id.clone(), name.clone(), initial_state);
                 info!(
                     pane = %pane.pane_id,
                     %name,
-                    ?state,
+                    state = ?initial_state,
                     source = "startup-mirror",
                     "registration recovered"
                 );
@@ -1232,7 +1230,7 @@ impl From<ExternalMailboxEvent> for ExternalMailboxView {
 fn now_epoch() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_secs() as i64)
+        .map_or(0, |duration| duration.as_secs().cast_signed())
 }
 
 fn rfc3339(epoch: i64) -> String {
@@ -1260,6 +1258,7 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
     (year + i64::from(month <= 2), month, day)
 }
 
+#[derive(Clone, Copy)]
 enum BriefMode {
     Normal,
     NoReply,

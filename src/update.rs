@@ -174,7 +174,7 @@ fn verify_checksum(archive: &Path, checksum: &Path, asset: &str) -> Result<()> {
 
     let mut source = File::open(archive)?;
     let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
     loop {
         let read = source.read(&mut buffer)?;
         if read == 0 {

@@ -35,7 +35,7 @@ pub async fn run(config: Config, mut command: String, args: Vec<String>) -> Resu
         send_options,
     };
     let response = lifecycle::request(&config, &request).await?;
-    print_response(response)
+    Ok(print_response(&response))
 }
 
 fn parse_send_args(args: Vec<String>) -> Result<(Vec<String>, Option<SendOptions>)> {
@@ -86,14 +86,14 @@ fn parse_send_args(args: Vec<String>) -> Result<(Vec<String>, Option<SendOptions
     Ok((parsed, has_options.then_some(options)))
 }
 
-fn print_response(response: Response) -> Result<i32> {
+fn print_response(response: &Response) -> i32 {
     if !response.stdout.is_empty() {
         print!("{}", response.stdout);
     }
     if !response.stderr.is_empty() {
         eprint!("{}", response.stderr);
     }
-    Ok(response.code)
+    response.code
 }
 
 #[cfg(test)]

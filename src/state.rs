@@ -386,7 +386,7 @@ mod tests {
         for id in 0..501 {
             state.add_mailbox_event(ExternalMailboxEvent {
                 id,
-                created_at: id as i64,
+                created_at: id.cast_signed(),
                 mailbox: "mobile".into(),
                 source_label: "mobile".into(),
                 direction: MailboxDirection::Out,

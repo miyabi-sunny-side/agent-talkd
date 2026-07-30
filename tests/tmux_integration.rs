@@ -22,6 +22,7 @@ impl Drop for Server {
 
 #[test]
 #[ignore = "requires permission to create a real tmux server"]
+#[allow(clippy::too_many_lines)]
 fn daemon_journal_read_recovery_and_pane_exit() {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)

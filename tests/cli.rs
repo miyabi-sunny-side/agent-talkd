@@ -144,7 +144,7 @@ fn run_survives_foreground_sigint_and_returns_child_status() {
         .unwrap();
     assert_eq!(ready, "ready\n");
 
-    let result = unsafe { libc::kill(-(child.id() as i32), libc::SIGINT) };
+    let result = unsafe { libc::kill(-child.id().cast_signed(), libc::SIGINT) };
     assert_eq!(result, 0);
     assert_eq!(child.wait().unwrap().code(), Some(130));
 }

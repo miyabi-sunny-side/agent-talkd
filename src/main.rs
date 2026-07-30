@@ -18,7 +18,9 @@ use config::Config;
 #[tokio::main]
 async fn main() -> ExitCode {
     match run().await {
-        Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
+        Ok(code) => ExitCode::from(
+            u8::try_from(code.clamp(0, 255)).expect("clamped exit code fits into u8"),
+        ),
         Err(error) => {
             eprintln!("agent-talk: {error:#}");
             ExitCode::FAILURE
@@ -37,11 +39,11 @@ async fn run() -> Result<i32> {
         print!("{}", help::GLOBAL);
         return Ok(0);
     }
-    if args.first().is_some_and(|arg| arg == "--help") {
-        if let Some(text) = help::command(&command) {
-            println!("{text}");
-            return Ok(0);
-        }
+    if args.first().is_some_and(|arg| arg == "--help")
+        && let Some(text) = help::command(&command)
+    {
+        println!("{text}");
+        return Ok(0);
     }
     if command == "--version" {
         println!("agent-talk {}", env!("CARGO_PKG_VERSION"));

@@ -50,11 +50,9 @@ impl Config {
         };
         let name = socket_name(&tmux_socket);
         let runtime = env::var_os("XDG_RUNTIME_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home().join(".cache/agent-talkd/run"));
+            .map_or_else(|| home().join(".cache/agent-talkd/run"), PathBuf::from);
         let state = env::var_os("XDG_STATE_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home().join(".local/state"));
+            .map_or_else(|| home().join(".local/state"), PathBuf::from);
         let queue_limit = tmux_option(&tmux_socket, "@agent_talkd_queue_limit")
             .and_then(|value| value.parse().ok())
             .filter(|limit| *limit > 0)
@@ -75,9 +73,10 @@ impl Config {
             .unwrap_or_else(|| BTreeSet::from(["mobile".into()]));
         Ok(Some(Self {
             tmux_socket,
-            rpc_socket: env::var_os("AGENT_TALK_RPC_SOCKET")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| runtime.join("agent-talkd").join(format!("{name}.sock"))),
+            rpc_socket: env::var_os("AGENT_TALK_RPC_SOCKET").map_or_else(
+                || runtime.join("agent-talkd").join(format!("{name}.sock")),
+                PathBuf::from,
+            ),
             journal: state.join("agent-talkd").join(format!("{name}.journal")),
             log: state.join("agent-talkd").join("agent-talkd.log"),
             queue_limit,
@@ -151,9 +150,7 @@ fn tmux_option(socket: &str, name: &str) -> Option<String> {
 }
 
 fn home() -> PathBuf {
-    env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
+    env::var_os("HOME").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from)
 }
 
 fn discover_tmux_socket() -> Result<Option<String>> {
