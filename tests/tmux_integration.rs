@@ -1,7 +1,7 @@
 use std::{
     fs,
-    io::Write,
-    os::unix::net::UnixListener,
+    io::{Read, Write},
+    os::unix::net::{UnixListener, UnixStream},
     path::Path,
     process::{Command, Output, Stdio},
     thread,
@@ -101,6 +101,9 @@ fn daemon_journal_read_recovery_and_pane_exit() {
         .join("agent-talkd")
         .join(socket_name)
         .with_extension("sock");
+    let http = runtime
+        .join("agent-talkd")
+        .join(format!("{}.http.sock", socket_name.to_string_lossy()));
     let journal = state
         .join("agent-talkd")
         .join(socket_name)
@@ -146,6 +149,22 @@ fn daemon_journal_read_recovery_and_pane_exit() {
         &["daemon-status"],
     ));
     assert!(status.contains("\"ready\":true"));
+    let hello = http_request(&http, "GET", "/v1/hello");
+    assert!(hello.starts_with("HTTP/1.1 200"), "{hello}");
+    assert!(hello.contains("\"name\":\"agent-talk\""), "{hello}");
+    let web_who = http_request(&http, "GET", "/v1/who");
+    assert!(web_who.starts_with("HTTP/1.1 200"), "{web_who}");
+    assert!(web_who.contains("\"name\":\"claude\""), "{web_who}");
+    let web_static = http_request(&http, "GET", "/nested/spa/route");
+    assert!(web_static.starts_with("HTTP/1.1 200"), "{web_static}");
+    assert!(web_static.contains("agent talk · registry"), "{web_static}");
+    let unknown_api = http_request(&http, "GET", "/v1/missing");
+    assert!(unknown_api.starts_with("HTTP/1.1 404"), "{unknown_api}");
+    let write_rejected = http_request(&http, "POST", "/v1/who");
+    assert!(
+        write_rejected.starts_with("HTTP/1.1 405"),
+        "{write_rejected}"
+    );
     agent(
         &socket,
         &runtime,
@@ -174,7 +193,7 @@ fn daemon_journal_read_recovery_and_pane_exit() {
         .env("XDG_RUNTIME_DIR", &runtime)
         .env("XDG_STATE_HOME", &state)
         .env("AGENT_TALK_DIR", &legacy_mail)
-        .env_remove("AGENT_TALK_RPC_SOCKET")
+        .env("AGENT_TALK_RPC_SOCKET", &rpc)
         .env("TMUX", format!("{socket},1,0"))
         .env("TMUX_PANE", &panes[2])
         .spawn()
@@ -775,6 +794,19 @@ fn daemon_journal_read_recovery_and_pane_exit() {
         &["new-session", "-d", "-s", "replacement", "sleep 30"],
     );
     wait_for(|| !rpc.exists());
+    wait_for(|| !http.exists());
+}
+
+fn http_request(socket: &Path, method: &str, path: &str) -> String {
+    let mut stream = UnixStream::connect(socket).unwrap();
+    write!(
+        stream,
+        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+    )
+    .unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    response
 }
 
 fn message_id(output: &str) -> u64 {
@@ -831,7 +863,7 @@ fn agent_raw(
         .env("XDG_RUNTIME_DIR", runtime)
         .env("XDG_STATE_HOME", state)
         .env("AGENT_TALK_DIR", legacy_mail)
-        .env_remove("AGENT_TALK_RPC_SOCKET")
+        .env("AGENT_TALK_RPC_SOCKET", rpc_socket(runtime, socket))
         .env("TMUX", format!("{socket},1,0"))
         .env("TMUX_PANE", pane)
         .output()
@@ -868,7 +900,7 @@ fn agent_external_raw(
         .env("XDG_RUNTIME_DIR", runtime)
         .env("XDG_STATE_HOME", state)
         .env("AGENT_TALK_DIR", legacy_mail)
-        .env_remove("AGENT_TALK_RPC_SOCKET")
+        .env("AGENT_TALK_RPC_SOCKET", rpc_socket(runtime, socket))
         .env("TMUX", format!("{socket},1,0"))
         .env_remove("TMUX_PANE")
         .output()
@@ -891,7 +923,7 @@ fn agent_raw_stdin(
         .env("XDG_RUNTIME_DIR", runtime)
         .env("XDG_STATE_HOME", state)
         .env("AGENT_TALK_DIR", legacy_mail)
-        .env_remove("AGENT_TALK_RPC_SOCKET")
+        .env("AGENT_TALK_RPC_SOCKET", rpc_socket(runtime, socket))
         .env("TMUX", format!("{socket},1,0"))
         .env("TMUX_PANE", pane)
         .stdin(Stdio::piped())
@@ -916,6 +948,13 @@ fn tmux(name: &str, args: &[&str]) -> Output {
         String::from_utf8_lossy(&output.stderr)
     );
     output
+}
+
+fn rpc_socket(runtime: &Path, tmux_socket: &str) -> std::path::PathBuf {
+    runtime
+        .join("agent-talkd")
+        .join(Path::new(tmux_socket).file_name().unwrap())
+        .with_extension("sock")
 }
 
 fn tmux_eventually(name: &str, args: &[&str]) -> Output {

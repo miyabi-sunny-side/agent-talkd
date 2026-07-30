@@ -205,6 +205,7 @@ mod tests {
         let config = Config {
             tmux_socket: String::new(),
             rpc_socket,
+            http_socket: PathBuf::new(),
             journal: PathBuf::new(),
             log: PathBuf::new(),
             queue_limit: 1,

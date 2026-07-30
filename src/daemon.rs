@@ -10,6 +10,17 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
+use bytes::Bytes;
+use http_body_util::Full;
+use hyper::{
+    Method, Request as HttpRequest, Response as HttpResponse, StatusCode,
+    body::Incoming,
+    header::{ALLOW, CACHE_CONTROL, CONTENT_TYPE},
+    server::conn::http1,
+    service::service_fn,
+};
+use hyper_util::rt::TokioIo;
+use serde::Serialize;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
@@ -97,7 +108,24 @@ enum Event {
         reply: oneshot::Sender<Response>,
         flushed: oneshot::Receiver<()>,
     },
+    HttpWho {
+        reply: oneshot::Sender<std::result::Result<Vec<WebAgent>, String>>,
+    },
     ServerCheck,
+}
+
+#[derive(Debug, Serialize)]
+struct WebAgent {
+    name: String,
+    state: AgentState,
+    pane_id: String,
+    session: String,
+    location: String,
+    cwd: String,
+}
+
+mod embedded {
+    include!(concat!(env!("OUT_DIR"), "/web_assets.rs"));
 }
 
 pub async fn run(config: Config) -> Result<()> {
@@ -115,6 +143,9 @@ pub async fn run(config: Config) -> Result<()> {
     }
     let listener = UnixListener::bind(&config.rpc_socket)
         .with_context(|| format!("cannot bind {}", config.rpc_socket.display()))?;
+    remove_stale_socket(&config.http_socket)?;
+    let http_listener = UnixListener::bind(&config.http_socket)
+        .with_context(|| format!("cannot bind {}", config.http_socket.display()))?;
 
     let tmux = Tmux::new(config.tmux_socket.clone());
     let server_pid = tmux.server_pid().await?;
@@ -127,6 +158,7 @@ pub async fn run(config: Config) -> Result<()> {
     );
     let (tx, mut rx) = mpsc::channel::<Event>(64);
     spawn_accept_loop(listener, tx.clone());
+    spawn_http_accept_loop(http_listener, tx.clone());
     let health_tx = tx.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
@@ -166,6 +198,10 @@ pub async fn run(config: Config) -> Result<()> {
                     break;
                 }
             }
+            Event::HttpWho { reply } => {
+                let result = broker.web_agents().await.map_err(|error| error.to_string());
+                let _ = reply.send(result);
+            }
             Event::ServerCheck => match tmux.server_pid().await {
                 Ok(pid) if pid == server_pid => failed_health_checks = 0,
                 Ok(_) => break,
@@ -191,6 +227,14 @@ pub async fn run(config: Config) -> Result<()> {
     }
     tmux.remove_pane_exit_hook().await;
     let _ = fs::remove_file(&broker.config.rpc_socket);
+    let _ = fs::remove_file(&broker.config.http_socket);
+    Ok(())
+}
+
+fn remove_stale_socket(path: &Path) -> Result<()> {
+    if path.exists() {
+        fs::remove_file(path).with_context(|| format!("cannot remove {}", path.display()))?;
+    }
     Ok(())
 }
 
@@ -208,6 +252,157 @@ fn spawn_accept_loop(listener: UnixListener, tx: mpsc::Sender<Event>) {
             });
         }
     });
+}
+
+fn spawn_http_accept_loop(listener: UnixListener, tx: mpsc::Sender<Event>) {
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            let peer_uid = stream.peer_cred().ok().map(|credentials| credentials.uid());
+            let effective_uid = unsafe { libc::geteuid() };
+            if !peer_uid_allowed(peer_uid, effective_uid) {
+                warn!(?peer_uid, effective_uid, "rejected HTTP socket peer uid");
+                continue;
+            }
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let service = service_fn(move |request| route_http(request, tx.clone()));
+                if let Err(error) = http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await
+                {
+                    warn!(%error, "HTTP connection failed");
+                }
+            });
+        }
+    });
+}
+
+fn peer_uid_allowed(peer_uid: Option<u32>, effective_uid: u32) -> bool {
+    peer_uid == Some(effective_uid)
+}
+
+async fn route_http(
+    request: HttpRequest<Incoming>,
+    tx: mpsc::Sender<Event>,
+) -> std::result::Result<HttpResponse<Full<Bytes>>, std::convert::Infallible> {
+    let response = match classify_http(request.method(), request.uri().path()) {
+        HttpRoute::MethodNotAllowed => response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "application/json",
+            br#"{"error":"method_not_allowed"}"#,
+        )
+        .with_header(ALLOW, "GET"),
+        HttpRoute::Hello => json_response(
+            StatusCode::OK,
+            &serde_json::json!({
+                "name": "agent-talk",
+                "version": env!("CARGO_PKG_VERSION"),
+            }),
+        ),
+        HttpRoute::Who => {
+            let (reply, receive) = oneshot::channel();
+            if tx.send(Event::HttpWho { reply }).await.is_err() {
+                json_error(StatusCode::SERVICE_UNAVAILABLE, "broker_unavailable")
+            } else {
+                match receive.await {
+                    Ok(Ok(agents)) => {
+                        json_response(StatusCode::OK, &serde_json::json!({ "agents": agents }))
+                    }
+                    _ => json_error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable"),
+                }
+            }
+        }
+        HttpRoute::ApiNotFound => json_error(StatusCode::NOT_FOUND, "not_found"),
+        HttpRoute::Static => static_response(request.uri().path()),
+    };
+    Ok(response)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum HttpRoute {
+    MethodNotAllowed,
+    Hello,
+    Who,
+    ApiNotFound,
+    Static,
+}
+
+fn classify_http(method: &Method, path: &str) -> HttpRoute {
+    if method != Method::GET {
+        return HttpRoute::MethodNotAllowed;
+    }
+    match path {
+        "/v1/hello" => HttpRoute::Hello,
+        "/v1/who" => HttpRoute::Who,
+        path if path.starts_with("/v1/") => HttpRoute::ApiNotFound,
+        _ => HttpRoute::Static,
+    }
+}
+
+trait HeaderExt {
+    fn with_header(self, name: hyper::header::HeaderName, value: &'static str) -> Self;
+}
+
+impl HeaderExt for HttpResponse<Full<Bytes>> {
+    fn with_header(mut self, name: hyper::header::HeaderName, value: &'static str) -> Self {
+        self.headers_mut()
+            .insert(name, value.parse().expect("valid header"));
+        self
+    }
+}
+
+fn json_response(status: StatusCode, value: &impl Serialize) -> HttpResponse<Full<Bytes>> {
+    let body =
+        serde_json::to_vec(value).unwrap_or_else(|_| br#"{"error":"encoding_failed"}"#.to_vec());
+    response(status, "application/json; charset=utf-8", &body)
+}
+
+fn json_error(status: StatusCode, code: &str) -> HttpResponse<Full<Bytes>> {
+    json_response(status, &serde_json::json!({ "error": code }))
+}
+
+fn static_response(path: &str) -> HttpResponse<Full<Bytes>> {
+    if embedded::ASSETS.is_empty() {
+        return json_error(StatusCode::SERVICE_UNAVAILABLE, "static_assets_unavailable");
+    }
+    let normalized = if path == "/" { "/index.html" } else { path };
+    let asset = embedded::ASSETS
+        .iter()
+        .find(|(route, _)| *route == normalized)
+        .or_else(|| {
+            embedded::ASSETS
+                .iter()
+                .find(|(route, _)| *route == "/index.html")
+        });
+    let Some((route, bytes)) = asset else {
+        return json_error(StatusCode::SERVICE_UNAVAILABLE, "static_assets_unavailable");
+    };
+    response(StatusCode::OK, content_type(route), bytes).with_header(CACHE_CONTROL, "no-cache")
+}
+
+fn content_type(path: &str) -> &'static str {
+    match Path::new(path).extension().and_then(OsStr::to_str) {
+        Some("css") => "text/css; charset=utf-8",
+        Some("js") => "text/javascript; charset=utf-8",
+        Some("svg") => "image/svg+xml",
+        Some("json") => "application/json; charset=utf-8",
+        _ => "text/html; charset=utf-8",
+    }
+}
+
+fn response(
+    status: StatusCode,
+    content_type: &'static str,
+    body: &[u8],
+) -> HttpResponse<Full<Bytes>> {
+    HttpResponse::builder()
+        .status(status)
+        .header(CONTENT_TYPE, content_type)
+        .body(Full::new(Bytes::copy_from_slice(body)))
+        .expect("valid HTTP response")
 }
 
 async fn serve_client(stream: UnixStream, tx: mpsc::Sender<Event>) -> Result<()> {
@@ -241,6 +436,24 @@ struct Broker {
 }
 
 impl Broker {
+    async fn web_agents(&self) -> Result<Vec<WebAgent>> {
+        let panes = self.tmux.panes().await?;
+        let mut agents = Vec::new();
+        for pane in panes {
+            if let Some(agent) = self.state.agents.get(&pane.pane_id) {
+                agents.push(WebAgent {
+                    name: agent.name.clone(),
+                    state: agent.state,
+                    pane_id: pane.pane_id,
+                    session: pane.session.clone(),
+                    location: format!("{}:{}.{}", pane.session, pane.window_index, pane.pane_index),
+                    cwd: pane.cwd,
+                });
+            }
+        }
+        Ok(agents)
+    }
+
     async fn handle(&mut self, request: Request) -> Response {
         let result = match request.command.as_str() {
             "register" => self.register(request).await,
@@ -1326,7 +1539,62 @@ fn init_logging(path: &Path, configured_level: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{SendIntent, SendOptions, rfc3339};
+    use hyper::{Method, StatusCode};
+
+    use super::{
+        HttpRoute, SendIntent, SendOptions, WebAgent, classify_http, peer_uid_allowed, rfc3339,
+        static_response,
+    };
+    use crate::state::AgentState;
+
+    #[test]
+    fn http_routes_are_read_only_and_api_misses_do_not_fall_back() {
+        assert_eq!(classify_http(&Method::GET, "/v1/hello"), HttpRoute::Hello);
+        assert_eq!(classify_http(&Method::GET, "/v1/who"), HttpRoute::Who);
+        assert_eq!(
+            classify_http(&Method::GET, "/v1/missing"),
+            HttpRoute::ApiNotFound
+        );
+        assert_eq!(
+            classify_http(&Method::GET, "/agents/one"),
+            HttpRoute::Static
+        );
+        assert_eq!(
+            classify_http(&Method::POST, "/v1/who"),
+            HttpRoute::MethodNotAllowed
+        );
+    }
+
+    #[test]
+    fn uid_gate_requires_a_known_matching_peer() {
+        assert!(peer_uid_allowed(Some(1000), 1000));
+        assert!(!peer_uid_allowed(Some(1001), 1000));
+        assert!(!peer_uid_allowed(None, 1000));
+    }
+
+    #[test]
+    fn web_agent_json_escapes_paths_with_spaces_and_quotes() {
+        let encoded = serde_json::to_string(&WebAgent {
+            name: "co\"dex".into(),
+            state: AgentState::Idle,
+            pane_id: "%1".into(),
+            session: "work".into(),
+            location: "work:0.1".into(),
+            cwd: "/tmp/project with \"quotes\"".into(),
+        })
+        .unwrap();
+        assert!(encoded.contains(r#""cwd":"/tmp/project with \"quotes\"""#));
+    }
+
+    #[test]
+    fn cargo_build_without_frontend_reports_static_assets_unavailable() {
+        if super::embedded::ASSETS.is_empty() {
+            assert_eq!(
+                static_response("/").status(),
+                StatusCode::SERVICE_UNAVAILABLE
+            );
+        }
+    }
 
     #[test]
     fn epoch_is_rendered_as_stable_utc_rfc3339() {

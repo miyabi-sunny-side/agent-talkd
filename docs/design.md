@@ -9,6 +9,10 @@ agent-talkd は、tmux 上の対話エージェントへ作業中の入力を割
   queueを単一イベントループで所有します。
 - `agent-talk` の各CLIコマンドは、tmux socket名ごとのUnix domain socketを
   通じてdaemonへ1要求を送ります。daemonがなければ競合を避けて自動起動します。
+- daemonは同じイベントループへ接続する第二のUnix domain socketで、read-onlyな
+  HTTP adapterも提供します。HTTP接続の処理は個別taskで行いますが、`GET /v1/who`は
+  eventを主ループへ送り、daemon memoryとlive tmux paneをそこで照合します。registryを
+  別の状態storeへ複製しないため、CLI配送との状態競合を増やしません。
 - `ensure-daemon` は同じtmux socketだけを対象に、実行中daemonの版を確認します。
   同版なら何もせず、旧版は graceful shutdown を先に試し、旧RPCしかない場合だけ
   Unix socket peer の UID/PID に限定して停止します。複数tmux serverを探索したり、
@@ -26,6 +30,53 @@ agent-talkd は、tmux 上の対話エージェントへ作業中の入力を割
   checkで検知し、一過性の実行失敗は1回だけ許容します。監視用のtmux sessionやcontrol
   mode clientは作成しません。hookにはdaemonのRPC socket絶対パスを渡し、tmux serverと
   CLIの環境変数が異なっても同じdaemonへ接続します。
+
+## Status pageとHTTP-over-UDS
+
+HTTP adapterは同一ホスト・同一tmux serverという境界を維持するため、TCP listenerを
+作りません。既定のsocketはruntime directoryの
+`agent-talkd/<tmux-socket-name>.http.sock`で、CLI用
+`agent-talkd/<tmux-socket-name>.sock`とstemを共有します。tmux socketのbasenameは
+英数字・`-`・`_`以外を`_`へ正規化します。`XDG_RUNTIME_DIR`がなければ
+`~/.cache/agent-talkd/run`をruntime directoryとします。RPC socketを環境変数で
+上書きした場合も、その実効RPC pathの親directoryとfile stemから
+`<stem>.http.sock`を導出します。二つのsocketを別の信頼境界へ分離しません。
+
+daemon起動時はsocket親directoryを作成して0700へ固定し、HTTP接続accept後にも
+peer credentialのUIDがdaemonのeffective UIDと一致することを要求します。前者は
+別UIDがsocketへ到達する経路をdirectoryで制限し、後者は既存directoryのmodeや
+環境差に依存しない接続単位の検査です。どちらかを外すと、registryのpane情報やcwdを
+同一UID外へ露出させる可能性があります。これは同じUID内のクライアントを相互認証する
+仕組みではありません。
+
+routeは次の順で分類します。
+
+1. GET以外は、pathにかかわらず`Allow: GET`付きのJSON 405にする。
+2. `GET /v1/hello`は製品名とversion、`GET /v1/who`はregistry snapshotをJSONで返す。
+3. 未知の`/v1/`以下は静的fallbackへ流さずJSON 404にする。
+4. その他のGETは埋め込みassetを返し、該当assetがなければ`/index.html`へfallbackする。
+
+HTTP APIは状態変更routeを持ちません。screen capture、letter送受信、busy recoveryも
+この段階のadapterには含めません。ブラウザはUDSを直接開けないため、status pageを
+ブラウザで利用するtransport bridgeも別scopeです。
+
+起動時はstaleなHTTP socketを除去してからbindします。daemonのイベントループ終了時は
+RPC socketとHTTP socketの両方を除去します。bind途中で失敗した場合にHTTPだけを提供する、
+またはRPCだけで継続する縮退modeは設けず、daemon全体を起動失敗にします。
+
+## Frontendの埋め込みと更新
+
+status clientはNode.js 24、strict TypeScript、Svelte 5、Viteで構築します。npm依存関係は
+`client/package-lock.json`で固定し、CIとreleaseは`npm ci`、format/type/test、frontend
+buildをRust buildより先に実行します。Cargoの`build.rs`はnpmを起動せず、既に存在する
+`client/dist`を列挙して`include_bytes!`用の表を生成します。これによりRustだけのbuildは
+frontend toolchainなしでも成功し、assetがないバイナリはAPIを維持したまま静的routeだけ
+`static_assets_unavailable`の503を返します。assetが必要な配布物は、順序を逆にすると
+動作するstatus pageを含まないため、frontend-firstのbuild順がrelease不変条件です。
+
+配布時は静的assetも既存の単一`agent-talk`バイナリに含まれます。したがってupdaterの
+タグ固定asset、checksum検証、atomic replacementという既存境界がUIにもそのまま及び、
+UI用の別install先・別version・別更新チャネルを作りません。
 
 ## 状態と配送
 

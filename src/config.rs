@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     env,
+    ffi::OsStr,
     path::{Path, PathBuf},
 };
 
@@ -29,6 +30,7 @@ impl SkillSyntax {
 pub struct Config {
     pub tmux_socket: String,
     pub rpc_socket: PathBuf,
+    pub http_socket: PathBuf,
     pub journal: PathBuf,
     pub log: PathBuf,
     pub queue_limit: usize,
@@ -71,12 +73,15 @@ impl Config {
             .map(|value| parse_token_set("@agent_talkd_allowed_sources", &value))
             .transpose()?
             .unwrap_or_else(|| BTreeSet::from(["mobile".into()]));
+        let rpc_socket = env::var_os("AGENT_TALK_RPC_SOCKET").map_or_else(
+            || runtime.join("agent-talkd").join(format!("{name}.sock")),
+            PathBuf::from,
+        );
+        let http_socket = http_socket_for(&rpc_socket);
         Ok(Some(Self {
             tmux_socket,
-            rpc_socket: env::var_os("AGENT_TALK_RPC_SOCKET").map_or_else(
-                || runtime.join("agent-talkd").join(format!("{name}.sock")),
-                PathBuf::from,
-            ),
+            rpc_socket,
+            http_socket,
             journal: state.join("agent-talkd").join(format!("{name}.journal")),
             log: state.join("agent-talkd").join("agent-talkd.log"),
             queue_limit,
@@ -86,6 +91,15 @@ impl Config {
             allowed_sources,
         }))
     }
+}
+
+fn http_socket_for(rpc_socket: &Path) -> PathBuf {
+    let mut filename = rpc_socket
+        .file_stem()
+        .unwrap_or_else(|| OsStr::new("agent-talkd"))
+        .to_os_string();
+    filename.push(".http.sock");
+    rpc_socket.with_file_name(filename)
 }
 
 fn parse_skill_syntax(value: Option<&str>) -> Result<BTreeMap<String, SkillSyntax>> {
@@ -201,5 +215,17 @@ mod tests {
             assert!(!is_safe_token(invalid), "{invalid}");
         }
         assert!(!is_safe_token(&"a".repeat(MAX_TOKEN_LEN + 1)));
+    }
+
+    #[test]
+    fn http_socket_uses_the_effective_rpc_parent_and_stem() {
+        assert_eq!(
+            http_socket_for(Path::new("/tmp/custom runtime/broker.sock")),
+            PathBuf::from("/tmp/custom runtime/broker.http.sock")
+        );
+        assert_eq!(
+            http_socket_for(Path::new("/run/user/1000/agent-talkd/tmux-main.sock")),
+            PathBuf::from("/run/user/1000/agent-talkd/tmux-main.http.sock")
+        );
     }
 }

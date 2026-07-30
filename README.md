@@ -48,10 +48,17 @@ rm -rf "$tmpdir"
 ```sh
 git clone https://github.com/miyabi-sunny-side/agent-talkd.git
 cd agent-talkd
+npm --prefix client ci
+npm --prefix client run build
 cargo build --release --locked
 mkdir -p ~/.local/bin
 install -m755 target/release/agent-talk ~/.local/bin/agent-talk
 ```
+
+フロントエンドのビルドにはNode.js 24とnpmを使います。`client/dist`を先に生成すると、
+続くCargoビルドがその静的ファイルを単一の`agent-talk`バイナリへ埋め込みます。
+`build.rs`からnpmは起動しません。`client/dist`がない状態でもCargoビルド自体は成功しますが、
+そのバイナリの静的ページは503を返します。
 
 ## tmuxプラグイン
 
@@ -100,6 +107,43 @@ socketです。
 Releaseだけを対象に、タグ固定assetとSHA-256を検証して更新します。ローカル版が
 latest以上の場合はdowngradeせず、デーモンの版確認だけを行います。tmux serverが
 無い環境ではCLI更新を完了し、daemonは `not applicable` と表示します。
+
+## Agent registry status page
+
+daemonはCLI用RPC socketに加え、read-onlyなagent registryと埋め込み済みSPAを
+HTTP-over-UDSで提供します。これはTCP listenerではなくUnix domain socketなので、
+通常のブラウザから直接開くことはできません。TCP proxyやtsnet連携は現時点では
+含まれません。
+
+既定のHTTP socketは
+`$XDG_RUNTIME_DIR/agent-talkd/<tmux-socket-name>.http.sock`です。
+`XDG_RUNTIME_DIR`が未設定なら
+`~/.cache/agent-talkd/run/agent-talkd/<tmux-socket-name>.http.sock`を使います。
+`<tmux-socket-name>`はtmux socketのbasenameを取り、英数字・`-`・`_`以外を
+`_`へ置換した値です。既定のCLI用`<tmux-socket-name>.sock`と同じstemを使います。
+`AGENT_TALK_RPC_SOCKET=/path/custom.sock`でRPC socketを上書きした場合も、同じ親directoryの
+`/path/custom.http.sock`へ追随します。
+
+- `GET /v1/hello`: 製品名とversionをJSONで返します。
+- `GET /v1/who`: 現在登録中のagent名、idle/busy状態、pane、session、location、cwdを
+  JSONで返します。
+- 未知の`/v1/`以下: JSONの404を返します。
+- GET以外: `Allow: GET`付きの405を返します。
+- その他のGET: 埋め込み静的ファイルを返し、未知の画面パスはSPA entryへfallbackします。
+  静的ファイルを埋め込まずにビルドした場合はJSONの503を返します。
+
+UDS上のAPIは、たとえば次のように確認できます。
+
+```sh
+agent_talk_runtime="${XDG_RUNTIME_DIR:-$HOME/.cache/agent-talkd/run}"
+agent_talk_tmux_name="$(tmux display-message -p '#{socket_path}' \
+  | sed 's|.*/||; s/[^A-Za-z0-9_-]/_/g')"
+curl --unix-socket \
+  "$agent_talk_runtime/agent-talkd/$agent_talk_tmux_name.http.sock" \
+  http://localhost/v1/who
+```
+
+この例は`AGENT_TALK_RPC_SOCKET`を上書きしていない既定設定向けです。
 
 `send` は `#<id>` を返し、受信側は呼び鈴に表示された
 `agent-talk read <id>` で依頼本文を取得します。`read` はcheckpointまでは
@@ -153,9 +197,16 @@ health checkで検知し、一過性の実行失敗は1回だけ許容します�
 ## テスト
 
 ```sh
-cargo test
-cargo test --test tmux_integration -- --ignored
-cargo clippy --all-targets -- -D warnings
+npm --prefix client ci
+npm --prefix client run format:check
+npm --prefix client run check
+npm --prefix client test
+npm --prefix client run build
+cargo fmt -- --check
+cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo test --locked
+cargo test --locked --test tmux_integration -- --ignored
+cargo build --locked --release
 ```
 
 統合テストは隔離した実 tmux サーバーを作成するため、通常のテスト実行では
