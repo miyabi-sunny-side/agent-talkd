@@ -108,10 +108,27 @@ enum Event {
         reply: oneshot::Sender<Response>,
         flushed: oneshot::Receiver<()>,
     },
-    HttpWho {
+    Http(HttpEvent),
+    ServerCheck,
+}
+
+enum HttpEvent {
+    Who {
         reply: oneshot::Sender<std::result::Result<Vec<WebAgent>, String>>,
     },
-    ServerCheck,
+    Screen {
+        pane: String,
+        reply: oneshot::Sender<std::result::Result<WebScreen, WebError>>,
+    },
+    Mailboxes {
+        reply: oneshot::Sender<Vec<String>>,
+    },
+    Mailbox {
+        mailbox: String,
+        after: Option<u64>,
+        limit: usize,
+        reply: oneshot::Sender<std::result::Result<Vec<ExternalMailboxView>, WebError>>,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -122,6 +139,32 @@ struct WebAgent {
     session: String,
     location: String,
     cwd: String,
+}
+
+#[derive(Debug, Serialize)]
+struct WebScreen {
+    pane_id: String,
+    screen: String,
+}
+
+#[derive(Debug)]
+struct WebError {
+    status: StatusCode,
+    code: &'static str,
+}
+
+impl WebError {
+    fn new(status: StatusCode, code: &'static str) -> Self {
+        Self { status, code }
+    }
+}
+
+fn capture_failure(pane_still_exists: Option<bool>) -> WebError {
+    if pane_still_exists == Some(false) {
+        WebError::new(StatusCode::GONE, "pane_unavailable")
+    } else {
+        WebError::new(StatusCode::SERVICE_UNAVAILABLE, "capture_unavailable")
+    }
 }
 
 mod embedded {
@@ -198,10 +241,7 @@ pub async fn run(config: Config) -> Result<()> {
                     break;
                 }
             }
-            Event::HttpWho { reply } => {
-                let result = broker.web_agents().await.map_err(|error| error.to_string());
-                let _ = reply.send(result);
-            }
+            Event::Http(event) => broker.handle_http_event(event).await,
             Event::ServerCheck => match tmux.server_pid().await {
                 Ok(pid) if pid == server_pid => failed_health_checks = 0,
                 Ok(_) => break,
@@ -302,23 +342,112 @@ async fn route_http(
                 "version": env!("CARGO_PKG_VERSION"),
             }),
         ),
-        HttpRoute::Who => {
-            let (reply, receive) = oneshot::channel();
-            if tx.send(Event::HttpWho { reply }).await.is_err() {
-                json_error(StatusCode::SERVICE_UNAVAILABLE, "broker_unavailable")
+        HttpRoute::Who => request_web_agents(&tx).await,
+        HttpRoute::Screen(pane) => {
+            if request.uri().query().is_some() {
+                json_error(StatusCode::BAD_REQUEST, "invalid_query")
             } else {
-                match receive.await {
-                    Ok(Ok(agents)) => {
-                        json_response(StatusCode::OK, &serde_json::json!({ "agents": agents }))
-                    }
-                    _ => json_error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable"),
-                }
+                request_web_screen(&tx, pane).await
             }
         }
-        HttpRoute::ApiNotFound => json_error(StatusCode::NOT_FOUND, "not_found"),
+        HttpRoute::Mailboxes => {
+            if request.uri().query().is_some() {
+                json_error(StatusCode::BAD_REQUEST, "invalid_query")
+            } else {
+                request_web_mailboxes(&tx).await
+            }
+        }
+        HttpRoute::Mailbox(mailbox) => {
+            request_web_mailbox(&tx, mailbox, request.uri().query()).await
+        }
+        HttpRoute::BadRequest => json_error(StatusCode::BAD_REQUEST, "invalid_path_parameter"),
+        HttpRoute::NotFound | HttpRoute::ApiNotFound => {
+            json_error(StatusCode::NOT_FOUND, "not_found")
+        }
         HttpRoute::Static => static_response(request.uri().path()),
     };
     Ok(response)
+}
+
+async fn request_web_agents(tx: &mpsc::Sender<Event>) -> HttpResponse<Full<Bytes>> {
+    let (reply, receive) = oneshot::channel();
+    if tx
+        .send(Event::Http(HttpEvent::Who { reply }))
+        .await
+        .is_err()
+    {
+        return json_error(StatusCode::SERVICE_UNAVAILABLE, "broker_unavailable");
+    }
+    match receive.await {
+        Ok(Ok(agents)) => json_response(StatusCode::OK, &serde_json::json!({ "agents": agents })),
+        _ => json_error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable"),
+    }
+}
+
+async fn request_web_screen(tx: &mpsc::Sender<Event>, pane: String) -> HttpResponse<Full<Bytes>> {
+    let (reply, receive) = oneshot::channel();
+    if tx
+        .send(Event::Http(HttpEvent::Screen { pane, reply }))
+        .await
+        .is_err()
+    {
+        return json_error(StatusCode::SERVICE_UNAVAILABLE, "broker_unavailable");
+    }
+    match receive.await {
+        Ok(Ok(screen)) => json_response(StatusCode::OK, &screen),
+        Ok(Err(error)) => json_error(error.status, error.code),
+        Err(_) => json_error(StatusCode::SERVICE_UNAVAILABLE, "broker_unavailable"),
+    }
+}
+
+async fn request_web_mailboxes(tx: &mpsc::Sender<Event>) -> HttpResponse<Full<Bytes>> {
+    let (reply, receive) = oneshot::channel();
+    if tx
+        .send(Event::Http(HttpEvent::Mailboxes { reply }))
+        .await
+        .is_err()
+    {
+        return json_error(StatusCode::SERVICE_UNAVAILABLE, "broker_unavailable");
+    }
+    match receive.await {
+        Ok(mailboxes) => json_response(
+            StatusCode::OK,
+            &serde_json::json!({ "mailboxes": mailboxes }),
+        ),
+        Err(_) => json_error(StatusCode::SERVICE_UNAVAILABLE, "broker_unavailable"),
+    }
+}
+
+async fn request_web_mailbox(
+    tx: &mpsc::Sender<Event>,
+    mailbox: String,
+    query: Option<&str>,
+) -> HttpResponse<Full<Bytes>> {
+    let (after, limit) = match parse_mailbox_query(query) {
+        Ok(page) => page,
+        Err(code) => return json_error(StatusCode::BAD_REQUEST, code),
+    };
+    let (reply, receive) = oneshot::channel();
+    if tx
+        .send(Event::Http(HttpEvent::Mailbox {
+            mailbox: mailbox.clone(),
+            after,
+            limit,
+            reply,
+        }))
+        .await
+        .is_err()
+    {
+        return json_error(StatusCode::SERVICE_UNAVAILABLE, "broker_unavailable");
+    }
+    match receive.await {
+        Ok(Ok(events)) => json_response(
+            StatusCode::OK,
+            &serde_json::json!({ "version": 1, "mailbox": mailbox, "events": events }),
+        ),
+        Ok(Err(error)) => json_error(error.status, error.code),
+        Err(_) => json_error(StatusCode::SERVICE_UNAVAILABLE, "broker_unavailable"),
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -326,6 +455,11 @@ enum HttpRoute {
     MethodNotAllowed,
     Hello,
     Who,
+    Screen(String),
+    Mailboxes,
+    Mailbox(String),
+    BadRequest,
+    NotFound,
     ApiNotFound,
     Static,
 }
@@ -337,9 +471,119 @@ fn classify_http(method: &Method, path: &str) -> HttpRoute {
     match path {
         "/v1/hello" => HttpRoute::Hello,
         "/v1/who" => HttpRoute::Who,
+        "/v1/mailboxes" => HttpRoute::Mailboxes,
+        path if path.starts_with("/v1/agents/") && path.ends_with("/screen") => {
+            let encoded = path
+                .strip_prefix("/v1/agents/")
+                .and_then(|rest| rest.strip_suffix("/screen"))
+                .unwrap_or_default();
+            match decode_path_segment(encoded) {
+                Some(pane) if valid_pane_id(&pane) => HttpRoute::Screen(pane),
+                Some(_) => HttpRoute::NotFound,
+                None => HttpRoute::BadRequest,
+            }
+        }
+        path if let Some(encoded) = path.strip_prefix("/v1/mailbox/") => {
+            match decode_path_segment(encoded) {
+                Some(mailbox) if is_safe_token(&mailbox) => HttpRoute::Mailbox(mailbox),
+                Some(_) => HttpRoute::NotFound,
+                None => HttpRoute::BadRequest,
+            }
+        }
         path if path.starts_with("/v1/") => HttpRoute::ApiNotFound,
         _ => HttpRoute::Static,
     }
+}
+
+fn decode_path_segment(encoded: &str) -> Option<String> {
+    if encoded.is_empty() || encoded.contains('/') || encoded.contains('\0') {
+        return None;
+    }
+    let bytes = encoded.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let high = *bytes.get(index + 1)?;
+            let low = *bytes.get(index + 2)?;
+            decoded.push(hex_value(high)? * 16 + hex_value(low)?);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    if decoded.contains(&b'/') || decoded.contains(&0) {
+        return None;
+    }
+    String::from_utf8(decoded).ok()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn valid_pane_id(pane: &str) -> bool {
+    pane.strip_prefix('%').is_some_and(|digits| {
+        !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
+fn parse_mailbox_query(
+    query: Option<&str>,
+) -> std::result::Result<(Option<u64>, usize), &'static str> {
+    let mut after = None::<&str>;
+    let mut limit = None::<&str>;
+    let Some(query) = query else {
+        return parse_mailbox_page(after, limit).map_err(|_| "invalid_query");
+    };
+    if query.is_empty() {
+        return Err("invalid_query");
+    }
+    for pair in query.split('&') {
+        let Some((key, value)) = pair.split_once('=') else {
+            return Err("invalid_query");
+        };
+        match key {
+            "after" if after.is_none() => after = Some(value),
+            "limit" if limit.is_none() => limit = Some(value),
+            "after" | "limit" => return Err("duplicate_query_parameter"),
+            _ => return Err("invalid_query"),
+        }
+    }
+    parse_mailbox_page(after, limit).map_err(|error| match error {
+        MailboxPageError::InvalidAfter => "invalid_after",
+        MailboxPageError::InvalidLimit | MailboxPageError::LimitOutOfRange => "invalid_limit",
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MailboxPageError {
+    InvalidAfter,
+    InvalidLimit,
+    LimitOutOfRange,
+}
+
+fn parse_mailbox_page(
+    after: Option<&str>,
+    limit: Option<&str>,
+) -> std::result::Result<(Option<u64>, usize), MailboxPageError> {
+    let after = after
+        .map(|value| value.parse().map_err(|_| MailboxPageError::InvalidAfter))
+        .transpose()?;
+    let limit = limit
+        .map(|value| value.parse().map_err(|_| MailboxPageError::InvalidLimit))
+        .transpose()?
+        .unwrap_or(100);
+    if !(1..=500).contains(&limit) {
+        return Err(MailboxPageError::LimitOutOfRange);
+    }
+    Ok((after, limit))
 }
 
 trait HeaderExt {
@@ -436,6 +680,29 @@ struct Broker {
 }
 
 impl Broker {
+    async fn handle_http_event(&self, event: HttpEvent) {
+        match event {
+            HttpEvent::Who { reply } => {
+                let result = self.web_agents().await.map_err(|error| error.to_string());
+                let _ = reply.send(result);
+            }
+            HttpEvent::Screen { pane, reply } => {
+                let _ = reply.send(self.web_screen(&pane).await);
+            }
+            HttpEvent::Mailboxes { reply } => {
+                let _ = reply.send(self.config.allowed_sources.iter().cloned().collect());
+            }
+            HttpEvent::Mailbox {
+                mailbox,
+                after,
+                limit,
+                reply,
+            } => {
+                let _ = reply.send(self.web_mailbox(&mailbox, after, limit));
+            }
+        }
+    }
+
     async fn web_agents(&self) -> Result<Vec<WebAgent>> {
         let panes = self.tmux.panes().await?;
         let mut agents = Vec::new();
@@ -452,6 +719,51 @@ impl Broker {
             }
         }
         Ok(agents)
+    }
+
+    async fn web_screen(&self, pane: &str) -> std::result::Result<WebScreen, WebError> {
+        if !self.state.agents.contains_key(pane) {
+            return Err(WebError::new(StatusCode::NOT_FOUND, "agent_not_found"));
+        }
+        let panes = self
+            .tmux
+            .panes()
+            .await
+            .map_err(|_| WebError::new(StatusCode::SERVICE_UNAVAILABLE, "tmux_unavailable"))?;
+        if !panes.iter().any(|candidate| candidate.pane_id == pane) {
+            return Err(WebError::new(StatusCode::GONE, "pane_unavailable"));
+        }
+        if let Ok(screen) = self.tmux.capture_pane(pane).await {
+            Ok(WebScreen {
+                pane_id: pane.to_owned(),
+                screen,
+            })
+        } else {
+            let pane_still_exists = self
+                .tmux
+                .panes()
+                .await
+                .ok()
+                .map(|panes| panes.iter().any(|candidate| candidate.pane_id == pane));
+            Err(capture_failure(pane_still_exists))
+        }
+    }
+
+    fn web_mailbox(
+        &self,
+        mailbox: &str,
+        after: Option<u64>,
+        limit: usize,
+    ) -> std::result::Result<Vec<ExternalMailboxView>, WebError> {
+        if !self.config.allowed_sources.contains(mailbox) {
+            return Err(WebError::new(StatusCode::NOT_FOUND, "mailbox_not_found"));
+        }
+        Ok(self
+            .state
+            .mailbox_events(mailbox, after, limit)
+            .into_iter()
+            .map(ExternalMailboxView::from)
+            .collect())
     }
 
     async fn handle(&mut self, request: Request) -> Response {
@@ -1066,10 +1378,8 @@ impl Broker {
         if !is_safe_token(mailbox) || !self.config.allowed_sources.contains(mailbox) {
             return Ok(Response::error("mailbox が許可されていません"));
         }
-        let mut after = None;
-        let mut limit = 100usize;
-        let mut seen_after = false;
-        let mut seen_limit = false;
+        let mut after = None::<&str>;
+        let mut limit = None::<&str>;
         let mut index = 1;
         while index < request.args.len() {
             let option = request.args[index].as_str();
@@ -1078,27 +1388,16 @@ impl Broker {
             };
             match option {
                 "--after" => {
-                    if seen_after {
+                    if after.is_some() {
                         return Ok(Response::error("--after は複数指定できません"));
                     }
-                    seen_after = true;
-                    after = Some(
-                        value
-                            .parse::<u64>()
-                            .map_err(|_| anyhow::anyhow!("after id が不正です: {value}"))?,
-                    );
+                    after = Some(value);
                 }
                 "--limit" => {
-                    if seen_limit {
+                    if limit.is_some() {
                         return Ok(Response::error("--limit は複数指定できません"));
                     }
-                    seen_limit = true;
-                    limit = value
-                        .parse::<usize>()
-                        .map_err(|_| anyhow::anyhow!("limit が不正です: {value}"))?;
-                    if limit == 0 || limit > 500 {
-                        return Ok(Response::error("limit は1から500の範囲です"));
-                    }
+                    limit = Some(value);
                 }
                 _ => {
                     return Ok(Response::error(format!(
@@ -1108,6 +1407,24 @@ impl Broker {
             }
             index += 2;
         }
+        let (after, limit) = match parse_mailbox_page(after, limit) {
+            Ok(page) => page,
+            Err(MailboxPageError::InvalidAfter) => {
+                return Err(anyhow::anyhow!(
+                    "after id が不正です: {}",
+                    after.expect("invalid after has a value")
+                ));
+            }
+            Err(MailboxPageError::InvalidLimit) => {
+                return Err(anyhow::anyhow!(
+                    "limit が不正です: {}",
+                    limit.expect("invalid limit has a value")
+                ));
+            }
+            Err(MailboxPageError::LimitOutOfRange) => {
+                return Ok(Response::error("limit は1から500の範囲です"));
+            }
+        };
         let events = self
             .state
             .mailbox_events(mailbox, after, limit)
@@ -1542,8 +1859,9 @@ mod tests {
     use hyper::{Method, StatusCode};
 
     use super::{
-        HttpRoute, SendIntent, SendOptions, WebAgent, classify_http, peer_uid_allowed, rfc3339,
-        static_response,
+        HttpRoute, MailboxPageError, SendIntent, SendOptions, WebAgent, capture_failure,
+        classify_http, decode_path_segment, parse_mailbox_page, parse_mailbox_query,
+        peer_uid_allowed, rfc3339, static_response,
     };
     use crate::state::AgentState;
 
@@ -1551,6 +1869,18 @@ mod tests {
     fn http_routes_are_read_only_and_api_misses_do_not_fall_back() {
         assert_eq!(classify_http(&Method::GET, "/v1/hello"), HttpRoute::Hello);
         assert_eq!(classify_http(&Method::GET, "/v1/who"), HttpRoute::Who);
+        assert_eq!(
+            classify_http(&Method::GET, "/v1/agents/%251/screen"),
+            HttpRoute::Screen("%1".into())
+        );
+        assert_eq!(
+            classify_http(&Method::GET, "/v1/mailboxes"),
+            HttpRoute::Mailboxes
+        );
+        assert_eq!(
+            classify_http(&Method::GET, "/v1/mailbox/review%3Asecurity"),
+            HttpRoute::Mailbox("review:security".into())
+        );
         assert_eq!(
             classify_http(&Method::GET, "/v1/missing"),
             HttpRoute::ApiNotFound
@@ -1563,6 +1893,65 @@ mod tests {
             classify_http(&Method::POST, "/v1/who"),
             HttpRoute::MethodNotAllowed
         );
+        for path in [
+            "/v1/agents/screen",
+            "/v1/agents/%1/screen",
+            "/v1/agents//screen",
+            "/v1/mailbox/bad%2Fname",
+        ] {
+            assert_eq!(classify_http(&Method::GET, path), HttpRoute::BadRequest);
+        }
+        for path in [
+            "/v1/agents/%252F/screen",
+            "/v1/agents/%250x/screen",
+            "/v1/mailbox/Bad",
+        ] {
+            assert_eq!(classify_http(&Method::GET, path), HttpRoute::NotFound);
+        }
+    }
+
+    #[test]
+    fn strict_percent_decoder_rejects_malformed_and_unsafe_segments() {
+        assert_eq!(decode_path_segment("%251"), Some("%1".into()));
+        assert_eq!(decode_path_segment("mobile"), Some("mobile".into()));
+        assert_eq!(decode_path_segment("%"), None);
+        assert_eq!(decode_path_segment("%GG"), None);
+        assert_eq!(decode_path_segment("%2F"), None);
+        assert_eq!(decode_path_segment("%00"), None);
+        assert_eq!(decode_path_segment("a/b"), None);
+    }
+
+    #[test]
+    fn mailbox_query_is_bounded_and_rejects_duplicates() {
+        assert_eq!(parse_mailbox_query(None), Ok((None, 100)));
+        assert_eq!(
+            parse_mailbox_query(Some("after=41&limit=2")),
+            Ok((Some(41), 2))
+        );
+        assert_eq!(parse_mailbox_query(Some("limit=0")), Err("invalid_limit"));
+        assert_eq!(parse_mailbox_query(Some("limit=501")), Err("invalid_limit"));
+        assert_eq!(
+            parse_mailbox_query(Some("after=1&after=2")),
+            Err("duplicate_query_parameter")
+        );
+        assert_eq!(parse_mailbox_query(Some("unknown=1")), Err("invalid_query"));
+        assert_eq!(parse_mailbox_page(None, None), Ok((None, 100)));
+        assert_eq!(
+            parse_mailbox_page(Some("9"), Some("500")),
+            Ok((Some(9), 500))
+        );
+        assert_eq!(
+            parse_mailbox_page(Some("bad"), None),
+            Err(MailboxPageError::InvalidAfter)
+        );
+        assert_eq!(
+            parse_mailbox_page(None, Some("bad")),
+            Err(MailboxPageError::InvalidLimit)
+        );
+        assert_eq!(
+            parse_mailbox_page(None, Some("501")),
+            Err(MailboxPageError::LimitOutOfRange)
+        );
     }
 
     #[test]
@@ -1570,6 +1959,18 @@ mod tests {
         assert!(peer_uid_allowed(Some(1000), 1000));
         assert!(!peer_uid_allowed(Some(1001), 1000));
         assert!(!peer_uid_allowed(None, 1000));
+    }
+
+    #[test]
+    fn capture_failure_only_reports_gone_after_confirmed_disappearance() {
+        let gone = capture_failure(Some(false));
+        assert_eq!(gone.status, StatusCode::GONE);
+        assert_eq!(gone.code, "pane_unavailable");
+        for still_exists in [Some(true), None] {
+            let transient = capture_failure(still_exists);
+            assert_eq!(transient.status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(transient.code, "capture_unavailable");
+        }
     }
 
     #[test]

@@ -22,6 +22,8 @@ pub struct Tmux {
     socket: String,
 }
 
+const MAX_CAPTURE_BYTES: usize = 1024 * 1024;
+
 impl Tmux {
     pub fn new(socket: String) -> Self {
         Self { socket }
@@ -71,6 +73,14 @@ impl Tmux {
             return Err(error);
         }
         Ok(())
+    }
+
+    pub async fn capture_pane(&self, pane: &str) -> Result<String> {
+        let output = self.run(["capture-pane", "-p", "-t", pane]).await?;
+        if output.len() > MAX_CAPTURE_BYTES {
+            bail!("captured pane exceeds {MAX_CAPTURE_BYTES} bytes");
+        }
+        Ok(output)
     }
 
     pub async fn mark_talk_sent(&self, pane: &str) {

@@ -108,9 +108,10 @@ Releaseだけを対象に、タグ固定assetとSHA-256を検証して更新し�
 latest以上の場合はdowngradeせず、デーモンの版確認だけを行います。tmux serverが
 無い環境ではCLI更新を完了し、daemonは `not applicable` と表示します。
 
-## Agent registry status page
+## Read-only observation page
 
-daemonはCLI用RPC socketに加え、read-onlyなagent registryと埋め込み済みSPAを
+daemonはCLI用RPC socketに加え、read-onlyなagent registry、pane screen、外部mailbox
+履歴と埋め込み済みSPAを
 HTTP-over-UDSで提供します。これはTCP listenerではなくUnix domain socketなので、
 通常のブラウザから直接開くことはできません。TCP proxyやtsnet連携は現時点では
 含まれません。
@@ -127,10 +128,25 @@ HTTP-over-UDSで提供します。これはTCP listenerではなくUnix domain s
 - `GET /v1/hello`: 製品名とversionをJSONで返します。
 - `GET /v1/who`: 現在登録中のagent名、idle/busy状態、pane、session、location、cwdを
   JSONで返します。
+- `GET /v1/agents/<pane>/screen`: 登録中のpaneの現在の表示範囲を、plain textの
+  `screen` fieldを持つJSONで返します。`%1`のようなpane IDはURL上では
+  `%251`のようにpercent encodeします。
+- `GET /v1/mailboxes`: `@agent_talkd_allowed_sources`で現在許可されているmailbox名を返します。
+- `GET /v1/mailbox/<mailbox>?after=<id>&limit=<n>`: mailbox eventをID順に非consume取得します。
+  `after`は排他、`limit`は1〜500で既定100です。JSON event schemaは
+  `mailbox-list-v1`と同一です。
 - 未知の`/v1/`以下: JSONの404を返します。
 - GET以外: `Allow: GET`付きの405を返します。
 - その他のGET: 埋め込み静的ファイルを返し、未知の画面パスはSPA entryへfallbackします。
   静的ファイルを埋め込まずにビルドした場合はJSONの503を返します。
+
+screen/mailbox path parameterのencoding不正、screen・mailboxesへのquery、mailboxの
+未知・重複・範囲外queryは400です。decodeできてもpane IDやmailbox tokenの形式が不正、
+またはpaneが未登録・mailboxが未許可なら404を返します。登録確認後にpaneの消滅を確認した
+screen取得は410、tmux captureやbrokerの一時障害は503です。UIのScreenはdocumentが
+表示中の間だけ2秒ごとに更新し、手動更新もできます。取得済みscreenがある状態で更新に
+失敗した場合は、内容を薄く残して失敗状態を表示し、再取得を続けます。Lettersは自動poll
+せず、更新操作で最後のevent IDより後を追加取得します。
 
 UDS上のAPIは、たとえば次のように確認できます。
 
@@ -141,9 +157,23 @@ agent_talk_tmux_name="$(tmux display-message -p '#{socket_path}' \
 curl --unix-socket \
   "$agent_talk_runtime/agent-talkd/$agent_talk_tmux_name.http.sock" \
   http://localhost/v1/who
+
+curl --unix-socket \
+  "$agent_talk_runtime/agent-talkd/$agent_talk_tmux_name.http.sock" \
+  http://localhost/v1/agents/%251/screen
+
+curl --unix-socket \
+  "$agent_talk_runtime/agent-talkd/$agent_talk_tmux_name.http.sock" \
+  'http://localhost/v1/mailbox/mobile?after=0&limit=10'
 ```
 
 この例は`AGENT_TALK_RPC_SOCKET`を上書きしていない既定設定向けです。
+HTTP socketへ接続できる同一UIDのcallerは、paneやmailboxごとの所有者確認なしに、すべての
+登録paneの表示内容と現在許可されている全mailboxの履歴を読めます。peer UID検査は別のOS
+userからの接続を拒む境界であり、同一UID内の人間を識別・認可するidentity gateでは
+ありません。API応答はscreen内容をlogへ記録せず、状態変更、journal追記、terminal入力を
+行いません。letter送信とbusy recoveryは人間の権限を使う変更・割り込み操作なので、
+同一UIDだけを根拠に追加せず、Port-3のhuman identity gateと同時に導入します。
 
 `send` は `#<id>` を返し、受信側は呼び鈴に表示された
 `agent-talk read <id>` で依頼本文を取得します。`read` はcheckpointまでは

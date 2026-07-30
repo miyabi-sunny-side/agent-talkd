@@ -10,9 +10,9 @@ agent-talkd は、tmux 上の対話エージェントへ作業中の入力を割
 - `agent-talk` の各CLIコマンドは、tmux socket名ごとのUnix domain socketを
   通じてdaemonへ1要求を送ります。daemonがなければ競合を避けて自動起動します。
 - daemonは同じイベントループへ接続する第二のUnix domain socketで、read-onlyな
-  HTTP adapterも提供します。HTTP接続の処理は個別taskで行いますが、`GET /v1/who`は
-  eventを主ループへ送り、daemon memoryとlive tmux paneをそこで照合します。registryを
-  別の状態storeへ複製しないため、CLI配送との状態競合を増やしません。
+  HTTP adapterも提供します。registry、screen、許可済みmailboxの要求はeventを主ループへ
+  送り、daemon memoryとlive tmux paneをそこで照合します。registryやmailboxを別の
+  状態storeへ複製しないため、CLI配送との状態競合を増やしません。
 - `ensure-daemon` は同じtmux socketだけを対象に、実行中daemonの版を確認します。
   同版なら何もせず、旧版は graceful shutdown を先に試し、旧RPCしかない場合だけ
   Unix socket peer の UID/PID に限定して停止します。複数tmux serverを探索したり、
@@ -53,12 +53,41 @@ routeは次の順で分類します。
 
 1. GET以外は、pathにかかわらず`Allow: GET`付きのJSON 405にする。
 2. `GET /v1/hello`は製品名とversion、`GET /v1/who`はregistry snapshotをJSONで返す。
-3. 未知の`/v1/`以下は静的fallbackへ流さずJSON 404にする。
-4. その他のGETは埋め込みassetを返し、該当assetがなければ`/index.html`へfallbackする。
+3. `GET /v1/agents/<pane>/screen`はstrictにdecode・検証した登録paneだけをtmux adapterへ
+   渡し、現在の表示範囲をJSON内のplain-text文字列で返す。pane形式と登録確認は
+   subprocessより先に行う。
+4. `GET /v1/mailboxes`は現在のallowlist、`GET /v1/mailbox/<mailbox>`は既存の
+   `mailbox-list-v1`と同じ非consume event viewを返す。mailbox tokenとallowlist、
+   `after`、`limit`の検査は既存primitiveと共有する。
+5. 未知の`/v1/`以下は静的fallbackへ流さずJSON 404にする。
+6. その他のGETは埋め込みassetを返し、該当assetがなければ`/index.html`へfallbackする。
 
-HTTP APIは状態変更routeを持ちません。screen capture、letter送受信、busy recoveryも
-この段階のadapterには含めません。ブラウザはUDSを直接開けないため、status pageを
-ブラウザで利用するtransport bridgeも別scopeです。
+失敗応答は`{"error":"<code>"}`です。statusはcallerが再試行と選択修正を区別できるよう
+次の意味に固定します。
+
+| HTTP | 意味 | 主なcode |
+| --- | --- | --- |
+| 400 | path/queryを修正しない限り成功しない | `invalid_path_parameter`, `invalid_query`, `duplicate_query_parameter`, `invalid_after`, `invalid_limit` |
+| 404 | API、登録agent、または許可済みmailboxとして存在しない | `not_found`, `agent_not_found`, `mailbox_not_found` |
+| 410 | 登録確認後にlive paneの消滅を確認した | `pane_unavailable` |
+| 503 | broker、tmux、capture、registry、または静的assetが一時的・実行時に利用できない | `broker_unavailable`, `tmux_unavailable`, `capture_unavailable`, `registry_unavailable`, `static_assets_unavailable` |
+
+HTTP APIは状態変更routeを持ちません。screen captureはshellを介さない個別argvの
+`tmux capture-pane`に限定します。screen/mailbox path parameterのencoding不正、screen・
+mailboxesへのquery、mailboxの未知・重複・範囲外queryは400です。decode後のpane ID・
+mailbox token形式が不正、またはpaneが未登録・mailboxが未許可なら404です。登録確認後に
+paneが消えた場合だけ410とし、tmux一覧・captureまたはbrokerの一時障害は503にして、消滅と
+観測不能を混同しません。capture payloadは1 MiBを上限とし、screen内容をlogへ記録しません。
+mailbox履歴はreadしてもconsumeせず、journal追記、delivery state遷移、doorbell、checkpointへ
+影響を与えません。
+
+0700 directoryとpeer UID検査は別UIDからの開示を防ぎますが、同一UID内のpane所有者や
+人間を区別しません。そのためHTTP socketへ到達できる同一UID callerには、全登録paneの
+screenと、現在allowlistにある全mailbox eventを開示する設計です。この開示範囲を
+pane/mailbox単位の認可と誤解してはなりません。一方、letter送信とbusy recoveryはhuman
+authorityによる変更・割り込みなので、同一UIDだけを権限根拠にせず、Port-3のhuman identity
+gateを備えた入口と同時に導入してread-only UDSへ先行配置しません。ブラウザはUDSを直接
+開けないため、transport bridgeも別scopeです。
 
 起動時はstaleなHTTP socketを除去してからbindします。daemonのイベントループ終了時は
 RPC socketとHTTP socketの両方を除去します。bind途中で失敗した場合にHTTPだけを提供する、
@@ -66,7 +95,7 @@ RPC socketとHTTP socketの両方を除去します。bind途中で失敗した�
 
 ## Frontendの埋め込みと更新
 
-status clientはNode.js 24、strict TypeScript、Svelte 5、Viteで構築します。npm依存関係は
+observation clientはNode.js 24、strict TypeScript、Svelte 5、Viteで構築します。npm依存関係は
 `client/package-lock.json`で固定し、CIとreleaseは`npm ci`、format/type/test、frontend
 buildをRust buildより先に実行します。Cargoの`build.rs`はnpmを起動せず、既に存在する
 `client/dist`を列挙して`include_bytes!`用の表を生成します。これによりRustだけのbuildは
@@ -77,6 +106,15 @@ frontend toolchainなしでも成功し、assetがないバイナリはAPIを維
 配布時は静的assetも既存の単一`agent-talk`バイナリに含まれます。したがってupdaterの
 タグ固定asset、checksum検証、atomic replacementという既存境界がUIにもそのまま及び、
 UI用の別install先・別version・別更新チャネルを作りません。
+
+Screen viewはdocumentがvisibleの間だけ2秒後のself-schedulingでcaptureを更新し、hidden時は
+timerを止め、visibleへ戻った時点で直ちに再取得します。手動更新とpollが競合した場合は
+古い応答を捨てます。初回失敗はretry stateを表示し、過去のscreenがある更新失敗ではその
+plain textをdimmed表示のまま保持して次のpollを続けます。Letters viewは自動pollせず、
+mailbox選択時に履歴をresetし、手動更新では末尾IDを排他的`after` cursorとして最大100件を
+追加します。mailbox切替前の遅い応答は捨て、本文はscreenと同様にSvelteのtext bindingで
+表示してmarkupとして解釈しません。UIは個別のHTTP error codeを表示せず、ScreenとLettersの
+各viewで共通の取得失敗表示とretryへまとめます。status codeの区別はAPI caller向けです。
 
 ## 状態と配送
 

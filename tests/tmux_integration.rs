@@ -155,16 +155,92 @@ fn daemon_journal_read_recovery_and_pane_exit() {
     let web_who = http_request(&http, "GET", "/v1/who");
     assert!(web_who.starts_with("HTTP/1.1 200"), "{web_who}");
     assert!(web_who.contains("\"name\":\"claude\""), "{web_who}");
+    let empty_screen = http_request(&http, "GET", "/v1/agents/screen");
+    assert!(empty_screen.starts_with("HTTP/1.1 400"), "{empty_screen}");
+    let web_who_after_empty_screen = http_request(&http, "GET", "/v1/who");
+    assert!(
+        web_who_after_empty_screen.starts_with("HTTP/1.1 200"),
+        "{web_who_after_empty_screen}"
+    );
+    tmux(
+        &name,
+        &["send-keys", "-t", &panes[1], "-l", "screen-capture-marker"],
+    );
+    let encoded_pane = panes[1].replace('%', "%25");
+    let web_screen = http_request(&http, "GET", &format!("/v1/agents/{encoded_pane}/screen"));
+    assert!(web_screen.starts_with("HTTP/1.1 200"), "{web_screen}");
+    assert!(
+        web_screen.contains(&format!("\"pane_id\":\"{}\"", panes[1])),
+        "{web_screen}"
+    );
+    assert!(web_screen.contains("screen-capture-marker"), "{web_screen}");
+    let unregistered_pane = panes[2].replace('%', "%25");
+    let unknown_screen = http_request(
+        &http,
+        "GET",
+        &format!("/v1/agents/{unregistered_pane}/screen"),
+    );
+    assert!(
+        unknown_screen.starts_with("HTTP/1.1 404"),
+        "{unknown_screen}"
+    );
+    let malformed_screen = http_request(&http, "GET", "/v1/agents/%2F/screen");
+    assert!(
+        malformed_screen.starts_with("HTTP/1.1 400"),
+        "{malformed_screen}"
+    );
+    let invalid_screen = http_request(&http, "GET", "/v1/agents/%25bad/screen");
+    assert!(
+        invalid_screen.starts_with("HTTP/1.1 404"),
+        "{invalid_screen}"
+    );
+    let mailboxes = http_request(&http, "GET", "/v1/mailboxes");
+    assert!(mailboxes.starts_with("HTTP/1.1 200"), "{mailboxes}");
+    assert!(mailboxes.contains("\"mobile\""), "{mailboxes}");
+    let empty_mailbox = http_request(&http, "GET", "/v1/mailbox/mobile?limit=1");
+    assert!(empty_mailbox.starts_with("HTTP/1.1 200"), "{empty_mailbox}");
+    assert!(empty_mailbox.contains("\"events\":[]"), "{empty_mailbox}");
+    let unknown_mailbox = http_request(&http, "GET", "/v1/mailbox/not-allowed");
+    assert!(
+        unknown_mailbox.starts_with("HTTP/1.1 404"),
+        "{unknown_mailbox}"
+    );
+    let invalid_mailbox = http_request(&http, "GET", "/v1/mailbox/Bad");
+    assert!(
+        invalid_mailbox.starts_with("HTTP/1.1 404"),
+        "{invalid_mailbox}"
+    );
+    let malformed_mailbox = http_request(&http, "GET", "/v1/mailbox/bad%2Fname");
+    assert!(
+        malformed_mailbox.starts_with("HTTP/1.1 400"),
+        "{malformed_mailbox}"
+    );
+    let invalid_mailbox_query = http_request(&http, "GET", "/v1/mailbox/mobile?limit=0");
+    assert!(
+        invalid_mailbox_query.starts_with("HTTP/1.1 400"),
+        "{invalid_mailbox_query}"
+    );
     let web_static = http_request(&http, "GET", "/nested/spa/route");
     assert!(web_static.starts_with("HTTP/1.1 200"), "{web_static}");
     assert!(web_static.contains("agent talk · registry"), "{web_static}");
     let unknown_api = http_request(&http, "GET", "/v1/missing");
     assert!(unknown_api.starts_with("HTTP/1.1 404"), "{unknown_api}");
-    let write_rejected = http_request(&http, "POST", "/v1/who");
-    assert!(
-        write_rejected.starts_with("HTTP/1.1 405"),
-        "{write_rejected}"
-    );
+    for path in [
+        "/v1/who",
+        "/v1/letters",
+        "/v1/recover",
+        "/v1/mailbox/mobile",
+    ] {
+        let write_rejected = http_request(&http, "POST", path);
+        assert!(
+            write_rejected.starts_with("HTTP/1.1 405"),
+            "POST {path}: {write_rejected}"
+        );
+        assert!(
+            write_rejected.to_ascii_lowercase().contains("allow: get"),
+            "{write_rejected}"
+        );
+    }
     agent(
         &socket,
         &runtime,
@@ -617,6 +693,14 @@ fn daemon_journal_read_recovery_and_pane_exit() {
         ],
     ));
     assert!(mailbox_again.contains("reply body"));
+    let web_mailbox = http_request(
+        &http,
+        "GET",
+        &format!("/v1/mailbox/mobile?after={external_id}&limit=1"),
+    );
+    assert!(web_mailbox.starts_with("HTTP/1.1 200"), "{web_mailbox}");
+    assert!(web_mailbox.contains("reply body"), "{web_mailbox}");
+    assert!(!web_mailbox.contains("external body"), "{web_mailbox}");
     let ambiguous = agent_raw(
         &socket,
         &runtime,
