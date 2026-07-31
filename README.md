@@ -53,7 +53,12 @@ npm --prefix client run build
 cargo build --release --locked
 mkdir -p ~/.local/bin
 install -m755 target/release/agent-talk ~/.local/bin/agent-talk
+install -m755 target/release/agent-talk-mcp ~/.local/bin/agent-talk-mcp
 ```
+
+このcrateは`agent-talk`（CLI・デーモン）と`agent-talk-mcp`（stdio MCP server）の
+2つのバイナリを作ります。リリースアーカイブと `agent-talk update` が扱うのは
+`agent-talk` だけなので、`agent-talk-mcp` はソースからビルドしてください。
 
 フロントエンドのビルドにはNode.js 24とnpmを使います。`client/dist`を先に生成すると、
 続くCargoビルドがその静的ファイルを単一の`agent-talk`バイナリへ埋め込みます。
@@ -75,6 +80,11 @@ set -g @plugin 'miyabi-sunny-side/agent-talkd'
 
 `run`, `register`, `unregister`, `busy`, `idle`, `turn-end`, `who`, `resolve`,
 `send`, `read`, `update`, `ensure-daemon`, `daemon-status` を提供します。
+`read-v1`, `ack-v1`, `peers-v1` は MCP adapter が使う配管コマンドで、依頼本文・
+受領報告の結果・登録agentと未受領IDをそれぞれJSONで返します。送信側の
+`send-message-v1` は MCP adapter 専用の daemon RPC です。CLI からは必要なオプションを
+渡せず `send-message-v1 optionsがありません` で失敗するので、CLI から送るときは `send`
+を使ってください。この4つは未登録の pane から呼ぶと拒否されます。
 互換用の `gc`, `watch` は no-op です。デーモンが未起動なら CLI が tmux
 サーバー単位で自動起動し、既存デーモンの版が古ければ安全に交代します。
 インストール済みのversionは `agent-talk --version` で確認できます。
@@ -107,6 +117,62 @@ socketです。
 Releaseだけを対象に、タグ固定assetとSHA-256を検証して更新します。ローカル版が
 latest以上の場合はdowngradeせず、デーモンの版確認だけを行います。tmux serverが
 無い環境ではCLI更新を完了し、daemonは `not applicable` と表示します。
+
+## MCP server
+
+`agent-talk-mcp` は agent が触る窓口の stdio MCP server です。tmux サーバーごとに
+1つ動いているデーモンへ、既存の Unix domain socket で接続します。公開する tool は
+次の4つだけで、file 読み書き・任意 path 指定・subprocess 実行の tool はありません。
+
+| tool | 引数 | 返り値 |
+| --- | --- | --- |
+| `list_peers` | なし | `{"version":1,"self":"%0","pending_to_me":[2],"peers":[...]}`。各peerは`name`/`state`/`location`/`pane`/`cwd`/`queued`/`pending_from_me` |
+| `send_message` | `to`, `body`, `no_reply?` | `{"version":1,"id":0,"path":"sent","to":"%2","name":"claude"}`（`path` は `sent` か `queued`） |
+| `read_message` | `id` | `{"version":1,"id":0,"from":"codex","reply_to":"%0","body":"..."}` |
+| `ack_message` | `id` | `{"version":1,"id":0,"outcome":"acked"}`（未知IDは `no_pending_message`） |
+
+どの返り値も `version: 1` の JSON です。デーモンの応答がこの形でなければ、adapter は
+成功として扱わず tool error（`isError: true`）にします。
+
+呼び出し元の pane が未登録なら、4つとも
+`この操作は登録済みのagent paneからのみ実行できます` で拒否されます。拒否は呼び鈴も
+未受領一覧も変えません。CLI の `send` は未登録 pane からも従来どおり送れます。人間が
+CLI から送る経路を閉じないためです。
+
+`read_message` の `from` は送信時点の送信者名で、送信者が退出・改名しても変わりません。
+`reply_to` は同じ名前の agent がその pane に今も登録されている場合だけ pane ID を返し、
+それ以外は `null` です。`null` のときは `list_peers` で現在の宛先を選び直します。
+
+呼び鈴を受けた側の手順は3段階です。
+
+1. `read_message` で読む。受領報告するまで何度でも読める。
+2. **作業に入る前に** `ack_message` で受領報告する。ここでメッセージが消える。
+3. 作業する。返信が必要なら `send_message` で普通に送り返す。返信専用の tool は
+   ありません。
+
+接続先の socket は spawn 時の `TMUX` と `XDG_RUNTIME_DIR`（無ければ `HOME`）から
+デーモンと同じ規則で導出します。tool 引数や `AGENT_TALK_RPC_SOCKET` からは受け取らず、
+tmux の subprocess も起動しません。`TMUX` は `<socket>,<pid>,<session>` のちょうど3
+フィールドで、余分なフィールドがあれば不正として扱います。`TMUX` / `TMUX_PANE` が
+欠けているか書式が不正なら、tool を1つも公開せずに終了します。
+
+```console
+$ agent-talk-mcp
+agent-talk-mcp: TMUX_PANE が設定されていません
+```
+
+未受領のIDは CLI の `who` でも両方向を確認できます。
+
+```console
+$ agent-talk who
+claude     busy  main:0.0 (%0)  /home/miyabi/projects/sunny-side/agent-talkd
+codex      idle  main:0.1 (%1)  /home/miyabi/projects/sunny-side/agent-talkd
+pending-to-me: #0
+```
+
+`pending-to-me` は自分宛で配達完了済みかつ未受領のID、`pending-from-me <pane>` は
+自分が送って未受領のIDです。後者には配達待ちqueueの分も含みます。どちらの行も
+未受領が無ければ出ません。
 
 ## Read-only observation page
 
@@ -176,8 +242,11 @@ userからの接続を拒む境界であり、同一UID内の人間を識別・�
 同一UIDだけを根拠に追加せず、Port-3のhuman identity gateと同時に導入します。
 
 `send` は `#<id>` を返し、受信側は呼び鈴に表示された
-`agent-talk read <id>` で依頼本文を取得します。`read` はcheckpointまでは
-繰り返し実行できます。本文、未配達queue、状態遷移は既定で
+`agent-talk read <id>` で依頼本文を取得します。`read` は本文を消しません。
+メッセージが消えるのは受信側が受領報告（`ack-v1` / MCP の `ack_message`）を
+送った後で、それまでは何度でも読み直せます。配達が完了していないqueue中の
+メッセージは、呼び鈴より先に本文を読ませないため `read` も `ack-v1` も拒否します。
+本文、未配達queue、状態遷移は既定で
 `$XDG_STATE_HOME/agent-talkd/`（未設定時は `~/.local/state/agent-talkd/`）
 のjournalに保存します。従来の `~/.cache/agent-talk/*.md` は新規作成せず、
 既存ファイルも自動削除しません。

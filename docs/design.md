@@ -9,6 +9,10 @@ agent-talkd は、tmux 上の対話エージェントへ作業中の入力を割
   queueを単一イベントループで所有します。
 - `agent-talk` の各CLIコマンドは、tmux socket名ごとのUnix domain socketを
   通じてdaemonへ1要求を送ります。daemonがなければ競合を避けて自動起動します。
+- `agent-talk-mcp` はagentが触る窓口のstdio MCP serverです。同じUnix domain socketで
+  daemonへ接続するだけで、自分では状態を持たず、daemonも起動しません。MCP serverは
+  sessionごとにspawnされて一緒に死ぬため、tmux監視・queue・journal・跨セッション配達を
+  持てません。常駐プロセスはこれらの所有者として残ります。
 - daemonは同じイベントループへ接続する第二のUnix domain socketで、read-onlyな
   HTTP adapterも提供します。registry、screen、許可済みmailboxの要求はeventを主ループへ
   送り、daemon memoryとlive tmux paneをそこで照合します。registryやmailboxを別の
@@ -132,9 +136,10 @@ daemonのメモリを稼働中の唯一の真実とし、`@agent` と `@agent_st
    入るのは、daemonが検証・生成したスキルトークンと固定の呼び鈴だけです。
 3. 宛先がbusyなら、配送待ちqueueへ入れてから`queued (busy)`を返します。
 4. `turn-end`は宛先をidleにし、queue先頭を1件だけ配送してbusyへ戻します。
-5. `read`は本文を返してConsumedを追記しますが、その場では本文を破壊せず、
-   checkpointまでは再取得できます。
-6. 未readのまま宛先が消滅した場合、元本文を含む配達失敗通知を送信元用の
+5. `read`は本文を返すだけで、状態を変えません。受領報告が来るまで何度でも読めます。
+6. `ack`は受領報告をjournalへ追記・fsyncしてから、そのメッセージを削除対象に
+   します。以後の`read`はnot-foundです。
+7. 未受領のまま宛先が消滅した場合、元本文を含む未受領通知を送信元用の
    新しいメッセージとして作成します。
 
 ## 永続化の不変条件
@@ -144,15 +149,182 @@ socket名ごとに分離します。
 
 - `sent`または`queued (busy)`を返す前に本文のappendと`fsync`を完了する。
 - journal書き込みに失敗したメッセージを配達済み・queuedとして報告しない。
-- daemon再起動時に未read本文と未配達queueを復元する。
-- Consumed済みかつ配送待ちqueueにない本文はcheckpointで圧縮消滅させる。
-  queue内で先にreadされた本文は、後続の`turn-end`配送まで保持する。
+- daemon再起動時に未受領本文と未配達queueを復元する。
+- 受領報告済み（Acked）かつ配送待ちqueueにない本文だけをcheckpointで圧縮消滅させる。
+  読んだだけの本文は消さない。queue内の本文はAckedでも、後続の`turn-end`配送まで
+  保持する。保持と可視性を同じ1つの真偽値で判定しない。
+- checkpointの発火は、総レコード数ではなく**前回checkpoint以降に追記した
+  レコード数**（256件）で判定する。総数で判定すると、圧縮後のsnapshot自体が
+  閾値以上になった時点で、追記がゼロでも毎リクエストで全書き換え・`sync_all`・
+  rename・親fsyncが走り続ける。
+- 圧縮出力では`sequence`レコードを**末尾**に書く。`Journal::open`は通常レコードで
+  カウンタを+1し、`sequence`で0へ戻すため、これが再起動を跨いだ追記数の復元境界に
+  なる。checkpointが成功したときだけカウンタを0にする。
 - checkpoint後もメッセージIDのhigh-water markを保持し、IDを再利用しない。
 - pane IDが再利用されても、起動時に`@agent`の登録名を照合して誤配しない。
 - 本文は1MiBを上限とし、journalの無制限な単発肥大を防ぐ。
 
 単一イベントループにCLI要求とtmuxイベントを合流させることで、busy判定と
 queue投入のlost wake-up、同一メッセージの同時二重配送を構造的に防ぎます。
+
+## 受領報告と保持
+
+メッセージの削除条件は「受信側からの明示的な受領報告（ack）」ただ1つです。状態も
+`Pending`（未受領）と`Acked`（受領報告済み＝削除対象）の1軸しかありません。
+**読んだかどうかは記録しません。** 読了を記録すると「未読のPending」と
+「読了済みのPending」を区別する分岐が削除判定・掃除・失敗通知の全経路に復活し、
+判定軸が2つに増えるためです。
+
+daemonは`read`と`ack`で同じ宛先・配達状態の検査を使います。
+
+| 対象 | `read` / `read-v1` | `ack-v1` |
+| --- | --- | --- |
+| 呼び出し元pane宛・配達完了済み・未受領 | 本文を返す（状態は変えない） | append＋fsyncの後に`Acked`。`outcome: acked` |
+| 配達未完了（queue中） | 拒否 | 拒否 |
+| 他pane宛 | 拒否 | 拒否 |
+| 存在しない、または受領報告済み | not-found | mutationなしで冪等成功（`outcome: no_pending_message`） |
+
+この表はversioned RPC（`read-v1` / `ack-v1`）では、呼び出し元paneが登録済みagentである
+場合にだけ適用されます。未登録paneはこの分岐へ入る前に拒否されます（「MCP adapter」を
+参照）。
+
+配達未完了を拒否するのは、IDを推測して呼び鈴の前に本文を読ませないためです。これを
+許すと、送り手の未受領一覧からは消えたのに呼び鈴だけ後から届き、その時点の`read`が
+not-foundになります。
+
+存在しないIDをエラーではなく冪等成功にするのは、応答が失われた後の再送を安全に
+するためです。`Acked`はcheckpointで所有情報ごとpruneされるので、再送時に
+「既に受領済み」と「そもそも存在しない」を区別できません。区別を保つには宛先付きの
+tombstoneを永続保持する必要があり、削除を目的とする本契約と矛盾します。mutationを
+伴わないため、他paneの`Pending`を消す危険もありません。
+
+未受領IDは両方向から観測できます。`pending_to_me`（`who`では`pending-to-me`）は
+呼び出し元pane宛で**配達完了済み**かつ未受領のID、`pending_from_me`（`who`では
+`pending-from-me <pane>`）は呼び出し元が送って未受領のIDで、**queue中も含みます**。
+どちらも本文と他送信者のIDは含みません。送り手側だけにすると、受け手が中断・再起動して
+IDを失ったとき、本文が残っていても受け手自身が再発見できなくなります。
+
+受領報告を忘れてもメッセージは残ります（誤削除より安全側）。ただし自動では解消
+しません。受け手が`pending_to_me`を見に行くか、送り手が気づいて再送するまで残ります。
+
+### journalのwire tagは`consumed`のまま
+
+製品用語の`Acked`に対応するjournalレコードのtagは`consumed`のままです。variant名を
+変えると旧daemonが既存journalを読めなくなるため、tagを維持して意味だけ
+「読了＝次の圧縮で削除」から「受領済み＝削除対象」へ読み替えています。旧journalの
+`consumed`レコードは新しい意味と一致するので、移行処理も既定値も不要です。コード上の
+`StoredMessage::acked`と`Record::Consumed`という名前のずれはこの互換のためです。
+
+`sequence`が先頭にあるか存在しない旧journalは、開いた時点の追記数を保守的に多く
+数えます。その結果1回だけ余分に圧縮し、以後は末尾`sequence`により正確になります。
+
+### pane消滅時の掃除
+
+読了を記録しない以上「未読のPending」は判定できません。したがって掃除と失敗通知の
+対象は**未受領の`Pending`全件**とし、通知も「配達されなかった」ではなく
+「受領報告されないまま宛先が退出した」を表す文言にします。読んだがack前に落ちた場合も
+未受領として扱う、ackを正とする意味論です。通知の完了後に残った`Pending`をterminalな
+`Acked`にし、journal replayでも`remove`後に同じ最終状態へ収束させます。通知の途中で
+失敗した場合はremoveせず、耐久性を壊しません。
+
+宛先が既に退出していて配達できなかったメッセージと、送信者向けの未受領通知を作り
+終えた元メッセージは、terminalなtombstoneとして従来どおり受領報告を待たずに即削除
+対象にします。これらには受け取る主体が存在せず、ackする者がいないためです。
+
+## MCP adapter
+
+`agent-talk-mcp`はstdio JSON-RPCのMCP serverとして、daemonの既存RPC socketへ接続
+します。新しいsocketも新しいprotocolも作りません。agentへ公開する面はここのtool 4個
+だけで、agentがCLIの使い方を読む必要をなくすことが目的です。MCPは道具の一覧と引数
+仕様を毎ターン自動でcontextへ渡すため、調べる対象そのものが消えます。
+
+| tool | daemonのコマンド |
+| --- | --- |
+| `list_peers` | `peers-v1` |
+| `send_message` | `send-message-v1` |
+| `read_message` | `read-v1` |
+| `ack_message` | `ack-v1` |
+
+`send_message`がCLIと同じ`send-v2`ではなく専用の`send-message-v1`を使うのは、成功応答の
+形が違うためです。CLIは人間向けテキスト（`sent -> %2 (claude): #0`）を返し、MCPは
+versioned JSON（`{"version":1,"id":0,"path":"sent","to":"%2","name":"claude"}`）を
+返します。1つのコマンドに2つの応答形を持たせると、どちらを返すかが呼び出し元の申告に
+依存し、agentが人間向けテキストを構造化応答と取り違える余地が残ります。
+
+`skill` / `from` / `pane` はtoolのschemaに存在しません。存在しない引数は誤用も偽装も
+できません。呼び出し元identityはadapterがspawn時の`TMUX_PANE`から導出し、agentは
+触れません。`TMUX_PANE`はrouting metadataであって認証境界ではなく、実際の境界は
+daemon側の同一UID UDSと未登録paneの拒否です。
+
+MCP serverはagentのexec sandboxの外で起動されるため、agent自身のshellより広い権限を
+持ちます。そのためtool surfaceを会話だけに限定し、file読み書き・任意path指定・
+subprocess実行・shell経由の呼び出しをtoolにも実装にも持ち込みません。1つでも持たせると、
+agentが自分のsandboxを迂回する経路になります。
+
+initializeで返すserver instructionsは短い操作契約に限定し、「呼び鈴を受けたら
+`read_message`で読み、作業に入る前に`ack_message`で受領報告する」を含めます。toolが
+context にあるだけでは横展開は起きない一方、判断そのものを縛る大きな文にすると
+skillを消した意味が失われます。
+
+### 未登録paneからの呼び出しは状態を見る前に拒否する
+
+`send-message-v1` / `read-v1` / `ack-v1` / `peers-v1`の4つは、呼び出し元paneが現在
+登録済みのagentであることを最初に確認し、満たさなければmessageの状態分岐へ進む前に
+拒否します。判定を分岐より前に置くのは、未登録callerへ「存在しない」「他pane宛」
+「配達未完了」の区別を返さないためです。区別が漏れると、未登録paneからID空間を
+走査してmessageの存在と配達状況を観測できます。拒否はjournal追記・呼び鈴・
+未受領一覧のいずれも変えません。
+
+legacyの`send` / `send-v2`は従来どおり未登録paneからも受理します。これは人間がCLIから
+送る唯一の経路であり、閉じるとhuman callerが送れなくなります。MCP側の4つだけを閉じる
+のは、そこがagentの経路であり、登録に失敗したagentがhuman callerを騙って送れては
+ならないためです。
+
+### `read_message`が返すidentityは送信時点で捕捉したもの
+
+`from`は送信時点で捕捉した送信者名（`Message::sender_name`）で、読み出し時にregistryを
+引き直しません。`reply_to`は、捕捉時と同じ名前のagentがその paneに今も登録されている
+場合だけpane IDを返し、それ以外は`null`です。送信者の退出・改名と、pane IDが別のagentへ
+再利用された場合が`null`に当たります。
+
+`from`を現在のregistryから引き直すと、pane再利用後に別人の名前で本文が提示されます。
+逆に`reply_to`を捕捉したpane IDのまま返すと、そのpaneの新しい住人へ返信を誤配します。
+表示用の名前と実際に配達へ使う宛先を別の規則で決めるのはこのためです。旧journal由来で
+`sender_name`を持たないmessageは、`from`が生のsender（pane IDや`human`などのラベル）に
+なり、`reply_to`は常に`null`になります。
+
+### 応答の解釈を暗黙に劣化させない
+
+4つのRPCはいずれもversioned JSONを返す契約なので、adapterは成功応答（`code == 0`）でも
+`version`が1のJSON objectでなければ`isError: true`にし、
+`agent-talkd の <command> 応答を解釈できません (<理由>)`を返します。人間向けテキストを
+そのままtool結果として通すと、agentは送信が成立したかどうかを文面から推測することになり、
+契約の違うdaemonへ接続していることにも気づけません。
+
+### 起動時のcontract
+
+接続先はspawn時の環境から純粋に導出します。`Config::discover`は呼ばず、tmuxの
+subprocessも起動せず、tool引数や`AGENT_TALK_RPC_SOCKET`のような任意の環境変数からも
+接続先を受け取りません。
+
+| 入力 | 扱い |
+| --- | --- |
+| `TMUX` | 必須。`<socket path>,<pid>,<session id>`の**ちょうど3フィールド**を検証する。余分なフィールドはfail closed |
+| `TMUX_PANE` | 必須。`%<digits>`の書式を検証する |
+| `XDG_RUNTIME_DIR` | 任意。絶対pathならruntime rootに使う |
+| `HOME` | `XDG_RUNTIME_DIR`欠落時のみ必須。`$HOME/.cache/agent-talkd/run`へfallback |
+
+欠落・不正な場合はtoolを1つも公開せずに終了します（fail closed）。曖昧な状態で既定値を
+作ると、実在しないsocketや別のtmux serverのsocketを掴み、誤ったpaneへ配達する余地が
+生じます。接続後はpeer UIDが自分のeffective UIDと一致することを確認し、daemon側の
+same-UID境界と対称にします。
+
+RPC socket pathはbasenameだけが`TMUX`のsocket名由来で、**rootは`XDG_RUNTIME_DIR`**
+です。daemonがruntime directoryを使っている環境でMCP側にだけ`XDG_RUNTIME_DIR`が
+渡らないと、MCPだけがHOME fallbackを導出し、実在しないsocketを掴んで必ず失敗します。
+このときinitializeとtools/listは成功し、tool呼び出しだけが
+`agent-talkd に接続できません (<path>)` というtool errorになります。掴んだpathが
+daemonのRPC socketと違っていないかを、まずこのメッセージで確認します。
 
 ## 外部送信元とスキル呼び出し
 

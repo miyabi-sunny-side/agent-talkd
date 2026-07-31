@@ -4,6 +4,7 @@ mod daemon;
 mod help;
 mod journal;
 mod lifecycle;
+mod paths;
 mod protocol;
 mod run;
 mod state;

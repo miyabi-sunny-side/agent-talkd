@@ -2,7 +2,7 @@ use std::{
     fs,
     io::{Read, Write},
     os::unix::net::{UnixListener, UnixStream},
-    path::Path,
+    path::{Path, PathBuf},
     process::{Command, Output, Stdio},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -775,6 +775,34 @@ fn daemon_journal_read_recovery_and_pane_exit() {
         &["who"],
     ));
     assert!(recovered.contains("claude     busy"));
+    // ADR 0002: 配達未完了 (queue 中) の read は拒否される。呼び鈴の前に本文は読めない。
+    let premature = agent_raw(
+        &socket,
+        &runtime,
+        &state,
+        &legacy_mail,
+        &panes[1],
+        &["read", &queued_id.to_string()],
+    );
+    assert!(!premature.status.success());
+    assert!(
+        String::from_utf8_lossy(&premature.stderr).contains("まだ配達されていません"),
+        "{}",
+        String::from_utf8_lossy(&premature.stderr)
+    );
+    agent(
+        &socket,
+        &runtime,
+        &state,
+        &legacy_mail,
+        &panes[1],
+        &["turn-end"],
+    );
+    let recovered_screen = text(tmux(&name, &["capture-pane", "-p", "-t", &panes[1]]));
+    assert!(recovered_screen.contains(&format!(
+        "/deliver [agent-talk] human から依頼が届きました。agent-talk read {queued_id}"
+    )));
+    assert!(!recovered_screen.contains("first durable body"));
     let recovered_brief = text(agent(
         &socket,
         &runtime,
@@ -793,19 +821,6 @@ fn daemon_journal_read_recovery_and_pane_exit() {
         &["read", &queued_id.to_string()],
     ));
     assert_eq!(recovered_reread, recovered_brief);
-    agent(
-        &socket,
-        &runtime,
-        &state,
-        &legacy_mail,
-        &panes[1],
-        &["turn-end"],
-    );
-    let recovered_screen = text(tmux(&name, &["capture-pane", "-p", "-t", &panes[1]]));
-    assert!(recovered_screen.contains(&format!(
-        "/deliver [agent-talk] human から依頼が届きました。agent-talk read {queued_id}"
-    )));
-    assert!(!recovered_screen.contains("first durable body"));
 
     // An unread message to an exited pane becomes a readable failure notice.
     agent(
@@ -842,10 +857,11 @@ fn daemon_journal_read_recovery_and_pane_exit() {
             &["show-option", "-pqv", "-t", &panes[0], "@agent_state"],
         ));
         let sender_screen = text(tmux(&name, &["capture-pane", "-p", "-t", &panes[0]]));
+        // ADR 0002: 通知文は「配達されなかった」ではなく受領報告の欠如を表す。
         if who.contains("codex")
             && !who.contains("claude")
             && sender_state == "busy"
-            && sender_screen.contains("[agent-talk] 配達失敗:")
+            && sender_screen.contains("[agent-talk] 未受領のまま終了:")
         {
             break read_id_from_bell(&sender_screen);
         }
@@ -864,7 +880,8 @@ fn daemon_journal_read_recovery_and_pane_exit() {
         &panes[0],
         &["read", &failure_id.to_string()],
     ));
-    assert!(failure_brief.contains("# agent-talk 配達失敗通知"));
+    assert!(failure_brief.contains("# agent-talk 未受領通知"));
+    assert!(failure_brief.contains("- reason: 受領報告されないまま"));
     assert!(failure_brief.contains(&format!("- original: #{second_id}")));
     assert!(failure_brief.contains("second unread body"));
 
@@ -879,6 +896,532 @@ fn daemon_journal_read_recovery_and_pane_exit() {
     );
     wait_for(|| !rpc.exists());
     wait_for(|| !http.exists());
+}
+
+/// 隔離 tmux server + 一時 runtime/state を1つにまとめた土台。
+/// 共有 tmux server や稼働中の daemon には一切触れない。
+struct Fixture {
+    server: Server,
+    socket: String,
+    panes: Vec<String>,
+    root: tempfile::TempDir,
+    runtime: PathBuf,
+    state: PathBuf,
+    legacy_mail: PathBuf,
+}
+
+impl Fixture {
+    fn new(label: &str, pane_count: usize) -> Self {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let name = format!("agent-talk-{label}-{}-{unique}", std::process::id());
+        let server = Server { name: name.clone() };
+        tmux(
+            &name,
+            &[
+                "new-session",
+                "-d",
+                "-s",
+                "test",
+                "-n",
+                "agents",
+                "sleep 300",
+            ],
+        );
+        for _ in 1..pane_count {
+            tmux(
+                &name,
+                &["split-window", "-d", "-t", "test:agents", "sleep 300"],
+            );
+        }
+        let socket = text(tmux(&name, &["display-message", "-p", "#{socket_path}"]));
+        let panes: Vec<_> = text(tmux(
+            &name,
+            &["list-panes", "-t", "test:agents", "-F", "#{pane_id}"],
+        ))
+        .lines()
+        .map(str::to_owned)
+        .collect();
+        assert_eq!(panes.len(), pane_count);
+        let root = tempfile::tempdir().unwrap();
+        let runtime = root.path().join("run");
+        let state = root.path().join("state");
+        let legacy_mail = root.path().join("mail");
+        Self {
+            server,
+            socket,
+            panes,
+            root,
+            runtime,
+            state,
+            legacy_mail,
+        }
+    }
+
+    fn name(&self) -> &str {
+        &self.server.name
+    }
+
+    fn run(&self, pane: usize, args: &[&str]) -> String {
+        text(agent(
+            &self.socket,
+            &self.runtime,
+            &self.state,
+            &self.legacy_mail,
+            &self.panes[pane],
+            args,
+        ))
+    }
+
+    fn run_raw(&self, pane: usize, args: &[&str]) -> Output {
+        agent_raw(
+            &self.socket,
+            &self.runtime,
+            &self.state,
+            &self.legacy_mail,
+            &self.panes[pane],
+            args,
+        )
+    }
+
+    fn rejected(&self, pane: usize, args: &[&str], expected: &str) {
+        let output = self.run_raw(pane, args);
+        assert!(!output.status.success(), "{args:?} should be rejected");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(expected),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn journal_len(&self) -> u64 {
+        let socket_name = Path::new(&self.socket).file_name().unwrap();
+        fs::metadata(
+            self.state
+                .join("agent-talkd")
+                .join(socket_name)
+                .with_extension("journal"),
+        )
+        .map_or(0, |meta| meta.len())
+    }
+
+    fn screen(&self, pane: usize) -> String {
+        text(tmux(
+            self.name(),
+            &["capture-pane", "-p", "-t", &self.panes[pane]],
+        ))
+    }
+
+    /// MCP adapter を起動する。socket は `TMUX` + `XDG_RUNTIME_DIR` から純粋導出される。
+    fn mcp(&self, pane: usize) -> McpSession {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_agent-talk-mcp"))
+            .env_remove("AGENT_TALK_RPC_SOCKET")
+            .env_remove("AGENT_TALK_TMUX_SOCKET")
+            .env("TMUX", format!("{},1,0", self.socket))
+            .env("TMUX_PANE", &self.panes[pane])
+            .env("XDG_RUNTIME_DIR", &self.runtime)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let reader = std::io::BufReader::new(child.stdout.take().unwrap());
+        McpSession { child, reader }
+    }
+}
+
+struct McpSession {
+    child: std::process::Child,
+    reader: std::io::BufReader<std::process::ChildStdout>,
+}
+
+impl McpSession {
+    fn call(&mut self, request: &serde_json::Value) -> serde_json::Value {
+        let mut line = serde_json::to_vec(request).unwrap();
+        line.push(b'\n');
+        self.child.stdin.as_mut().unwrap().write_all(&line).unwrap();
+        let mut response = String::new();
+        std::io::BufRead::read_line(&mut self.reader, &mut response).unwrap();
+        assert!(!response.is_empty(), "MCP server closed stdout");
+        serde_json::from_str(&response).unwrap()
+    }
+
+    fn tool(&mut self, id: u64, name: &str, arguments: &serde_json::Value) -> serde_json::Value {
+        let response = self.call(&serde_json::json!({
+            "jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": { "name": name, "arguments": arguments }
+        }));
+        assert!(
+            response.get("result").is_some(),
+            "{name} failed: {response}"
+        );
+        response["result"].clone()
+    }
+}
+
+impl Drop for McpSession {
+    fn drop(&mut self) {
+        drop(self.child.stdin.take());
+        let _ = self.child.wait();
+    }
+}
+
+#[test]
+#[ignore = "requires permission to create a real tmux server"]
+#[allow(clippy::too_many_lines)]
+fn message_retention_follows_the_acknowledgement_contract() {
+    let fixture = Fixture::new("ack", 3);
+    fixture.run(0, &["register", "codex"]);
+    fixture.run(1, &["register", "claude"]);
+
+    // 配達完了済みの message は read しても消えない。
+    let sent = fixture.run(0, &["send", "claude", "first body"]);
+    assert!(sent.starts_with("sent -> "), "{sent}");
+    let first = message_id(&sent);
+    let before_reads = fixture.journal_len();
+    let brief = fixture.run(1, &["read", &first.to_string()]);
+    assert!(brief.contains("first body"));
+    assert_eq!(fixture.run(1, &["read", &format!("#{first}")]), brief);
+    assert_eq!(
+        fixture.journal_len(),
+        before_reads,
+        "read は journal を1バイトも増やさない"
+    );
+
+    // 両方向の未受領一覧。本文も他送信者の ID も含めない。
+    let receiver_view = fixture.run(1, &["who"]);
+    assert!(
+        receiver_view.contains(&format!("pending-to-me: #{first}")),
+        "{receiver_view}"
+    );
+    assert!(!receiver_view.contains("first body"));
+    let sender_view = fixture.run(0, &["who"]);
+    assert!(
+        sender_view.contains(&format!("pending-from-me {}: #{first}", fixture.panes[1])),
+        "{sender_view}"
+    );
+    assert!(!sender_view.contains("first body"));
+
+    // 他 pane 宛の ID は read も ack もできない。
+    fixture.rejected(0, &["read", &first.to_string()], "このpane宛ではありません");
+    fixture.rejected(
+        0,
+        &["ack-v1", &first.to_string()],
+        "このpane宛ではありません",
+    );
+    assert!(
+        fixture
+            .run(1, &["who"])
+            .contains(&format!("pending-to-me: #{first}"))
+    );
+
+    // 存在しない ID の ack は mutation なしで冪等成功する。
+    let unknown = fixture.run(0, &["ack-v1", "99999"]);
+    assert!(
+        unknown.contains("\"outcome\":\"no_pending_message\""),
+        "{unknown}"
+    );
+    assert!(
+        fixture
+            .run(1, &["who"])
+            .contains(&format!("pending-to-me: #{first}")),
+        "unknown ack must not disturb another pane's Pending"
+    );
+
+    // 受領報告すると消える。再送は冪等成功。
+    let acked = fixture.run(1, &["ack-v1", &first.to_string()]);
+    assert!(acked.contains("\"outcome\":\"acked\""), "{acked}");
+    fixture.rejected(
+        1,
+        &["read", &first.to_string()],
+        "見つかりません (受領報告済みの可能性があります)",
+    );
+    let reacked = fixture.run(1, &["ack-v1", &first.to_string()]);
+    assert!(
+        reacked.contains("\"outcome\":\"no_pending_message\""),
+        "{reacked}"
+    );
+    assert!(!fixture.run(1, &["who"]).contains("pending-to-me"));
+    assert!(!fixture.run(0, &["who"]).contains("pending-from-me"));
+
+    // queue 中は read も ack も拒否され、pending_to_me にも出ない。
+    fixture.run(1, &["busy"]);
+    let queued = fixture.run(0, &["send", "claude", "queued body"]);
+    assert!(queued.starts_with("queued (busy) -> "), "{queued}");
+    let second = message_id(&queued);
+    fixture.rejected(1, &["read", &second.to_string()], "まだ配達されていません");
+    fixture.rejected(
+        1,
+        &["ack-v1", &second.to_string()],
+        "まだ配達されていません",
+    );
+    assert!(!fixture.run(1, &["who"]).contains("pending-to-me"));
+    assert!(
+        fixture
+            .run(0, &["who"])
+            .contains(&format!("pending-from-me {}: #{second}", fixture.panes[1])),
+        "送り手は queue 中も未受領として観測できる"
+    );
+
+    fixture.run(1, &["turn-end"]);
+    assert!(
+        fixture
+            .run(1, &["who"])
+            .contains(&format!("pending-to-me: #{second}"))
+    );
+
+    // 未受領のまま daemon を再起動しても本文は残り、受け手は再発見できる。
+    fixture.run(0, &["internal-daemon-shutdown"]);
+    thread::sleep(Duration::from_millis(200));
+    assert!(
+        fixture
+            .run(1, &["who"])
+            .contains(&format!("pending-to-me: #{second}"))
+    );
+    assert!(
+        fixture
+            .run(1, &["read", &second.to_string()])
+            .contains("queued body")
+    );
+    assert!(
+        fixture
+            .run(1, &["ack-v1", &second.to_string()])
+            .contains("\"outcome\":\"acked\"")
+    );
+
+    // 読了済みでも未受領なら、pane 退出時に受領報告の欠如として通知される。
+    fixture.run(1, &["turn-end"]);
+    let third_send = fixture.run(0, &["send", "claude", "read but unacked"]);
+    assert!(third_send.starts_with("sent -> "), "{third_send}");
+    let third = message_id(&third_send);
+    assert!(
+        fixture
+            .run(1, &["read", &third.to_string()])
+            .contains("read but unacked")
+    );
+    tmux(fixture.name(), &["kill-pane", "-t", &fixture.panes[1]]);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let who = fixture.run(0, &["who"]);
+        let screen = fixture.screen(0);
+        if !who.contains("claude") && screen.contains("[agent-talk] 未受領のまま終了:") {
+            let notice_id = read_id_from_bell(&screen);
+            let notice = fixture.run(0, &["read", &notice_id.to_string()]);
+            assert!(notice.contains("# agent-talk 未受領通知"), "{notice}");
+            assert!(
+                notice.contains("- reason: 受領報告されないまま"),
+                "{notice}"
+            );
+            assert!(
+                notice.contains(&format!("- original: #{third}")),
+                "{notice}"
+            );
+            assert!(notice.contains("read but unacked"), "{notice}");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "unacked-exit notification timed out: who={who:?}\ndaemon log:\n{}",
+            fs::read_to_string(fixture.state.join("agent-talkd/agent-talkd.log"))
+                .unwrap_or_default()
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    // 退出済み pane 宛の message は terminal `Acked` になり削除対象へ移る。
+    fixture.rejected(
+        0,
+        &["read", &third.to_string()],
+        "見つかりません (受領報告済みの可能性があります)",
+    );
+    assert!(!fixture.run(0, &["who"]).contains("pending-from-me"));
+    drop(fixture.root);
+}
+
+#[test]
+#[ignore = "requires permission to create a real tmux server"]
+#[allow(clippy::too_many_lines)]
+fn mcp_tools_talk_to_the_daemon_over_the_derived_socket() {
+    let fixture = Fixture::new("mcp", 3);
+    fixture.run(0, &["register", "codex"]);
+    fixture.run(1, &["register", "claude"]);
+
+    let mut codex = fixture.mcp(0);
+    let initialize = codex.call(&serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "version": "0"}}
+    }));
+    assert_eq!(initialize["result"]["serverInfo"]["name"], "agent-talk");
+    assert!(
+        initialize["result"]["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("ack_message")
+    );
+
+    let listed = codex.call(&serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}));
+    let schema = serde_json::to_string(&listed["result"]).unwrap();
+    for forbidden in ["skill", "from", "pane"] {
+        assert!(
+            !schema.contains(forbidden),
+            "tools/list must not contain {forbidden:?}: {schema}"
+        );
+    }
+
+    // 実 RPC 接続 (premise 1 の未確認部分)。
+    let peers = codex.tool(3, "list_peers", &serde_json::json!({}));
+    assert_eq!(peers["isError"], false, "{peers}");
+    let names: Vec<_> = peers["structuredContent"]["peers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|peer| peer["name"].as_str().unwrap().to_owned())
+        .collect();
+    assert!(names.contains(&"claude".to_owned()), "{peers}");
+    assert!(names.contains(&"codex".to_owned()), "{peers}");
+
+    // send -> doorbell -> read -> ack -> 返信の往復。
+    let sent = codex.tool(
+        4,
+        "send_message",
+        &serde_json::json!({"to": "claude", "body": "mcp round trip body"}),
+    );
+    assert_eq!(sent["structuredContent"]["path"], "sent", "{sent}");
+    let id = sent["structuredContent"]["id"].as_u64().unwrap();
+    let doorbell = fixture.screen(1);
+    assert!(
+        doorbell.contains(&format!("agent-talk read {id}")),
+        "doorbell missing: {doorbell}"
+    );
+    assert!(
+        !doorbell.contains("mcp round trip body"),
+        "本文は端末へ注入しない: {doorbell}"
+    );
+
+    let mut claude = fixture.mcp(1);
+    let read = claude.tool(1, "read_message", &serde_json::json!({"id": id}));
+    assert_eq!(read["isError"], false, "{read}");
+    assert_eq!(read["structuredContent"]["from"], "codex");
+    assert_eq!(read["structuredContent"]["reply_to"], fixture.panes[0]);
+    assert!(
+        read["structuredContent"]["body"]
+            .as_str()
+            .unwrap()
+            .contains("mcp round trip body")
+    );
+    // 受領報告するまで何度でも読める。
+    let reread = claude.tool(2, "read_message", &serde_json::json!({"id": id}));
+    assert_eq!(reread["structuredContent"], read["structuredContent"]);
+
+    let acked = claude.tool(3, "ack_message", &serde_json::json!({"id": id}));
+    assert_eq!(acked["structuredContent"]["outcome"], "acked", "{acked}");
+    let gone = claude.tool(4, "read_message", &serde_json::json!({"id": id}));
+    assert_eq!(gone["isError"], true, "{gone}");
+
+    // 相手からの send_message による返信。
+    fixture.run(1, &["turn-end"]);
+    let reply = claude.tool(
+        5,
+        "send_message",
+        &serde_json::json!({"to": "codex", "body": "mcp reply body", "no_reply": true}),
+    );
+    assert_eq!(reply["structuredContent"]["path"], "sent", "{reply}");
+    let reply_id = reply["structuredContent"]["id"].as_u64().unwrap();
+    let reply_doorbell = fixture.screen(0);
+    assert!(
+        reply_doorbell.contains(&format!("agent-talk read {reply_id}")),
+        "{reply_doorbell}"
+    );
+    assert!(
+        reply_doorbell.contains("返信は不要です"),
+        "{reply_doorbell}"
+    );
+
+    // busy 中の送信は queue され、turn-end で呼び鈴が鳴る。
+    fixture.run(1, &["busy"]);
+    let queued = codex.tool(
+        5,
+        "send_message",
+        &serde_json::json!({"to": "claude", "body": "mcp queued body"}),
+    );
+    assert_eq!(queued["structuredContent"]["path"], "queued", "{queued}");
+    let queued_id = queued["structuredContent"]["id"].as_u64().unwrap();
+    // 呼び鈴の前は read も ack もできない。
+    let early_read = claude.tool(6, "read_message", &serde_json::json!({"id": queued_id}));
+    assert_eq!(early_read["isError"], true, "{early_read}");
+    let early_ack = claude.tool(7, "ack_message", &serde_json::json!({"id": queued_id}));
+    assert_eq!(early_ack["isError"], true, "{early_ack}");
+    let peers_before = codex.tool(6, "list_peers", &serde_json::json!({}));
+    let pending_from_me = peers_before["structuredContent"]["peers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|peer| peer["pane"] == fixture.panes[1].as_str())
+        .unwrap()["pending_from_me"]
+        .clone();
+    assert_eq!(pending_from_me, serde_json::json!([queued_id]));
+
+    fixture.run(1, &["turn-end"]);
+    let queued_doorbell = fixture.screen(1);
+    assert!(
+        queued_doorbell.contains(&format!("agent-talk read {queued_id}")),
+        "{queued_doorbell}"
+    );
+    let delivered = claude.tool(8, "list_peers", &serde_json::json!({}));
+    assert_eq!(
+        delivered["structuredContent"]["pending_to_me"],
+        serde_json::json!([queued_id])
+    );
+
+    // 未登録 pane からの MCP 呼び出しは、4 tool すべてが daemon に拒否される。
+    // 登録に失敗した agent が human を騙って送れてはならない。
+    let claude_screen_before = fixture.screen(1);
+    let messages_before = fixture.run(0, &["who"]);
+    let mut stranger = fixture.mcp(2);
+    for (index, (name, arguments)) in [
+        ("list_peers", serde_json::json!({})),
+        (
+            "send_message",
+            serde_json::json!({"to": "claude", "body": "from an unregistered pane"}),
+        ),
+        ("read_message", serde_json::json!({"id": queued_id})),
+        ("ack_message", serde_json::json!({"id": queued_id})),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let rejected = stranger.tool(index as u64 + 1, name, &arguments);
+        assert_eq!(
+            rejected["isError"], true,
+            "{name} from an unregistered pane must be rejected: {rejected}"
+        );
+        assert!(
+            rejected["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("登録済みのagent pane"),
+            "{name}: {rejected}"
+        );
+    }
+    // 拒否は副作用を残さない: 呼び鈴も鳴らず、未受領一覧も変わらない。
+    assert_eq!(fixture.screen(1), claude_screen_before);
+    assert_eq!(fixture.run(0, &["who"]), messages_before);
+    let still_pending = claude.tool(9, "list_peers", &serde_json::json!({}));
+    assert_eq!(
+        still_pending["structuredContent"]["pending_to_me"],
+        serde_json::json!([queued_id]),
+        "拒否された ack が他 pane の Pending を消してはならない"
+    );
+
+    // CLI からの human 送信は従来どおり通る (legacy 経路は変えない)。
+    // 同じ未登録 pane から、同じ宛先へ、CLI では受理される。
+    let human = fixture.run(2, &["send", "claude", "human still works"]);
+    assert!(
+        human.starts_with("sent -> ") || human.starts_with("queued (busy) -> "),
+        "{human}"
+    );
+    drop(fixture.root);
 }
 
 fn http_request(socket: &Path, method: &str, path: &str) -> String {

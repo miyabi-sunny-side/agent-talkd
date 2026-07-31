@@ -20,16 +20,38 @@ pub struct PaneInfo {
 #[derive(Clone)]
 pub struct Tmux {
     socket: String,
+    /// test 専用の代役。`Some` のとき tmux subprocess を一切起動せず、
+    /// scripted な pane 一覧を返し、その他の操作は成功したものとして扱う。
+    /// production build にはこのフィールド自体が存在しない。
+    #[cfg(test)]
+    scripted: Option<Vec<PaneInfo>>,
 }
 
 const MAX_CAPTURE_BYTES: usize = 1024 * 1024;
 
 impl Tmux {
     pub fn new(socket: String) -> Self {
-        Self { socket }
+        Self {
+            socket,
+            #[cfg(test)]
+            scripted: None,
+        }
+    }
+
+    /// tmux を起動せずに固定の pane 一覧を返す代役 (test 専用)。
+    #[cfg(test)]
+    pub fn scripted(panes: Vec<PaneInfo>) -> Self {
+        Self {
+            socket: String::new(),
+            scripted: Some(panes),
+        }
     }
 
     pub async fn panes(&self) -> Result<Vec<PaneInfo>> {
+        #[cfg(test)]
+        if let Some(panes) = &self.scripted {
+            return Ok(panes.clone());
+        }
         let format = "#{session_name}\t#{window_id}\t#{pane_id}\t#{pane_current_path}\t#{window_index}\t#{pane_index}\t#{@agent}";
         let output = self.run(["list-panes", "-a", "-F", format]).await?;
         Ok(output
@@ -62,6 +84,11 @@ impl Tmux {
     }
 
     pub async fn deliver(&self, pane: &str, bell: &str) -> Result<()> {
+        #[cfg(test)]
+        if self.scripted.is_some() {
+            let _ = (pane, bell);
+            return Ok(());
+        }
         self.set_option(pane, "@agent_state", Some("busy")).await?;
         if let Err(error) = self.run(["send-keys", "-t", pane, "-l", bell]).await {
             let _ = self.set_option(pane, "@agent_state", Some("idle")).await;
@@ -141,6 +168,10 @@ impl Tmux {
         I: IntoIterator<Item = S>,
         S: AsRef<std::ffi::OsStr>,
     {
+        #[cfg(test)]
+        if self.scripted.is_some() {
+            return Ok(String::new());
+        }
         let output = Command::new("tmux")
             .arg("-S")
             .arg(&self.socket)
@@ -156,23 +187,6 @@ impl Tmux {
         }
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
-}
-
-pub fn socket_name(socket: &str) -> String {
-    Path::new(socket)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty())
-        .unwrap_or("default")
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
 }
 
 fn shell_quote(value: &str) -> String {

@@ -23,6 +23,7 @@ pub const GLOBAL: &str = r"agent-talk: tmux 上の対話エージェント同士
   agent-talk send <addr> [--from <source>] [--skill <name>] [--] [message]
   agent-talk send <addr> [--no-reply] [--] [message]
   agent-talk read <id>
+  agent-talk ack-v1 <id>
 ";
 
 pub const COMMANDS: &[CommandHelp] = &[
@@ -85,6 +86,22 @@ pub const COMMANDS: &[CommandHelp] = &[
     CommandHelp {
         command: "read",
         text: "usage: agent-talk read <id>\n\n現在のpane宛の依頼本文を確認します。",
+    },
+    CommandHelp {
+        command: "send-message-v1",
+        text: "usage: agent-talk send-message-v1 <addr>\n\n登録済みagent paneからの送信結果をJSONで返します (MCP adapter用)。",
+    },
+    CommandHelp {
+        command: "read-v1",
+        text: "usage: agent-talk read-v1 <id>\n\n依頼本文をJSONで返します (MCP adapter用)。配達未完了は拒否します。",
+    },
+    CommandHelp {
+        command: "ack-v1",
+        text: "usage: agent-talk ack-v1 <id>\n\n受領報告を送りmessageを削除対象にします。存在しないIDは冪等成功です。",
+    },
+    CommandHelp {
+        command: "peers-v1",
+        text: "usage: agent-talk peers-v1\n\n登録agentと両方向の未受領IDをJSONで返します (MCP adapter用)。",
     },
     CommandHelp {
         command: "reply",
@@ -155,6 +172,10 @@ mod tests {
             "resolve",
             "send",
             "read",
+            "send-message-v1",
+            "read-v1",
+            "ack-v1",
+            "peers-v1",
             "reply",
             "mailbox-list-v1",
             "daemon",

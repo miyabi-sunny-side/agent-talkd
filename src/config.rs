@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 
-use crate::tmux::socket_name;
+use crate::paths::{rpc_socket_path, socket_name};
 
 const MAX_TOKEN_LEN: usize = 64;
 
@@ -73,10 +73,8 @@ impl Config {
             .map(|value| parse_token_set("@agent_talkd_allowed_sources", &value))
             .transpose()?
             .unwrap_or_else(|| BTreeSet::from(["mobile".into()]));
-        let rpc_socket = env::var_os("AGENT_TALK_RPC_SOCKET").map_or_else(
-            || runtime.join("agent-talkd").join(format!("{name}.sock")),
-            PathBuf::from,
-        );
+        let rpc_socket = env::var_os("AGENT_TALK_RPC_SOCKET")
+            .map_or_else(|| rpc_socket_path(&runtime, &tmux_socket), PathBuf::from);
         let http_socket = http_socket_for(&rpc_socket);
         Ok(Some(Self {
             tmux_socket,

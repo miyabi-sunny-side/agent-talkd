@@ -18,13 +18,45 @@ impl AgentState {
     }
 }
 
+/// 送信時点で捕捉した送信者 identity。
+///
+/// **後からレジストリを引き直さない。** 送信者が退出・改名・pane ID 再利用されると
+/// 現在のレジストリからは誤った名前が引けるため、送信時の名前を message へ永続化する。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Origin {
+    /// 送信元 pane。外部 CLI / 内部通知では `human` / `system` などの label。
+    pub pane: String,
+    /// 送信時点の送信者名。
+    pub name: String,
+}
+
+impl Origin {
+    pub fn new(pane: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            pane: pane.into(),
+            name: name.into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Message {
     pub id: u64,
     pub sender: String,
+    /// 送信時点で捕捉した送信者名。旧 journal には無いので `None` を許す
+    /// (`None` は「捕捉されていない」であって「名前が無い」ではない)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_name: Option<String>,
     pub brief: String,
     pub bell: String,
     pub target_name: String,
+}
+
+impl Message {
+    /// 表示用の送信者名。捕捉済みならそれを、旧 journal 由来なら生の sender を返す。
+    pub fn sender_label(&self) -> &str {
+        self.sender_name.as_deref().unwrap_or(&self.sender)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -32,7 +64,11 @@ pub struct StoredMessage {
     pub message: Message,
     pub target_pane: String,
     pub delivered: bool,
-    pub consumed: bool,
+    /// 製品用語では `Acked`（受領報告済み = 削除対象）。
+    /// journal の wire tag は旧 daemon 互換のため `Record::Consumed` のまま維持している
+    /// (docs/decisions/0002-message-retention-ack.md「journal 形式と旧データの移行」)。
+    /// `false` が `Pending`。**読んだかどうかは記録しない。**
+    pub acked: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -112,7 +148,7 @@ impl BrokerState {
     pub fn dispatch<F>(
         &mut self,
         pane: &str,
-        sender: String,
+        origin: Origin,
         brief: String,
         expected_name: &str,
         make_bell: F,
@@ -128,7 +164,8 @@ impl BrokerState {
         self.next_id += 1;
         let message = Message {
             id,
-            sender,
+            sender: origin.pane,
+            sender_name: Some(origin.name),
             brief,
             bell: make_bell(id),
             target_name: expected_name.to_owned(),
@@ -146,7 +183,7 @@ impl BrokerState {
                 message,
                 target_pane: pane.to_owned(),
                 delivered: false,
-                consumed: false,
+                acked: false,
             },
         );
         Ok(dispatch)
@@ -209,6 +246,18 @@ impl BrokerState {
         self.messages.get(&id)
     }
 
+    /// 返信先 pane。**捕捉時と同じ identity で今も登録中の pane にだけ**返す。
+    /// 送信者が退出・改名した場合や pane ID が再利用された場合は `None`
+    /// (新しい住人へ誤配送しないため)。
+    pub fn reply_target(&self, message: &Message) -> Option<String> {
+        let captured = message.sender_name.as_deref()?;
+        if !message.sender.starts_with('%') {
+            return None;
+        }
+        let agent = self.agents.get(&message.sender)?;
+        (agent.name == captured).then(|| message.sender.clone())
+    }
+
     pub fn complete_delivery(&mut self, pane: &str, id: u64) {
         if let Some(agent) = self.agents.get_mut(pane) {
             agent.queue.remove(&id);
@@ -220,10 +269,41 @@ impl BrokerState {
         }
     }
 
-    pub fn consume(&mut self, id: u64) {
+    /// 受領報告済み (`Acked`) にする。journal への追記が成功した後にだけ呼ぶこと。
+    pub fn ack(&mut self, id: u64) {
         if let Some(stored) = self.messages.get_mut(&id) {
-            stored.consumed = true;
+            stored.acked = true;
         }
+    }
+
+    /// 呼び出し元 pane 宛で **配達完了済み** かつ未受領の ID。本文は含めない。
+    pub fn pending_to_me(&self, pane: &str) -> Vec<u64> {
+        let current_name = self.agents.get(pane).map(|agent| agent.name.as_str());
+        self.messages
+            .values()
+            .filter(|stored| {
+                stored.target_pane == pane
+                    && !stored.acked
+                    && stored.delivered
+                    && current_name == Some(stored.message.target_name.as_str())
+            })
+            .map(|stored| stored.message.id)
+            .collect()
+    }
+
+    /// 呼び出し元 pane が送って未受領の ID を宛先 pane ごとに返す。**queue 中も含む。**
+    pub fn pending_from_me(&self, pane: &str) -> BTreeMap<String, Vec<u64>> {
+        let mut pending: BTreeMap<String, Vec<u64>> = BTreeMap::new();
+        for stored in self.messages.values() {
+            if stored.acked || stored.message.sender != pane {
+                continue;
+            }
+            pending
+                .entry(stored.target_pane.clone())
+                .or_default()
+                .push(stored.message.id);
+        }
+        pending
     }
 
     pub fn restore_agent(&mut self, pane: String, name: String, state: AgentState) {
@@ -245,7 +325,7 @@ impl BrokerState {
                 message,
                 target_pane: pane,
                 delivered: false,
-                consumed: false,
+                acked: false,
             },
         );
     }
@@ -272,10 +352,12 @@ impl BrokerState {
         }
     }
 
+    /// pane 宛の **未受領 (`Pending`) 全件**。読了は記録しないので「未読だけ」は判定できない
+    /// (docs/decisions/0002-message-retention-ack.md「pane 消滅時の掃除」)。
     pub fn messages_for_target(&self, pane: &str) -> Vec<Message> {
         self.messages
             .values()
-            .filter(|stored| stored.target_pane == pane && !stored.consumed)
+            .filter(|stored| stored.target_pane == pane && !stored.acked)
             .map(|stored| stored.message.clone())
             .collect()
     }
@@ -286,10 +368,12 @@ impl BrokerState {
             .is_some_and(|agent| agent.queue.contains(&id))
     }
 
-    pub fn prune_consumed_not_queued(&mut self) {
+    /// `Acked` は削除対象。ただし queue 中なら本文を durable に保持する
+    /// (保持と可視性を同じ真偽値で判定しない)。
+    pub fn prune_acked_not_queued(&mut self) {
         let agents = &self.agents;
         self.messages.retain(|id, stored| {
-            !stored.consumed
+            !stored.acked
                 || agents
                     .get(&stored.target_pane)
                     .is_some_and(|agent| agent.queue.contains(id))
@@ -313,6 +397,10 @@ mod tests {
         format!("read {id}")
     }
 
+    fn from(pane: &str) -> Origin {
+        Origin::new(pane, format!("agent{}", pane.trim_start_matches('%')))
+    }
+
     #[test]
     fn busy_messages_are_fifo_and_delivered_once() {
         let mut state = BrokerState::default();
@@ -321,7 +409,7 @@ mod tests {
 
         for body in ["one", "two"] {
             assert!(matches!(
-                state.dispatch("%1", "%2".into(), body.into(), "claude", bell),
+                state.dispatch("%1", from("%2"), body.into(), "claude", bell),
                 Ok(Dispatch::Queued(_))
             ));
         }
@@ -341,7 +429,7 @@ mod tests {
         state.set_state("%1", AgentState::Busy);
         for body in ["one", "two"] {
             state
-                .dispatch("%1", "%2".into(), body.into(), "claude", bell)
+                .dispatch("%1", from("%2"), body.into(), "claude", bell)
                 .unwrap();
         }
         state.remove("%1");
@@ -350,19 +438,164 @@ mod tests {
     }
 
     #[test]
-    fn consumed_message_remains_readable_until_checkpoint() {
+    fn acked_message_is_terminal_and_leaves_the_pending_views() {
         let mut state = BrokerState::default();
         state.register("%1".into(), "claude".into());
         let Dispatch::Deliver(id) = state
-            .dispatch("%1", "%2".into(), "body".into(), "claude", bell)
+            .dispatch("%1", from("%2"), "body".into(), "claude", bell)
             .unwrap()
         else {
             panic!("message should be delivered");
         };
         state.complete_delivery("%1", id);
-        state.consume(id);
+        assert_eq!(state.pending_to_me("%1"), vec![id]);
+        assert_eq!(state.pending_from_me("%2")["%1"], vec![id]);
+        state.ack(id);
         assert_eq!(state.message(id).unwrap().message.brief, "body");
-        assert!(state.message(id).unwrap().consumed);
+        assert!(state.message(id).unwrap().acked);
+        assert!(state.pending_to_me("%1").is_empty());
+        assert!(state.pending_from_me("%2").is_empty());
+    }
+
+    #[test]
+    fn pending_to_me_hides_queued_ids_that_pending_from_me_still_shows() {
+        let mut state = BrokerState::default();
+        state.register("%1".into(), "claude".into());
+        state.set_state("%1", AgentState::Busy);
+        let Dispatch::Queued(queued) = state
+            .dispatch("%1", from("%2"), "queued".into(), "claude", bell)
+            .unwrap()
+        else {
+            panic!("message should be queued");
+        };
+        assert!(
+            state.pending_to_me("%1").is_empty(),
+            "配達完了前の ID は呼び鈴の前に読めてはならない"
+        );
+        assert_eq!(state.pending_from_me("%2")["%1"], vec![queued]);
+
+        state.complete_delivery("%1", queued);
+        assert_eq!(state.pending_to_me("%1"), vec![queued]);
+    }
+
+    #[test]
+    fn pending_views_track_only_the_callers_own_ids() {
+        let mut state = BrokerState::default();
+        state.register("%1".into(), "claude".into());
+        state.set_state("%1", AgentState::Busy);
+        let mut mine = Vec::new();
+        for (sender, body) in [("%2", "a"), ("%3", "b"), ("%2", "c")] {
+            let Dispatch::Queued(id) = state
+                .dispatch("%1", from(sender), body.into(), "claude", bell)
+                .unwrap()
+            else {
+                panic!("message should be queued");
+            };
+            state.complete_delivery("%1", id);
+            if sender == "%2" {
+                mine.push(id);
+            }
+        }
+        assert_eq!(state.pending_from_me("%2")["%1"], mine);
+        assert_eq!(state.pending_from_me("%3")["%1"].len(), 1);
+        assert_eq!(state.pending_to_me("%1").len(), 3);
+    }
+
+    #[test]
+    fn sender_identity_is_captured_at_send_time_and_never_re_resolved() {
+        let mut state = BrokerState::default();
+        state.register("%1".into(), "claude".into());
+        state.register("%2".into(), "codex".into());
+        let Dispatch::Deliver(id) = state
+            .dispatch(
+                "%1",
+                Origin::new("%2", "codex"),
+                "body".into(),
+                "claude",
+                bell,
+            )
+            .unwrap()
+        else {
+            panic!("message should be delivered");
+        };
+        let captured = state.message(id).unwrap().message.clone();
+        assert_eq!(captured.sender_label(), "codex");
+        assert_eq!(state.reply_target(&captured), Some("%2".into()));
+
+        // 送信者が改名 (= pane ID 再利用) しても、捕捉した名前は変わらない。
+        state.register("%2".into(), "gemini".into());
+        assert_eq!(
+            state.message(id).unwrap().message.sender_label(),
+            "codex",
+            "現在のレジストリを引き直してはならない"
+        );
+        assert_eq!(
+            state.reply_target(&captured),
+            None,
+            "新しい住人へ返信させてはならない"
+        );
+
+        // 送信者が退出した場合も返信先を出さない。
+        state.register("%2".into(), "codex".into());
+        assert_eq!(state.reply_target(&captured), Some("%2".into()));
+        state.remove("%2");
+        assert_eq!(state.reply_target(&captured), None);
+    }
+
+    #[test]
+    fn a_legacy_message_without_a_captured_name_never_offers_a_reply_target() {
+        let mut state = BrokerState::default();
+        state.register("%2".into(), "codex".into());
+        let legacy = Message {
+            id: 1,
+            sender: "%2".into(),
+            sender_name: None,
+            brief: "body".into(),
+            bell: "read 1".into(),
+            target_name: "claude".into(),
+        };
+        assert_eq!(legacy.sender_label(), "%2");
+        assert_eq!(state.reply_target(&legacy), None);
+    }
+
+    #[test]
+    fn non_pane_senders_never_offer_a_reply_target() {
+        let mut state = BrokerState::default();
+        state.register("%1".into(), "claude".into());
+        for label in ["human", "system"] {
+            let Dispatch::Deliver(id) = state
+                .dispatch(
+                    "%1",
+                    Origin::new(label, label),
+                    "body".into(),
+                    "claude",
+                    bell,
+                )
+                .unwrap()
+            else {
+                panic!("message should be delivered");
+            };
+            let message = state.message(id).unwrap().message.clone();
+            assert_eq!(message.sender_label(), label);
+            assert_eq!(state.reply_target(&message), None);
+            state.ack(id);
+            state.set_state("%1", AgentState::Idle);
+        }
+    }
+
+    #[test]
+    fn pending_to_me_requires_the_registered_name_to_still_match() {
+        let mut state = BrokerState::default();
+        state.register("%1".into(), "claude".into());
+        let Dispatch::Deliver(id) = state
+            .dispatch("%1", from("%2"), "body".into(), "claude", bell)
+            .unwrap()
+        else {
+            panic!("message should be delivered");
+        };
+        state.complete_delivery("%1", id);
+        state.register("%1".into(), "codex".into());
+        assert!(state.pending_to_me("%1").is_empty());
     }
 
     #[test]
@@ -372,7 +605,7 @@ mod tests {
         state.set_state("%1", AgentState::Busy);
         for index in 0..1000 {
             state
-                .dispatch("%1", "%2".into(), index.to_string(), "claude", bell)
+                .dispatch("%1", from("%2"), index.to_string(), "claude", bell)
                 .unwrap();
         }
         let ids: Vec<_> = state.agents["%1"].queue.iter().copied().collect();
