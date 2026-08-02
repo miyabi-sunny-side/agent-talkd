@@ -1,10 +1,11 @@
 name: ci
 
+# main への push では走らせない。ローカルの delivery skill が commit 前に
+# 同じ検査を通しており、push 後に赤くなってもゲートとして機能しないため。
+# 実際のゲートは PR、確認したいときは手動実行。
 on:
-  push:
-    branches:
-      - main
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read

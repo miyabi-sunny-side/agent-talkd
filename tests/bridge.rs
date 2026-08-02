@@ -16,12 +16,17 @@ use std::{
     os::unix::net::{UnixListener, UnixStream},
     path::{Path, PathBuf},
     process::{Command, Output},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
 
 use serde_json::{Value, json};
+
+mod common;
 use tempfile::TempDir;
 
 /// 隔離した tmux サーバー。Drop で必ず落とす。
@@ -127,10 +132,18 @@ struct Harness {
     http_port: u16,
 }
 
+/// テストごとに別の tmux サーバーを与える連番。同名だと並列実行時に互いの
+/// pane を壊し、Drop の `kill-server` が相手のサーバーまで落とす。
+static NEXT_SERVER: AtomicUsize = AtomicUsize::new(0);
+
 impl Harness {
     fn start() -> Self {
         let root = TempDir::new().unwrap();
-        let name = format!("agent-talkd-bridge-{}", std::process::id());
+        let name = format!(
+            "agent-talkd-bridge-{}-{}",
+            std::process::id(),
+            NEXT_SERVER.fetch_add(1, Ordering::Relaxed)
+        );
         let tmux = TmuxServer { name: name.clone() };
         let runtime = root.path().join("run");
         let state = root.path().join("state");
@@ -284,16 +297,25 @@ fn one_daemon_bridges_tmux_and_herdr_and_serves_mobile_over_tcp() {
     harness.ok(&harness.as_herdr_pane(&["register", "codex"]));
 
     // --- 達成条件 1: who に両方の pane が出る ---
+    //
+    // agent 名の列で判定する。cwd 列との偶然の一致で通ってしまわないように。
     let who = harness.ok(&harness.as_tmux_pane(&["who"]));
-    assert!(who.contains("claude"), "tmux 側の agent が見えない: {who}");
-    assert!(who.contains("codex"), "herdr 側の agent が見えない: {who}");
-    assert!(who.contains("tmux"), "backend 列が無い: {who}");
-    assert!(who.contains("herdr"), "backend 列が無い: {who}");
+    assert!(
+        common::has_agent(&who, "claude"),
+        "tmux 側が見えない: {who}"
+    );
+    assert!(
+        common::has_agent(&who, "codex"),
+        "herdr 側が見えない: {who}"
+    );
+    // backend 列は「どの agent がどちらに居るか」まで含めて確かめる。
+    assert_eq!(common::agent_backend(&who, "claude"), Some("tmux"), "{who}");
+    assert_eq!(common::agent_backend(&who, "codex"), Some("herdr"), "{who}");
 
     // 逆向きも成立する: herdr 側のクライアントから tmux 側の agent が見える。
     let who_from_herdr = harness.ok(&harness.as_herdr_pane(&["who"]));
     assert!(
-        who_from_herdr.contains("claude"),
+        common::has_agent(&who_from_herdr, "claude"),
         "herdr 側から tmux 側の agent が見えない: {who_from_herdr}"
     );
 
@@ -345,7 +367,7 @@ fn losing_one_multiplexer_does_not_take_down_the_other() {
     thread::sleep(Duration::from_secs(5));
     let who = harness.ok(&harness.as_tmux_pane(&["who"]));
     assert!(
-        who.contains("claude"),
+        common::has_agent(&who, "claude"),
         "herdr が落ちたら tmux 側まで見えなくなった: {who}"
     );
 
@@ -389,11 +411,11 @@ fn a_herdr_only_daemon_is_replaced_by_one_that_serves_both() {
 
     // 1 つの registry を共有していること。どちらの経路からも両方見える。
     let from_tmux = harness.ok(&harness.as_tmux_pane(&["who"]));
-    assert!(from_tmux.contains("claude"), "{from_tmux}");
-    assert!(from_tmux.contains("codex"), "{from_tmux}");
+    assert!(common::has_agent(&from_tmux, "claude"), "{from_tmux}");
+    assert!(common::has_agent(&from_tmux, "codex"), "{from_tmux}");
     let from_herdr = harness.ok(&harness.as_herdr_pane(&["who"]));
-    assert!(from_herdr.contains("claude"), "{from_herdr}");
-    assert!(from_herdr.contains("codex"), "{from_herdr}");
+    assert!(common::has_agent(&from_herdr, "claude"), "{from_herdr}");
+    assert!(common::has_agent(&from_herdr, "codex"), "{from_herdr}");
 
     let _ = harness.as_tmux_pane(&["internal-daemon-shutdown"]);
 }

@@ -8,6 +8,8 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+mod common;
+
 struct Server {
     name: String,
 }
@@ -283,7 +285,9 @@ fn daemon_journal_read_recovery_and_pane_exit() {
         &panes[0],
         &["who"],
     ));
-    assert!(during_run.contains("runner"));
+    // 行全体ではなく agent 名の列で見る。cwd 列に "runner" を含む path
+    // (GitHub Actions の /home/runner/...) でも意味を保つため。
+    assert!(common::has_agent(&during_run, "runner"), "{during_run}");
     fs::write(&stop, "stop").unwrap();
     assert!(runner.wait().unwrap().success());
     let after_run = text(agent(
@@ -294,7 +298,7 @@ fn daemon_journal_read_recovery_and_pane_exit() {
         &panes[0],
         &["who"],
     ));
-    assert!(!after_run.contains("runner"));
+    assert!(!common::has_agent(&after_run, "runner"), "{after_run}");
 
     // A failed registration stays silent and does not block the child.
     let registration_failure = agent_raw(
@@ -326,7 +330,10 @@ fn daemon_journal_read_recovery_and_pane_exit() {
         &panes[0],
         &["who"],
     ));
-    assert!(!after_spawn_failure.contains("runner"));
+    assert!(
+        !common::has_agent(&after_spawn_failure, "runner"),
+        "{after_spawn_failure}"
+    );
 
     // Immediate messages are journal-backed and read is non-destructive.
     let human_send = text(agent(
@@ -858,8 +865,8 @@ fn daemon_journal_read_recovery_and_pane_exit() {
         ));
         let sender_screen = text(tmux(&name, &["capture-pane", "-p", "-t", &panes[0]]));
         // ADR 0002: 通知文は「配達されなかった」ではなく受領報告の欠如を表す。
-        if who.contains("codex")
-            && !who.contains("claude")
+        if common::has_agent(&who, "codex")
+            && !common::has_agent(&who, "claude")
             && sender_state == "busy"
             && sender_screen.contains("[agent-talk] 未受領のまま終了:")
         {
@@ -1206,7 +1213,8 @@ fn message_retention_follows_the_acknowledgement_contract() {
     loop {
         let who = fixture.run(0, &["who"]);
         let screen = fixture.screen(0);
-        if !who.contains("claude") && screen.contains("[agent-talk] 未受領のまま終了:") {
+        if !common::has_agent(&who, "claude") && screen.contains("[agent-talk] 未受領のまま終了:")
+        {
             let notice_id = read_id_from_bell(&screen);
             let notice = fixture.run(0, &["read", &notice_id.to_string()]);
             assert!(notice.contains("# agent-talk 未受領通知"), "{notice}");
@@ -1615,4 +1623,34 @@ fn wait_for(mut condition: impl FnMut() -> bool) {
         assert!(Instant::now() < deadline, "condition timed out");
         thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// 回帰: `who` の判定が cwd 列に引きずられないこと。
+///
+/// GitHub Actions の checkout 先は `/home/runner/...` で、agent 名 "runner" と
+/// 同じ語を cwd に含む。行全体への部分文字列一致だと登録の有無に関わらず
+/// 一致してしまい、`daemon_journal_read_recovery_and_pane_exit` が
+/// 2026-07-28 から常に失敗していた。
+#[test]
+fn who_lookup_ignores_the_cwd_column() {
+    // "runner" は cwd にだけ現れ、agent としては登録されていない。
+    let who = "\
+claude     idle        tmux  test:0.0 (%0)  /home/runner/work/agent-talkd
+codex      idle        tmux  test:0.1 (%1)  /home/runner/work/agent-talkd
+pending-to-me: #1
+";
+    assert!(
+        !common::has_agent(who, "runner"),
+        "cwd 列に引きずられている"
+    );
+    assert!(common::has_agent(who, "claude"));
+    assert!(common::has_agent(who, "codex"));
+    // 付随行を agent と誤認しない。
+    assert!(!common::has_agent(who, "pending-to-me:"));
+    assert_eq!(common::agent_backend(who, "claude"), Some("tmux"));
+
+    // 登録されている "runner" は、同じ語が cwd にあっても検出できる。
+    let with_runner =
+        format!("{who}runner     idle        tmux  test:0.2 (%2)  /home/runner/work\n");
+    assert!(common::has_agent(&with_runner, "runner"));
 }
