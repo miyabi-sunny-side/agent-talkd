@@ -24,7 +24,7 @@ use tokio::{
 };
 
 use crate::{
-    paths::rpc_socket_path,
+    paths::{herdr_rpc_socket_path, rpc_socket_path},
     protocol::{Request, Response, SendOptions},
 };
 
@@ -51,25 +51,74 @@ pub struct Context {
     pub socket: PathBuf,
 }
 
-/// `TMUX` / `TMUX_PANE` / runtime root を検証して接続先を純粋導出する。
+/// multiplexer 環境 / runtime root を検証して接続先を純粋導出する。
+///
+/// herdr の pane に居るなら herdr 由来、tmux なら tmux 由来の socket を選ぶ。
+/// daemon は両方の path で listen しているので、どちらから来ても同じ broker に
+/// 届く (`docs/decisions/0001-conversation-broker-scope.md` の接続先 positive 定義)。
 ///
 /// 曖昧な状態では起動しない。勝手な既定値は作らない。
 pub fn resolve_context<F>(get: F) -> Result<Context, String>
 where
     F: Fn(&str) -> Option<OsString>,
 {
-    let tmux = get("TMUX").ok_or("TMUX が設定されていません")?;
-    let tmux_socket = tmux_socket_of(&tmux)?;
-    let pane = pane_id_of(
-        get("TMUX_PANE")
-            .ok_or("TMUX_PANE が設定されていません")?
-            .as_os_str(),
-    )?;
     let root = runtime_root(&get)?;
-    Ok(Context {
-        pane,
-        socket: rpc_socket_path(&root, &tmux_socket),
-    })
+    // herdr を先に見る。herdr の pane の中で tmux を起動している場合、
+    // agent が実際に居るのは内側の tmux なので TMUX 側が正しい。
+    if let Some(tmux) = get("TMUX") {
+        let tmux_socket = tmux_socket_of(&tmux)?;
+        let pane = pane_id_of(
+            get("TMUX_PANE")
+                .ok_or("TMUX_PANE が設定されていません")?
+                .as_os_str(),
+        )?;
+        return Ok(Context {
+            pane,
+            socket: rpc_socket_path(&root, &tmux_socket),
+        });
+    }
+    if let Some(socket) = get("HERDR_SOCKET_PATH") {
+        let herdr_socket = herdr_socket_of(&socket)?;
+        let pane = herdr_pane_id_of(
+            get("HERDR_PANE_ID")
+                .ok_or("HERDR_PANE_ID が設定されていません")?
+                .as_os_str(),
+        )?;
+        return Ok(Context {
+            pane,
+            socket: herdr_rpc_socket_path(&root, &herdr_socket),
+        });
+    }
+    Err("TMUX も HERDR_SOCKET_PATH も設定されていません".to_owned())
+}
+
+/// `HERDR_SOCKET_PATH` は絶対 path。書式違反は fail closed。
+fn herdr_socket_of(value: &OsStr) -> Result<PathBuf, String> {
+    let value = value
+        .to_str()
+        .ok_or("HERDR_SOCKET_PATH の値が UTF-8 ではありません".to_owned())?;
+    if !absolute_path(value) || Path::new(value).file_name().is_none() {
+        return Err(format!("HERDR_SOCKET_PATH が不正です: '{value}'"));
+    }
+    Ok(PathBuf::from(value))
+}
+
+/// `HERDR_PANE_ID` は `w<digits>:p<digits>`。
+fn herdr_pane_id_of(value: &OsStr) -> Result<String, String> {
+    let value = value
+        .to_str()
+        .ok_or("HERDR_PANE_ID の値が UTF-8 ではありません".to_owned())?;
+    let valid = value.split_once(":p").is_some_and(|(workspace, pane)| {
+        workspace.strip_prefix('w').is_some_and(|digits| {
+            !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+        }) && !pane.is_empty()
+            && pane.bytes().all(|byte| byte.is_ascii_digit())
+    });
+    if valid {
+        Ok(value.to_owned())
+    } else {
+        Err(format!("HERDR_PANE_ID が不正です: '{value}'"))
+    }
 }
 
 /// `TMUX` は `<socket path>,<server pid>,<session id>`。書式違反は fail closed。

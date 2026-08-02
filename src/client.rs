@@ -1,7 +1,4 @@
-use std::{
-    env,
-    io::{self, Read},
-};
+use std::io::{self, Read};
 
 use anyhow::{Result, bail};
 
@@ -31,7 +28,7 @@ pub async fn run(config: Config, mut command: String, args: Vec<String>) -> Resu
         command,
         args,
         stdin,
-        pane: env::var("TMUX_PANE").ok(),
+        pane: crate::backend::self_pane(),
         send_options,
     };
     let response = lifecycle::request(&config, &request).await?;
@@ -203,9 +200,11 @@ mod tests {
             writer.write_all(b"\n").await.unwrap();
         });
         let config = Config {
-            tmux_socket: String::new(),
-            rpc_socket,
+            tmux_socket: Some(String::new()),
+            herdr_socket: None,
+            rpc_sockets: vec![rpc_socket],
             http_socket: PathBuf::new(),
+            http_tcp: None,
             journal: PathBuf::new(),
             log: PathBuf::new(),
             queue_limit: 1,

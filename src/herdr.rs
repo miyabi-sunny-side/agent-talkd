@@ -1,0 +1,414 @@
+//! herdr socket API client。
+//!
+//! herdr は newline-delimited JSON を local socket で話す (protocol 17)。
+//! 1 リクエスト 1 接続で、`{"id","method","params"}` を送り 1 行の応答を読む。
+//!
+//! tmux backend との決定的な違いは **配送に状態ガードがあること**。
+//! `pane.send_text` 自体は herdr 側に何のガードも無く、working / blocked な
+//! pane にも文字を撃ち込める。承認ダイアログへ Enter を撃ち込む事故を避けるため、
+//! herdr が **積極的に `idle` と判定した pane にだけ**送る (README の
+//! 「multiplexer backend」節)。`unknown` は idle の証拠にならないので送らない。
+
+use std::path::PathBuf;
+
+use anyhow::{Context, Result, bail};
+use serde_json::{Value, json};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    net::UnixStream,
+};
+
+/// 応答 1 行の上限。壊れた相手からの無限読み出しを防ぐ。
+const MAX_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// herdr が報告する agent の意味的状態。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentStatus {
+    Idle,
+    Working,
+    Blocked,
+    Done,
+    Unknown,
+}
+
+impl AgentStatus {
+    fn parse(value: &str) -> Self {
+        match value {
+            "idle" => Self::Idle,
+            "working" => Self::Working,
+            "blocked" => Self::Blocked,
+            "done" => Self::Done,
+            _ => Self::Unknown,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Working => "working",
+            Self::Blocked => "blocked",
+            Self::Done => "done",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// 自動配送を許すのは、herdr が **積極的に** idle と判定したときだけ。
+    ///
+    /// `Unknown` を許さないのは、herdr の detection manifest に無い画面形状が
+    /// idle fallback になり得るため。負の証拠を根拠に入力してはならない。
+    pub fn accepts_delivery(self) -> bool {
+        matches!(self, Self::Idle)
+    }
+}
+
+/// 配送の結果。`Skipped` は失敗ではなく「送らないと判断した」ことを表す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Delivery {
+    Sent,
+    Skipped(AgentStatus),
+}
+
+/// herdr の pane 1 つ。`pane_id` は位置依存 (`w1:p2`)、`terminal_id` は安定。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HerdrPane {
+    pub pane_id: String,
+    pub terminal_id: String,
+    pub workspace_id: String,
+    pub tab_id: String,
+    pub cwd: String,
+    pub agent: Option<String>,
+    pub status: AgentStatus,
+}
+
+#[derive(Clone)]
+pub struct Herdr {
+    socket: PathBuf,
+}
+
+impl Herdr {
+    pub fn new(socket: PathBuf) -> Self {
+        Self { socket }
+    }
+
+    /// protocol 番号を返す。daemon の health check に使う。
+    pub async fn protocol(&self) -> Result<u64> {
+        let result = self.call("ping", json!({})).await?;
+        result
+            .get("protocol")
+            .and_then(Value::as_u64)
+            .context("herdr ping に protocol がありません")
+    }
+
+    pub async fn panes(&self) -> Result<Vec<HerdrPane>> {
+        let result = self.call("pane.list", json!({})).await?;
+        let panes = result
+            .get("panes")
+            .and_then(Value::as_array)
+            .context("herdr pane.list に panes がありません")?;
+        Ok(panes.iter().filter_map(parse_pane).collect())
+    }
+
+    /// idle と確認できた pane にだけ本文を送る。
+    ///
+    /// 状態の取得と送信の間には原理的に race があるが、herdr には
+    /// 「idle なら送る」を atomic に行う API が無い (`agent.prompt` は状態を
+    /// 問わず即時送信する)。窓を最小化するため、直前に取得した状態で判断する。
+    pub async fn deliver(&self, pane_id: &str, text: &str) -> Result<Delivery> {
+        let status = self.status_of(pane_id).await?;
+        if !status.accepts_delivery() {
+            return Ok(Delivery::Skipped(status));
+        }
+        self.call("pane.send_text", json!({"pane_id": pane_id, "text": text}))
+            .await?;
+        Ok(Delivery::Sent)
+    }
+
+    pub async fn read(&self, pane_id: &str) -> Result<String> {
+        let result = self
+            .call(
+                "pane.read",
+                json!({"pane_id": pane_id, "source": "visible"}),
+            )
+            .await?;
+        Ok(result
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned())
+    }
+
+    async fn status_of(&self, pane_id: &str) -> Result<AgentStatus> {
+        let result = self
+            .call("pane.get", json!({"pane_id": pane_id}))
+            .await
+            .with_context(|| format!("herdr pane {pane_id} の状態を取得できません"))?;
+        Ok(status_from(&result))
+    }
+
+    async fn call(&self, method: &str, params: Value) -> Result<Value> {
+        let stream = UnixStream::connect(&self.socket)
+            .await
+            .with_context(|| format!("herdr socket へ接続できません: {}", self.socket.display()))?;
+        let (read_half, mut write_half) = stream.into_split();
+        let request = format!(
+            "{}\n",
+            json!({"id": "agent-talkd", "method": method, "params": params})
+        );
+        write_half
+            .write_all(request.as_bytes())
+            .await
+            .context("herdr へ要求を書けません")?;
+        // 壊れた相手が改行を返さない場合に無限に読まないよう、読み出し側を
+        // 先に切ってから行読みする。
+        let mut reader = BufReader::new(read_half.take(MAX_RESPONSE_BYTES));
+        let mut line = String::new();
+        reader
+            .read_line(&mut line)
+            .await
+            .context("herdr の応答を読めません")?;
+        if line.trim().is_empty() {
+            bail!("herdr が {method} に応答しませんでした");
+        }
+        let response: Value = serde_json::from_str(line.trim())
+            .with_context(|| format!("herdr の {method} 応答が JSON ではありません"))?;
+        if let Some(error) = response.get("error") {
+            let code = error.get("code").and_then(Value::as_str).unwrap_or("error");
+            let message = error.get("message").and_then(Value::as_str).unwrap_or("");
+            bail!("herdr {method} が失敗しました: {code}: {message}");
+        }
+        response
+            .get("result")
+            .cloned()
+            .with_context(|| format!("herdr の {method} 応答に result がありません"))
+    }
+}
+
+fn status_from(value: &Value) -> AgentStatus {
+    value
+        .get("agent_status")
+        .and_then(Value::as_str)
+        .map_or(AgentStatus::Unknown, AgentStatus::parse)
+}
+
+fn parse_pane(value: &Value) -> Option<HerdrPane> {
+    let field = |key: &str| {
+        value
+            .get(key)
+            .and_then(Value::as_str)
+            .map(std::borrow::ToOwned::to_owned)
+    };
+    Some(HerdrPane {
+        pane_id: field("pane_id")?,
+        terminal_id: field("terminal_id").unwrap_or_default(),
+        workspace_id: field("workspace_id").unwrap_or_default(),
+        tab_id: field("tab_id").unwrap_or_default(),
+        cwd: field("cwd").unwrap_or_default(),
+        agent: field("agent").filter(|agent| !agent.is_empty()),
+        status: status_from(value),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use serde_json::json;
+    use tempfile::TempDir;
+    use tokio::{
+        io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+        net::UnixListener,
+    };
+
+    use super::*;
+
+    /// 実 herdr の代わりに立てる偽サーバー。
+    ///
+    /// 実 socket 上で newline JSON をやり取りするので、wire 形式そのものを
+    /// 検証できる。受け取った要求は全て記録し、テストから参照する。
+    struct FakeHerdr {
+        socket: PathBuf,
+        requests: Arc<Mutex<Vec<Value>>>,
+        _dir: TempDir,
+    }
+
+    impl FakeHerdr {
+        fn start<F>(responder: F) -> Self
+        where
+            F: Fn(&str, &Value) -> Value + Send + Sync + 'static,
+        {
+            let dir = TempDir::new().unwrap();
+            let socket = dir.path().join("herdr.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let recorded = Arc::clone(&requests);
+            let responder = Arc::new(responder);
+            tokio::spawn(async move {
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let recorded = Arc::clone(&recorded);
+                    let responder = Arc::clone(&responder);
+                    tokio::spawn(async move {
+                        let mut reader = BufReader::new(stream);
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).await.is_err() || line.trim().is_empty() {
+                            return;
+                        }
+                        let request: Value = serde_json::from_str(line.trim()).unwrap();
+                        let method = request
+                            .get("method")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned();
+                        let params = request.get("params").cloned().unwrap_or(Value::Null);
+                        recorded.lock().unwrap().push(request);
+                        let response = responder(&method, &params);
+                        let payload = format!("{response}\n");
+                        let _ = reader.get_mut().write_all(payload.as_bytes()).await;
+                    });
+                }
+            });
+            Self {
+                socket,
+                requests,
+                _dir: dir,
+            }
+        }
+
+        fn client(&self) -> Herdr {
+            Herdr::new(self.socket.clone())
+        }
+
+        fn methods(&self) -> Vec<String> {
+            self.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|request| {
+                    request
+                        .get("method")
+                        .and_then(Value::as_str)
+                        .map(std::borrow::ToOwned::to_owned)
+                })
+                .collect()
+        }
+    }
+
+    fn ok(result: &Value) -> Value {
+        json!({"id": "agent-talkd", "result": result})
+    }
+
+    fn pane(pane_id: &str, agent: &str, status: &str) -> Value {
+        json!({
+            "pane_id": pane_id,
+            "terminal_id": format!("term_{pane_id}"),
+            "workspace_id": pane_id.split(':').next().unwrap_or_default(),
+            "tab_id": format!("{}:t1", pane_id.split(':').next().unwrap_or_default()),
+            "cwd": "/home/miyabi/projects",
+            "agent": agent,
+            "agent_status": status,
+        })
+    }
+
+    /// 達成条件 1: herdr の pane と agent 状態を列挙できる。
+    #[tokio::test]
+    async fn panes_expose_agent_identity_and_status() {
+        let fake = FakeHerdr::start(|method, _| match method {
+            "pane.list" => ok(&json!({
+                "type": "pane_list",
+                "panes": [
+                    pane("w1:p1", "codex", "working"),
+                    pane("w1:p2", "claude", "idle"),
+                    json!({"pane_id": "w1:p6", "agent_status": "unknown"}),
+                ],
+            })),
+            _ => ok(&json!({})),
+        });
+
+        let panes = fake.client().panes().await.unwrap();
+
+        assert_eq!(panes.len(), 3);
+        assert_eq!(panes[0].pane_id, "w1:p1");
+        assert_eq!(panes[0].agent.as_deref(), Some("codex"));
+        assert_eq!(panes[0].status, AgentStatus::Working);
+        assert_eq!(panes[0].terminal_id, "term_w1:p1");
+        assert_eq!(panes[1].agent.as_deref(), Some("claude"));
+        assert_eq!(panes[1].status, AgentStatus::Idle);
+        // agent の居ない素の pane も列挙され、状態は Unknown になる。
+        assert_eq!(panes[2].agent, None);
+        assert_eq!(panes[2].status, AgentStatus::Unknown);
+    }
+
+    /// 達成条件 2 の中核: busy な pane には一文字も送らない。
+    ///
+    /// 「送信を試みて失敗する」ではなく「**そもそも `send_text` を発行しない**」
+    /// ことを、偽サーバーが受け取った method 列で証明する。
+    #[tokio::test]
+    async fn deliver_never_sends_text_to_a_pane_that_is_not_idle() {
+        for status in ["working", "blocked", "unknown", "done"] {
+            let owned = status.to_owned();
+            let fake = FakeHerdr::start(move |method, _| match method {
+                "pane.get" => ok(&pane("w1:p1", "codex", &owned)),
+                _ => ok(&json!({})),
+            });
+
+            let delivery = fake.client().deliver("w1:p1", "[agent-talk] #1").await;
+
+            assert_eq!(
+                delivery.unwrap(),
+                Delivery::Skipped(AgentStatus::parse(status)),
+                "{status} は配送を拒否しなければならない"
+            );
+            assert!(
+                !fake
+                    .methods()
+                    .iter()
+                    .any(|method| method == "pane.send_text"),
+                "{status} な pane へ send_text を発行してはならない (実際: {:?})",
+                fake.methods()
+            );
+        }
+    }
+
+    /// 達成条件 2 の対: idle なら実際に送る。拒否だけして届かないのでは無意味。
+    #[tokio::test]
+    async fn deliver_sends_text_to_an_idle_pane() {
+        let fake = FakeHerdr::start(|method, _| match method {
+            "pane.get" => ok(&pane("w1:p2", "claude", "idle")),
+            _ => ok(&json!({})),
+        });
+
+        let delivery = fake
+            .client()
+            .deliver("w1:p2", "[agent-talk] #1\n")
+            .await
+            .unwrap();
+
+        assert_eq!(delivery, Delivery::Sent);
+        assert_eq!(fake.methods(), vec!["pane.get", "pane.send_text"]);
+        let sent = fake.requests.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(sent["params"]["pane_id"], "w1:p2");
+        assert_eq!(sent["params"]["text"], "[agent-talk] #1\n");
+    }
+
+    /// herdr の error 応答を握り潰さない。
+    #[tokio::test]
+    async fn socket_errors_surface_instead_of_being_swallowed() {
+        let fake = FakeHerdr::start(
+            |_, _| json!({"id": "agent-talkd", "error": {"code": "not_found", "message": "no such pane"}}),
+        );
+
+        let error = fake.client().panes().await.unwrap_err().to_string();
+
+        assert!(error.contains("not_found"), "{error}");
+        assert!(error.contains("no such pane"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn protocol_is_reported_for_health_checks() {
+        let fake = FakeHerdr::start(|_, _| ok(&json!({"type": "pong", "protocol": 17})));
+
+        assert_eq!(fake.client().protocol().await.unwrap(), 17);
+    }
+}

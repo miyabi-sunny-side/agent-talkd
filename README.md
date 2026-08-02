@@ -311,13 +311,48 @@ cargo build --locked --release
 統合テストは隔離した実 tmux サーバーを作成するため、通常のテスト実行では
 ignore されています。
 
+## multiplexer backend（tmux / herdr）
+
+tmux と herdr の**両方を 1 つの daemon が同時に扱います**。移行期に
+「tmux 側の agent」と「herdr 側の agent」が会話できなくなるのを避けるためです。
+
+daemon は設定された backend ごとに RPC socket を開きます。pane の中に居る
+クライアントは自分の環境変数から socket を導出しますが、どちらの経路も
+**同じ daemon プロセス**に届きます。
+
+| 環境変数 | 役割 |
+|---|---|
+| `AGENT_TALK_HERDR_SOCKET` | herdr backend を明示的に有効化する。空文字なら無効。tmux の pane から herdr 側の agent とも会話したい場合はこれを設定する |
+| `AGENT_TALK_TMUX_SOCKET` | tmux backend を明示的に指定する |
+| `AGENT_TALK_HTTP_ADDR` | 設定すると読み取り専用 HTTP 面を TCP でも待ち受ける（例 `127.0.0.1:8787`）。既定は無効 |
+
+herdr の pane の中に居る場合（`HERDR_PANE_ID` / `HERDR_SOCKET_PATH` がある）は
+自動的に herdr backend が有効になります。**socket file が存在するだけでは
+有効になりません** — 停止済み・無関係な herdr を掴まないためです。
+
+pane id は tmux が `%5`、herdr が `w1:p2` で形式が交わらないため、
+1 つの registry に混ぜても曖昧になりません。宛先に pane id を直接
+指定する場合は両方の形式が使えます。ただし **tmux の session と herdr の
+workspace は別の名前空間**なので、backend をまたぐときは
+`w1/codex` のような明示 scope か pane id が必要です。
+
+herdr への配送は、herdr が **idle と積極的に判定した pane にだけ**行います。
+`working` / `blocked` / `unknown` には一文字も送りません。
+
+### 既知の TODO
+
+- **tmux backend は移行のための一時的な足場**です。移行が完了したら削除します
+- herdr の `AttentionRequired`（固着 pane の検知と通知）は未実装
+- `agent-talk-mcp` の herdr 対応は環境変数の解決までで、実 herdr での E2E は未検証
+
 ## 対応環境
 
 - Linux x86_64
 - macOS Apple Silicon
 - tmux 3.4以上（3.4 / 3.6bで検証）
+- herdr 0.7.5（protocol 17）で検証
 
-Windowsはtmuxを前提とするためサポート対象外です。
+Windows は tmux / herdr のどちらも前提にできないためサポート対象外です。
 
 ## ライセンス
 

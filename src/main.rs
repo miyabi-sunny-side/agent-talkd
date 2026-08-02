@@ -1,7 +1,9 @@
+mod backend;
 mod client;
 mod config;
 mod daemon;
 mod help;
+mod herdr;
 mod journal;
 mod lifecycle;
 mod paths;
@@ -79,7 +81,7 @@ async fn run() -> Result<i32> {
     if matches!(
         command.as_str(),
         "register" | "unregister" | "busy" | "idle" | "turn-end"
-    ) && (env::var_os("TMUX").is_none() || env::var_os("TMUX_PANE").is_none())
+    ) && backend::self_pane().is_none()
     {
         return Ok(0);
     }

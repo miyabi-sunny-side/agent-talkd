@@ -4,7 +4,7 @@ use std::{
     fmt::Write as _,
     fs::{self, OpenOptions},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
-    path::Path,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -23,21 +23,23 @@ use hyper_util::rt::TokioIo;
 use serde::Serialize;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    net::{UnixListener, UnixStream},
+    net::{TcpListener, UnixListener, UnixStream},
     sync::{mpsc, oneshot},
 };
 use tracing::{error, info, warn};
 
 use crate::{
+    backend::{Multiplexer, PaneInfo},
     config::{Config, is_safe_token},
     help,
+    herdr::Herdr,
     journal::{Journal, Record},
     protocol::{Request, Response, SendOptions},
     state::{
         AgentState, BrokerState, Dispatch, ExternalMailboxEvent, MailboxDirection, Message, Origin,
         StoredMessage,
     },
-    tmux::{PaneInfo, Tmux},
+    tmux::Tmux,
 };
 
 const MAX_BODY_BYTES: usize = 1024 * 1024;
@@ -262,35 +264,37 @@ mod embedded {
 
 pub async fn run(config: Config) -> Result<()> {
     init_logging(&config.log, &config.log_level)?;
-    if let Some(parent) = config.rpc_socket.parent() {
+    if let Some(parent) = config.rpc_socket().parent() {
         fs::create_dir_all(parent)?;
         fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
     }
-    if config.rpc_socket.exists() {
-        match UnixStream::connect(&config.rpc_socket).await {
-            Ok(_) => return Ok(()),
-            Err(_) => fs::remove_file(&config.rpc_socket)
-                .with_context(|| format!("cannot remove {}", config.rpc_socket.display()))?,
-        }
-    }
-    let listener = UnixListener::bind(&config.rpc_socket)
-        .with_context(|| format!("cannot bind {}", config.rpc_socket.display()))?;
+    let Some(listeners) = bind_rpc_sockets(&config.rpc_sockets).await? else {
+        // 既に生きた daemon が居る。二重起動しない。
+        return Ok(());
+    };
     remove_stale_socket(&config.http_socket)?;
     let http_listener = UnixListener::bind(&config.http_socket)
         .with_context(|| format!("cannot bind {}", config.http_socket.display()))?;
 
-    let tmux = Tmux::new(config.tmux_socket.clone());
-    let server_pid = tmux.server_pid().await?;
+    let tmux = config.tmux_socket.clone().map(Tmux::new);
+    let herdr = config.herdr_socket.clone().map(Herdr::new);
+    let mut mux = Multiplexer::new(tmux, herdr);
+    let baseline = mux.probe().await?;
     let executable = env::current_exe()?;
-    tmux.install_pane_exit_hook(&executable, &config.rpc_socket)
-        .await?;
-    ensure!(
-        tmux.server_pid().await? == server_pid,
-        "tmux server changed during daemon startup"
-    );
+    if let Some(tmux) = mux.tmux() {
+        tmux.install_pane_exit_hook(&executable, config.rpc_socket())
+            .await?;
+        ensure!(
+            Some(tmux.server_pid().await?) == baseline.tmux_pid,
+            "tmux server changed during daemon startup"
+        );
+    }
     let (tx, mut rx) = mpsc::channel::<Event>(64);
-    spawn_accept_loop(listener, tx.clone());
+    for listener in listeners {
+        spawn_accept_loop(listener, tx.clone());
+    }
     spawn_http_accept_loop(http_listener, tx.clone());
+    spawn_http_tcp(config.http_tcp.as_deref(), &tx).await;
     let health_tx = tx.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
@@ -306,7 +310,7 @@ pub async fn run(config: Config) -> Result<()> {
     let mut broker = Broker {
         state,
         journal,
-        tmux: tmux.clone(),
+        mux: mux.clone(),
         config,
     };
     broker.reconcile(true).await;
@@ -331,19 +335,17 @@ pub async fn run(config: Config) -> Result<()> {
                 }
             }
             Event::Http(event) => broker.handle_http_event(event).await,
-            Event::ServerCheck => match tmux.server_pid().await {
-                Ok(pid) if pid == server_pid => failed_health_checks = 0,
-                Ok(_) => break,
+            // 設定された backend が **すべて** 落ちたときだけ停止する。
+            // 片方だけ落ちても、もう片方に居る agent の会話は続く。
+            Event::ServerCheck => match mux.still_serving(&baseline).await {
+                Ok(true) => failed_health_checks = 0,
+                Ok(false) => break,
                 Err(error) => {
                     failed_health_checks += 1;
                     if failed_health_checks >= 2 {
                         break;
                     }
-                    warn!(
-                        %error,
-                        source = "tmux-health",
-                        "tmux health check failed; retrying"
-                    );
+                    warn!(%error, source = "health", "health check failed; retrying");
                 }
             },
         }
@@ -352,12 +354,45 @@ pub async fn run(config: Config) -> Result<()> {
     if shutdown_requested {
         info!(source = "lifecycle", "stopping after shutdown request");
     } else {
-        info!(source = "tmux-health", "stopping after tmux server exit");
+        info!(
+            source = "health",
+            "stopping after all multiplexers went away"
+        );
     }
-    tmux.remove_pane_exit_hook().await;
-    let _ = fs::remove_file(&broker.config.rpc_socket);
+    if let Some(tmux) = mux.tmux() {
+        tmux.remove_pane_exit_hook().await;
+    }
+    for path in &broker.config.rpc_sockets {
+        let _ = fs::remove_file(path);
+    }
     let _ = fs::remove_file(&broker.config.http_socket);
     Ok(())
+}
+
+/// 両 backend 分の RPC socket をすべて開く。
+///
+/// tmux の pane に居るクライアントと herdr の pane に居るクライアントは
+/// 別の path を導出するが、どちらもこの 1 プロセスへ届く。
+/// これが backend をまたいだ会話の土台になる。
+///
+/// 既に生きた daemon が居るときは `None` を返す (二重起動しない)。
+async fn bind_rpc_sockets(paths: &[PathBuf]) -> Result<Option<Vec<UnixListener>>> {
+    // **先に全 path を調べる。** 1 つでも生きた daemon が居るなら 1 つも bind
+    // しない。途中まで bind してから中断すると、drop された listener の
+    // pathname だけが残り、その socket へ繋ぐクライアントが永久に待たされる。
+    for path in paths {
+        if path.exists() && UnixStream::connect(path).await.is_ok() {
+            return Ok(None);
+        }
+    }
+    let mut listeners = Vec::with_capacity(paths.len());
+    for path in paths {
+        remove_stale_socket(path)?;
+        listeners.push(
+            UnixListener::bind(path).with_context(|| format!("cannot bind {}", path.display()))?,
+        );
+    }
+    Ok(Some(listeners))
 }
 
 fn remove_stale_socket(path: &Path) -> Result<()> {
@@ -403,6 +438,51 @@ fn spawn_http_accept_loop(listener: UnixListener, tx: mpsc::Sender<Event>) {
                     .await
                 {
                     warn!(%error, "HTTP connection failed");
+                }
+            });
+        }
+    });
+}
+
+/// agent-terrace 相当の TCP 面を必要なら開く。
+///
+/// bind に失敗しても daemon は止めない。TCP はスマホ向けの追加面であって、
+/// agent 同士の会話 (UDS 面) はそれと独立に成立していなければならない。
+async fn spawn_http_tcp(addr: Option<&str>, tx: &mpsc::Sender<Event>) {
+    let Some(addr) = addr else {
+        return;
+    };
+    match TcpListener::bind(addr).await {
+        Ok(listener) => {
+            info!(source = "http-tcp", %addr, "listening");
+            spawn_http_tcp_accept_loop(listener, tx.clone());
+        }
+        Err(error) => {
+            error!(%error, source = "http-tcp", %addr, "cannot bind; continuing without TCP");
+        }
+    }
+}
+
+/// agent-terrace 相当の TCP 面。
+///
+/// UDS 面と違い peer uid で絞れない。ネットワーク境界は Tailscale が担う、
+/// というのが user の明示的な判断であり、ここでは独自の認証層を持たない
+/// (2026-08-03 の依頼文: 「現在存在しているagent達が、TCP越しに悪さをするのは
+/// 目を瞑る」)。既定では `AGENT_TALK_HTTP_ADDR` 未設定＝TCP 面なし。
+fn spawn_http_tcp_accept_loop(listener: TcpListener, tx: mpsc::Sender<Event>) {
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, peer)) = listener.accept().await else {
+                break;
+            };
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let service = service_fn(move |request| route_http(request, tx.clone()));
+                if let Err(error) = http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await
+                {
+                    warn!(%error, %peer, "HTTP over TCP connection failed");
                 }
             });
         }
@@ -764,7 +844,7 @@ async fn serve_client(stream: UnixStream, tx: mpsc::Sender<Event>) -> Result<()>
 struct Broker {
     state: BrokerState,
     journal: Journal,
-    tmux: Tmux,
+    mux: Multiplexer,
     config: Config,
 }
 
@@ -793,7 +873,7 @@ impl Broker {
     }
 
     async fn web_agents(&self) -> Result<Vec<WebAgent>> {
-        let panes = self.tmux.panes().await?;
+        let panes = self.mux.panes().await?;
         let mut agents = Vec::new();
         for pane in panes {
             if let Some(agent) = self.state.agents.get(&pane.pane_id) {
@@ -815,21 +895,21 @@ impl Broker {
             return Err(WebError::new(StatusCode::NOT_FOUND, "agent_not_found"));
         }
         let panes = self
-            .tmux
+            .mux
             .panes()
             .await
             .map_err(|_| WebError::new(StatusCode::SERVICE_UNAVAILABLE, "tmux_unavailable"))?;
         if !panes.iter().any(|candidate| candidate.pane_id == pane) {
             return Err(WebError::new(StatusCode::GONE, "pane_unavailable"));
         }
-        if let Ok(screen) = self.tmux.capture_pane(pane).await {
+        if let Ok(screen) = self.mux.capture_pane(pane).await {
             Ok(WebScreen {
                 pane_id: pane.to_owned(),
                 screen,
             })
         } else {
             let pane_still_exists = self
-                .tmux
+                .mux
                 .panes()
                 .await
                 .ok()
@@ -901,6 +981,7 @@ impl Broker {
                     "version": env!("CARGO_PKG_VERSION"),
                     "pid": std::process::id(),
                     "ready": true,
+                    "backends": self.config.backend_names(),
                 })
             ))),
             "internal-daemon-shutdown" | "gc" | "watch" => Ok(Response::ok("")),
@@ -953,8 +1034,8 @@ impl Broker {
                 "前の宛先への配達失敗通知を永続化できないため登録を中止しました",
             ));
         }
-        self.tmux.set_option(&pane, "@agent", Some(name)).await?;
-        self.tmux
+        self.mux.set_option(&pane, "@agent", Some(name)).await?;
+        self.mux
             .set_option(&pane, "@agent_state", Some("idle"))
             .await?;
         self.journal.append(&Record::Register {
@@ -972,10 +1053,10 @@ impl Broker {
             return Ok(Response::ok(""));
         };
         if self.remove_agent(&pane, "宛先エージェントが退出した").await {
-            if let Err(error) = self.tmux.set_option(&pane, "@agent", None).await {
+            if let Err(error) = self.mux.set_option(&pane, "@agent", None).await {
                 warn!(%pane, %error, source = "unregister", "agent mirror removal failed");
             }
-            if let Err(error) = self.tmux.set_option(&pane, "@agent_state", None).await {
+            if let Err(error) = self.mux.set_option(&pane, "@agent_state", None).await {
                 warn!(%pane, %error, source = "unregister", "state mirror removal failed");
             }
         } else {
@@ -996,7 +1077,7 @@ impl Broker {
             return Ok(Response::ok(""));
         };
         if let Err(error) = self
-            .tmux
+            .mux
             .set_option(&pane, "@agent_state", Some(state.as_str()))
             .await
         {
@@ -1016,7 +1097,7 @@ impl Broker {
             return Ok(Response::ok(""));
         };
         if let Err(error) = self
-            .tmux
+            .mux
             .set_option(&pane, "@agent_state", Some("idle"))
             .await
         {
@@ -1062,7 +1143,7 @@ impl Broker {
                 )));
             };
             let bell = stored.message.bell.clone();
-            if self.tmux.deliver(&pane, &bell).await.is_ok() {
+            if self.mux.deliver(&pane, &bell).await.is_ok() {
                 self.journal.append(&Record::Complete {
                     pane: pane.clone(),
                     id,
@@ -1083,15 +1164,22 @@ impl Broker {
     }
 
     async fn who(&self, request: &Request) -> Result<Response> {
-        let panes = self.tmux.panes().await?;
+        let panes = self.mux.panes().await?;
         let mut output = String::new();
+        // backend 列は移行期にどちらの multiplexer に居る相手なのかを示す。
+        // herdr backend では multiplexer 自身が持つ状態も併記する
+        // (agent-talkd の hook 由来の状態より信頼できる場面がある)。
         for pane in &panes {
             if let Some(agent) = self.state.agents.get(&pane.pane_id) {
+                let observed = pane
+                    .status
+                    .map_or_else(String::new, |status| format!("/{}", status.as_str()));
                 let _ = writeln!(
                     output,
-                    "{:<10} {:<5} {}:{}.{} ({})  {}",
+                    "{:<10} {:<11} {:<5} {}:{}.{} ({})  {}",
                     agent.name,
-                    agent.state.as_str(),
+                    format!("{}{observed}", agent.state.as_str()),
+                    pane.backend.as_str(),
                     pane.session,
                     pane.window_index,
                     pane.pane_index,
@@ -1212,7 +1300,7 @@ impl Broker {
             )));
         }
 
-        let panes = self.tmux.panes().await?;
+        let panes = self.mux.panes().await?;
         let from_info = request
             .pane
             .as_deref()
@@ -1232,7 +1320,7 @@ impl Broker {
         };
         let brief = build_brief(addr, &from_agent, from_info, reply_info, &body, brief_mode);
         if let Some((from_pane, _)) = registered_sender.as_ref() {
-            self.tmux.mark_talk_sent(from_pane).await;
+            self.mux.mark_talk_sent(from_pane).await;
         }
         // 送信時点の identity を捕捉する。後からレジストリを引き直さない。
         let origin = registered_sender.map_or_else(
@@ -1351,7 +1439,7 @@ impl Broker {
                     )));
                 };
                 let bell = stored.message.bell.clone();
-                if self.tmux.deliver(&pane, &bell).await.is_ok() {
+                if self.mux.deliver(&pane, &bell).await.is_ok() {
                     self.journal.append(&Record::Complete {
                         pane: pane.clone(),
                         id,
@@ -1361,7 +1449,7 @@ impl Broker {
                     Ok(report.accepted(SendPath::Sent, id, &pane, addr, &expected))
                 } else {
                     let target_is_live = self
-                        .tmux
+                        .mux
                         .panes()
                         .await
                         .is_ok_and(|panes| panes.iter().any(|item| item.pane_id == pane));
@@ -1484,7 +1572,7 @@ impl Broker {
 
     /// 登録 agent 一覧と両方向の未受領 ID。MCP adapter の `list_peers` が使う。
     async fn peers_json(&self, request: &Request) -> Result<Response> {
-        let panes = self.tmux.panes().await?;
+        let panes = self.mux.panes().await?;
         let caller = request.pane.as_deref();
         let pending_to_me = caller.map(|pane| self.state.pending_to_me(pane));
         let pending_from_me = caller.map(|pane| self.state.pending_from_me(pane));
@@ -1653,12 +1741,13 @@ impl Broker {
         addr: &str,
         self_pane: Option<&str>,
     ) -> std::result::Result<(String, String), Response> {
-        let panes = self.tmux.panes().await.map_err(|error| {
+        let panes = self.mux.panes().await.map_err(|error| {
             Response::error(format!(
                 "tmux サーバーに接続できません (sandbox 内なら承認付きで再実行): {error}"
             ))
         })?;
-        if addr.starts_with('%') && addr[1..].chars().all(|c| c.is_ascii_digit()) {
+        // pane id の直接指定。tmux (`%5`) と herdr (`w1:p2`) の両方を受ける。
+        if crate::backend::BackendKind::of(addr).is_some() {
             return self
                 .state
                 .agents
@@ -1765,7 +1854,7 @@ impl Broker {
         reason: &str,
         excluded_pane: Option<&str>,
     ) -> bool {
-        let panes = self.tmux.panes().await.unwrap_or_default();
+        let panes = self.mux.panes().await.unwrap_or_default();
         for original in messages {
             let sender_target = original
                 .sender
@@ -1872,7 +1961,7 @@ impl Broker {
             return;
         };
         let bell = stored.message.bell.clone();
-        if self.tmux.deliver(sender, &bell).await.is_ok() {
+        if self.mux.deliver(sender, &bell).await.is_ok() {
             if let Err(error) = self.journal.append(&Record::Complete {
                 pane: sender.to_owned(),
                 id,
@@ -1894,7 +1983,7 @@ impl Broker {
     }
 
     async fn reconcile(&mut self, startup: bool) {
-        let Ok(panes) = self.tmux.panes().await else {
+        let Ok(panes) = self.mux.panes().await else {
             return;
         };
         let stale: Vec<_> = self
@@ -2124,9 +2213,10 @@ mod tests {
         parse_mailbox_query, peer_uid_allowed, rfc3339, static_response,
     };
     use crate::{
+        backend::{Multiplexer, PaneInfo},
         config::Config,
         state::AgentState,
-        tmux::{PaneInfo, Tmux},
+        tmux::Tmux,
     };
 
     fn pane_info(pane_id: &str, agent: Option<&str>) -> PaneInfo {
@@ -2138,6 +2228,8 @@ mod tests {
             window_index: "0".into(),
             pane_index: "0".into(),
             agent: agent.map(str::to_owned),
+            backend: crate::backend::BackendKind::Tmux,
+            status: None,
         }
     }
 
@@ -2149,11 +2241,13 @@ mod tests {
         Broker {
             state,
             journal,
-            tmux: Tmux::scripted(panes),
+            mux: Multiplexer::new(Some(Tmux::scripted(panes)), None),
             config: Config {
-                tmux_socket: String::new(),
-                rpc_socket: PathBuf::new(),
+                tmux_socket: Some(String::new()),
+                herdr_socket: None,
+                rpc_sockets: vec![PathBuf::new()],
                 http_socket: PathBuf::new(),
+                http_tcp: None,
                 journal: journal_path,
                 log: PathBuf::new(),
                 queue_limit: 1000,
@@ -2396,7 +2490,10 @@ mod tests {
         let original = json(&broker.handle(send_request("%1", "claude", "body")).await)["id"]
             .as_u64()
             .unwrap();
-        broker.tmux = Tmux::scripted(vec![pane_info("%1", Some("codex"))]);
+        broker.mux = Multiplexer::new(
+            Some(Tmux::scripted(vec![pane_info("%1", Some("codex"))])),
+            None,
+        );
         (broker, original)
     }
 

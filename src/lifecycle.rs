@@ -30,6 +30,13 @@ pub struct DaemonStatus {
     pub version: String,
     pub pid: u32,
     pub ready: bool,
+    /// この daemon が面倒を見ている multiplexer。
+    ///
+    /// 旧 daemon は返さないので `default` で空になる。空は「不明」であって
+    /// 「無い」ではないため、置換判定では **狭いとは見なさない**
+    /// (version 不一致の既存経路が拾う)。
+    #[serde(default)]
+    pub backends: Vec<String>,
 }
 
 struct Peer {
@@ -101,6 +108,7 @@ pub async fn daemon_status(config: &Config) -> Result<DaemonStatus> {
 
 pub async fn ensure_daemon(config: &Config) -> Result<DaemonStatus> {
     let _lock = acquire_lock(config).await?;
+    stop_daemons_with_narrower_backends(config).await?;
     match probe(config).await? {
         Probe::Current(status) if status.ready && status.version == env!("CARGO_PKG_VERSION") => {
             return Ok(status);
@@ -110,22 +118,83 @@ pub async fn ensure_daemon(config: &Config) -> Result<DaemonStatus> {
         Probe::Missing => {}
     }
 
-    if config.rpc_socket.exists() {
-        fs::remove_file(&config.rpc_socket).with_context(|| {
-            format!("cannot remove stale socket {}", config.rpc_socket.display())
+    if config.rpc_socket().exists() {
+        fs::remove_file(config.rpc_socket()).with_context(|| {
+            format!(
+                "cannot remove stale socket {}",
+                config.rpc_socket().display()
+            )
         })?;
     }
     spawn_daemon(config)?;
     wait_for_expected_status(config, Instant::now() + STARTUP_TIMEOUT).await
 }
 
+/// 自分が担当する backend を **すべて** は見ていない daemon を止める。
+///
+/// 移行期には「herdr だけを知る daemon」が先に立っていることがある。そのまま
+/// 起動すると、こちらは tmux socket を bind した直後に herdr socket 側の生存を
+/// 見つけて中断し、死んだ socket file だけが残る。tmux 側のクライアントは
+/// 永久に daemon へ届かなくなるので、狭い daemon は明示的に置換する。
+async fn stop_daemons_with_narrower_backends(config: &Config) -> Result<()> {
+    let required = config.backend_names();
+    for path in &config.rpc_sockets {
+        let Some(status) = status_at(path).await else {
+            continue;
+        };
+        let covers = required
+            .iter()
+            .all(|backend| status.backends.iter().any(|known| known == backend));
+        // backends が空 = 旧 daemon。version 不一致の既存経路に任せる。
+        if status.backends.is_empty() || covers {
+            continue;
+        }
+        shutdown_at(path).await?;
+    }
+    Ok(())
+}
+
+/// 指定 path に居る daemon の status を取る。居なければ `None`。
+async fn status_at(path: &Path) -> Option<DaemonStatus> {
+    let mut stream = UnixStream::connect(path).await.ok()?;
+    if stream.peer_cred().ok()?.uid() != unsafe { libc::geteuid() } {
+        return None;
+    }
+    write_request(&mut stream, &internal_request("internal-daemon-status"))
+        .await
+        .ok()?;
+    let response = read_response(&mut stream).await.ok()?;
+    (response.code == 0)
+        .then(|| serde_json::from_str(response.stdout.trim()).ok())
+        .flatten()
+}
+
+/// 指定 path の daemon を止め、socket が消えるまで待つ。
+async fn shutdown_at(path: &Path) -> Result<()> {
+    let mut stream = UnixStream::connect(path).await?;
+    write_request(&mut stream, &internal_request("internal-daemon-shutdown")).await?;
+    let response = read_response(&mut stream).await?;
+    if response.code != 0 {
+        bail!("daemon shutdown failed: {}", response.stderr.trim());
+    }
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    while Instant::now() < deadline {
+        if UnixStream::connect(path).await.is_err() {
+            let _ = fs::remove_file(path);
+            return Ok(());
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+    bail!("daemon shutdown timed out at {}", path.display())
+}
+
 async fn acquire_lock(config: &Config) -> Result<LockGuard> {
     let parent = config
-        .rpc_socket
+        .rpc_socket()
         .parent()
         .context("runtime directory missing")?;
     fs::create_dir_all(parent)?;
-    let path = config.rpc_socket.with_extension("spawn");
+    let path = config.rpc_socket().with_extension("spawn");
     let deadline = Instant::now() + LOCK_TIMEOUT;
     loop {
         match OpenOptions::new().write(true).create_new(true).open(&path) {
@@ -153,7 +222,7 @@ async fn acquire_lock(config: &Config) -> Result<LockGuard> {
 }
 
 async fn probe(config: &Config) -> Result<Probe> {
-    let mut stream = match UnixStream::connect(&config.rpc_socket).await {
+    let mut stream = match UnixStream::connect(&config.rpc_socket()).await {
         Ok(stream) => stream,
         Err(error)
             if matches!(
@@ -240,8 +309,8 @@ fn verify_legacy_executable(_pid: i32) -> Result<()> {
 
 async fn wait_for_exit(config: &Config, pid: Option<i32>, deadline: Instant) -> Result<()> {
     while Instant::now() < deadline {
-        let connection = UnixStream::connect(&config.rpc_socket).await;
-        let socket_gone = !config.rpc_socket.exists() && connection.is_err();
+        let connection = UnixStream::connect(&config.rpc_socket()).await;
+        let socket_gone = !config.rpc_socket().exists() && connection.is_err();
         let process_gone = pid.is_none_or(|pid| {
             let result = unsafe { libc::kill(pid, 0) };
             result != 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
@@ -250,7 +319,7 @@ async fn wait_for_exit(config: &Config, pid: Option<i32>, deadline: Instant) -> 
             return Ok(());
         }
         if pid.is_some() && process_gone && connection.is_err() {
-            let _ = fs::remove_file(&config.rpc_socket);
+            let _ = fs::remove_file(config.rpc_socket());
             return Ok(());
         }
         sleep(Duration::from_millis(50)).await;
@@ -263,10 +332,18 @@ fn spawn_daemon(config: &Config) -> Result<()> {
     let mut command = Command::new(executable);
     command
         .arg("daemon")
-        .env("AGENT_TALK_TMUX_SOCKET", &config.tmux_socket)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    if let Some(tmux_socket) = &config.tmux_socket {
+        command.env("AGENT_TALK_TMUX_SOCKET", tmux_socket);
+    }
+    // 解決済みの backend 構成をそのまま daemon へ渡す。渡さないと daemon 側で
+    // 再探索して、起動元とは別の backend 構成になり得る。
+    command.env(
+        "AGENT_TALK_HERDR_SOCKET",
+        config.herdr_socket.as_deref().unwrap_or(Path::new("")),
+    );
     unsafe {
         command.pre_exec(|| {
             if libc::setsid() == -1 {
@@ -293,7 +370,7 @@ async fn wait_for_expected_status(config: &Config, deadline: Instant) -> Result<
 }
 
 async fn request_once(config: &Config, request: &Request) -> Result<Response> {
-    let mut stream = UnixStream::connect(&config.rpc_socket).await?;
+    let mut stream = UnixStream::connect(&config.rpc_socket()).await?;
     let credentials = stream.peer_cred()?;
     if credentials.uid() != unsafe { libc::geteuid() } {
         bail!("daemon socket peer uid mismatch");
@@ -323,7 +400,7 @@ fn internal_request(command: &str) -> Request {
         command: command.into(),
         args: Vec::new(),
         stdin: String::new(),
-        pane: env::var("TMUX_PANE").ok(),
+        pane: crate::backend::self_pane(),
         send_options: None,
     }
 }

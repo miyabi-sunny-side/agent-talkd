@@ -6,16 +6,7 @@ use tokio::{
     time::{Duration, sleep},
 };
 
-#[derive(Debug, Clone)]
-pub struct PaneInfo {
-    pub session: String,
-    pub window_id: String,
-    pub pane_id: String,
-    pub cwd: String,
-    pub window_index: String,
-    pub pane_index: String,
-    pub agent: Option<String>,
-}
+use crate::backend::{BackendKind, PaneInfo};
 
 #[derive(Clone)]
 pub struct Tmux {
@@ -66,6 +57,8 @@ impl Tmux {
                     window_index: fields[4].into(),
                     pane_index: fields[5].into(),
                     agent: (!fields[6].is_empty()).then(|| fields[6].into()),
+                    backend: BackendKind::Tmux,
+                    status: None,
                 })
             })
             .collect())

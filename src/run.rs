@@ -1,4 +1,4 @@
-use std::{env, io, os::unix::process::ExitStatusExt};
+use std::{io, os::unix::process::ExitStatusExt};
 
 use anyhow::Result;
 use tokio::{process::Command, signal::unix};
@@ -44,9 +44,7 @@ pub async fn run(args: Vec<String>) -> Result<i32> {
 }
 
 fn discover_tmux_config() -> Option<Config> {
-    if env::var_os("TMUX").is_none() || env::var_os("TMUX_PANE").is_none() {
-        return None;
-    }
+    crate::backend::self_pane()?;
     Config::discover().ok()
 }
 
@@ -57,7 +55,7 @@ async fn request(config: &Config, command: &str, args: Vec<String>) -> Option<Re
             command: command.into(),
             args,
             stdin: String::new(),
-            pane: env::var("TMUX_PANE").ok(),
+            pane: crate::backend::self_pane(),
             send_options: None,
         },
     )

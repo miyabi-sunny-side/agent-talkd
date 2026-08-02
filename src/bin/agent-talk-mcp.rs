@@ -6,6 +6,8 @@
 
 #[path = "../mcp.rs"]
 mod mcp;
+// daemon と共有する path 導出。MCP は tmux 由来の path だけを使う。
+#[allow(dead_code)]
 #[path = "../paths.rs"]
 mod paths;
 // daemon と共有する wire 形式。MCP は構築側だけを使うため一部は未使用になる。
