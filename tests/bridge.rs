@@ -80,13 +80,17 @@ impl FakeHerdr {
         *self.alive.lock().unwrap() = false;
     }
 
-    fn sent_text(&self) -> Vec<String> {
+    fn prompts(&self) -> Vec<(String, String)> {
         self.requests
             .lock()
             .unwrap()
             .iter()
-            .filter(|request| request["method"] == "pane.send_text")
-            .filter_map(|request| request["params"]["text"].as_str().map(str::to_owned))
+            .filter(|request| request["method"] == "agent.prompt")
+            .filter_map(|request| {
+                let target = request["params"]["target"].as_str()?;
+                let text = request["params"]["text"].as_str()?;
+                Some((target.to_owned(), text.to_owned()))
+            })
             .collect()
     }
 }
@@ -357,11 +361,16 @@ fn one_daemon_bridges_tmux_and_herdr_and_serves_mobile_over_tcp() {
     // そのまま効くため、backend をまたぐときは明示 scope が要る。
     let sent = harness.ok(&harness.as_tmux_pane(&["send", "w1:p1", "--", "cross backend hello"]));
     assert!(sent.contains("w1:p1"), "{sent}");
-    wait_for(|| !harness.herdr.sent_text().is_empty());
-    let delivered = harness.herdr.sent_text().join("");
+    wait_for(|| !harness.herdr.prompts().is_empty());
+    let (target, bell) = harness.herdr.prompts().remove(0);
+    // 呼び鈴は agent.prompt として正しい pane の agent へ届く (send_text では
+    // 入力欄に残るだけで turn が始まらない)。本文は運ばず ID だけを案内する。
+    assert_eq!(target, "w1:p1");
+    assert!(bell.contains("agent-talk"), "{bell:?}");
+    assert!(bell.contains("read_message"), "{bell:?}");
     assert!(
-        delivered.contains("agent-talk"),
-        "herdr へ呼び鈴が届いていない: {delivered:?}"
+        !bell.contains("cross backend hello"),
+        "本文を呼び鈴に載せてはならない: {bell:?}"
     );
 
     // --- 達成条件 2 の逆向き: herdr → tmux も配送が実際に届く ---

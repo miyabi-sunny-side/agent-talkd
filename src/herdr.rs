@@ -4,7 +4,7 @@
 //! 1 リクエスト 1 接続で、`{"id","method","params"}` を送り 1 行の応答を読む。
 //!
 //! tmux backend との決定的な違いは **配送に状態ガードがあること**。
-//! `pane.send_text` 自体は herdr 側に何のガードも無く、working / blocked な
+//! herdr の入力系 API 自体には steer ガードが無く、working / blocked な
 //! pane にも文字を撃ち込める。承認ダイアログへ Enter を撃ち込む事故を避けるため、
 //! herdr が **積極的に `idle` と判定した pane にだけ**送る (README の
 //! 「multiplexer backend」節)。`unknown` は idle の証拠にならないので送らない。
@@ -108,17 +108,24 @@ impl Herdr {
         Ok(panes.iter().filter_map(parse_pane).collect())
     }
 
-    /// idle と確認できた pane にだけ本文を送る。
+    /// idle と確認できた pane の **agent** にだけ呼び鈴を届ける。
     ///
     /// 状態の取得と送信の間には原理的に race があるが、herdr には
-    /// 「idle なら送る」を atomic に行う API が無い (`agent.prompt` は状態を
-    /// 問わず即時送信する)。窓を最小化するため、直前に取得した状態で判断する。
+    /// 「idle なら送る」を atomic に行う API が無い。窓を最小化するため、
+    /// 直前に取得した状態で判断する。
+    ///
+    /// 送信は `pane.send_text` ではなく `agent.prompt` を使う。submit の作法
+    /// (Enter の押し方・paste の扱い) は herdr が agent 種別ごとに知っている側で、
+    /// `send_text` だと本文が入力欄に残ったまま turn が始まらない。agent が居ない
+    /// pane へは herdr が `agent_not_running` で拒否するため、素の shell に呼び鈴が
+    /// タイプされる事故も構造的に起きない (Err は呼び出し側の requeue 経路に乗る)。
+    /// `wait` は付けない — 単一 event loop を agent の完了待ちで塞がない。
     pub async fn deliver(&self, pane_id: &str, text: &str) -> Result<Delivery> {
         let status = self.status_of(pane_id).await?;
         if !status.accepts_delivery() {
             return Ok(Delivery::Skipped(status));
         }
-        self.call("pane.send_text", json!({"pane_id": pane_id, "text": text}))
+        self.call("agent.prompt", json!({"target": pane_id, "text": text}))
             .await?;
         Ok(Delivery::Sent)
     }
@@ -359,7 +366,7 @@ mod tests {
 
     /// 達成条件 2 の中核: busy な pane には一文字も送らない。
     ///
-    /// 「送信を試みて失敗する」ではなく「**そもそも `send_text` を発行しない**」
+    /// 「送信を試みて失敗する」ではなく「**そもそも入力系 API を発行しない**」
     /// ことを、偽サーバーが受け取った method 列で証明する。
     #[tokio::test]
     async fn deliver_never_sends_text_to_a_pane_that_is_not_idle() {
@@ -377,20 +384,18 @@ mod tests {
                 Delivery::Skipped(AgentStatus::parse(status)),
                 "{status} は配送を拒否しなければならない"
             );
-            assert!(
-                !fake
-                    .methods()
-                    .iter()
-                    .any(|method| method == "pane.send_text"),
-                "{status} な pane へ send_text を発行してはならない (実際: {:?})",
-                fake.methods()
+            assert_eq!(
+                fake.methods(),
+                vec!["pane.get"],
+                "{status} な pane へは入力系 API を一切発行してはならない"
             );
         }
     }
 
-    /// 達成条件 2 の対: idle なら実際に送る。拒否だけして届かないのでは無意味。
+    /// 達成条件 2 の対: idle なら agent へ prompt として届く。
+    /// 拒否だけして届かないのでは無意味だし、入力欄に置くだけでは turn が始まらない。
     #[tokio::test]
-    async fn deliver_sends_text_to_an_idle_pane() {
+    async fn deliver_prompts_the_agent_of_an_idle_pane() {
         let fake = FakeHerdr::start(|method, _| match method {
             "pane.get" => pane_get(&pane("w1:p2", "claude", "idle")),
             _ => ok(&json!({})),
@@ -398,15 +403,44 @@ mod tests {
 
         let delivery = fake
             .client()
-            .deliver("w1:p2", "[agent-talk] #1\n")
+            .deliver("w1:p2", "[agent-talk] #1")
             .await
             .unwrap();
 
         assert_eq!(delivery, Delivery::Sent);
-        assert_eq!(fake.methods(), vec!["pane.get", "pane.send_text"]);
+        // send_text / send_keys ではなく agent.prompt ちょうど1発。
+        assert_eq!(fake.methods(), vec!["pane.get", "agent.prompt"]);
         let sent = fake.requests.lock().unwrap().last().cloned().unwrap();
-        assert_eq!(sent["params"]["pane_id"], "w1:p2");
-        assert_eq!(sent["params"]["text"], "[agent-talk] #1\n");
+        assert_eq!(sent["params"]["target"], "w1:p2");
+        assert_eq!(sent["params"]["text"], "[agent-talk] #1");
+        // event loop を塞ぐ wait を仕込まない。
+        assert!(sent["params"].get("wait").is_none(), "{sent}");
+    }
+
+    /// agent が pane から消えた race では herdr が `agent_not_running` を返す。
+    /// これを成功や terminal 消費に変換せず Err にする (呼び出し側が requeue する)。
+    #[tokio::test]
+    async fn a_vanished_agent_fails_the_delivery_instead_of_typing_into_a_shell() {
+        let fake = FakeHerdr::start(|method, _| match method {
+            "pane.get" => pane_get(&pane("w1:p2", "claude", "idle")),
+            "agent.prompt" => json!({
+                "id": "agent-talkd",
+                "error": {
+                    "code": "agent_not_running",
+                    "message": "agent is no longer running in the target pane",
+                },
+            }),
+            _ => ok(&json!({})),
+        });
+
+        let error = fake
+            .client()
+            .deliver("w1:p2", "[agent-talk] #1")
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("agent_not_running"), "{error}");
     }
 
     /// `pane.read` は `result.read.text` を読む。封筒の欠けた応答を
@@ -439,7 +473,7 @@ mod tests {
     }
 
     /// `pane.get` の封筒が欠けた応答は Unknown ではなく protocol error。
-    /// どちらの場合も `send_text` は一文字も出ない。
+    /// どちらの場合も入力系 API は一文字も出ない。
     #[tokio::test]
     async fn a_flat_pane_get_response_is_a_protocol_error_not_unknown() {
         let fake = FakeHerdr::start(|method, _| match method {
@@ -453,12 +487,10 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("pane object"), "{error}");
-        assert!(
-            !fake
-                .methods()
-                .iter()
-                .any(|method| method == "pane.send_text"),
-            "壊れた応答でも send_text を発行してはならない"
+        assert_eq!(
+            fake.methods(),
+            vec!["pane.get"],
+            "壊れた応答でも入力系 API を発行してはならない"
         );
     }
 
