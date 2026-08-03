@@ -114,7 +114,22 @@ fn serve_one(stream: UnixStream, recorded: &Arc<Mutex<Vec<Value>>>) {
     let result = match method.as_str() {
         "ping" => json!({"type": "pong", "version": "0.7.5", "protocol": 17}),
         "pane.list" => json!({"type": "pane_list", "panes": [pane]}),
-        "pane.get" => pane,
+        // 実 herdr は method 別の封筒を持つ (2026-08-03 実機採取)。
+        // pane.get の中身は result.pane にネストする。
+        "pane.get" => json!({"type": "pane", "pane": pane}),
+        "pane.read" => json!({
+            "type": "read",
+            "read": {
+                "pane_id": "w1:p1",
+                "workspace_id": "w1",
+                "tab_id": "w1:t1",
+                "source": "visible",
+                "format": "text",
+                "text": "fake herdr screen",
+                "revision": 1,
+                "truncated": false,
+            },
+        }),
         _ => json!({}),
     };
     let mut stream = stream;
@@ -208,6 +223,22 @@ impl Harness {
                 format!("127.0.0.1:{}", self.http_port),
             ),
         ])
+    }
+
+    /// 実 tmux pane の表示内容 (呼び鈴の着弾観測用)。
+    fn capture_tmux_pane(&self) -> String {
+        let output = Command::new("tmux")
+            .args([
+                "-S",
+                &self.tmux_socket,
+                "capture-pane",
+                "-p",
+                "-t",
+                &self.tmux_pane,
+            ])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&output.stdout).into_owned()
     }
 
     /// tmux の pane に居るクライアントとして実行する。
@@ -331,6 +362,29 @@ fn one_daemon_bridges_tmux_and_herdr_and_serves_mobile_over_tcp() {
     assert!(
         delivered.contains("agent-talk"),
         "herdr へ呼び鈴が届いていない: {delivered:?}"
+    );
+
+    // --- 達成条件 2 の逆向き: herdr → tmux も配送が実際に届く ---
+    //
+    // who の双方向性だけでは会話の双方向性を証明しない。herdr 側の
+    // クライアントから tmux 側 agent へ送り、実 tmux pane に呼び鈴が
+    // 打鍵されることを capture-pane で観測する。
+    let sent_back = harness.ok(&harness.as_herdr_pane(&[
+        "send",
+        &harness.tmux_pane.clone(),
+        "--",
+        "reverse cross backend hello",
+    ]));
+    assert!(sent_back.contains('#'), "{sent_back}");
+    wait_for(|| {
+        let screen = harness.capture_tmux_pane();
+        screen.contains("read_message")
+    });
+    assert!(
+        !harness
+            .capture_tmux_pane()
+            .contains("reverse cross backend hello"),
+        "本文は端末へ注入しない"
     );
 
     // --- 達成条件 3: スマホ向けの TCP 面が応答する ---

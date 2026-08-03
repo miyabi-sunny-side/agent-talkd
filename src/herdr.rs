@@ -130,11 +130,14 @@ impl Herdr {
                 json!({"pane_id": pane_id, "source": "visible"}),
             )
             .await?;
-        Ok(result
-            .get("text")
+        // 実 herdr は method 別の封筒を持つ: `pane.read` の中身は `result.read.text`。
+        // 欠落を空画面へ黙って劣化させず、protocol error として表面化する。
+        result
+            .get("read")
+            .and_then(|read| read.get("text"))
             .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned())
+            .map(std::borrow::ToOwned::to_owned)
+            .with_context(|| format!("herdr pane.read 応答に read.text がありません ({pane_id})"))
     }
 
     async fn status_of(&self, pane_id: &str) -> Result<AgentStatus> {
@@ -142,7 +145,16 @@ impl Herdr {
             .call("pane.get", json!({"pane_id": pane_id}))
             .await
             .with_context(|| format!("herdr pane {pane_id} の状態を取得できません"))?;
-        Ok(status_from(&result))
+        // `pane.get` の中身は `result.pane`。封筒の欠けた応答は Unknown に
+        // 劣化させず protocol error にする (壊れた応答と「本当に unknown」を
+        // 混同しない)。`agent_status` の欠落だけは従来どおり Unknown。
+        let pane = result
+            .get("pane")
+            .filter(|value| value.is_object())
+            .with_context(|| {
+                format!("herdr pane.get 応答に pane object がありません ({pane_id})")
+            })?;
+        Ok(status_from(pane))
     }
 
     async fn call(&self, method: &str, params: Value) -> Result<Value> {
@@ -299,6 +311,11 @@ mod tests {
         json!({"id": "agent-talkd", "result": result})
     }
 
+    /// 実 herdr の `pane.get` 封筒 (2026-08-03 実機採取): 中身は `result.pane`。
+    fn pane_get(pane: &Value) -> Value {
+        ok(&json!({"type": "pane", "pane": pane}))
+    }
+
     fn pane(pane_id: &str, agent: &str, status: &str) -> Value {
         json!({
             "pane_id": pane_id,
@@ -349,7 +366,7 @@ mod tests {
         for status in ["working", "blocked", "unknown", "done"] {
             let owned = status.to_owned();
             let fake = FakeHerdr::start(move |method, _| match method {
-                "pane.get" => ok(&pane("w1:p1", "codex", &owned)),
+                "pane.get" => pane_get(&pane("w1:p1", "codex", &owned)),
                 _ => ok(&json!({})),
             });
 
@@ -375,7 +392,7 @@ mod tests {
     #[tokio::test]
     async fn deliver_sends_text_to_an_idle_pane() {
         let fake = FakeHerdr::start(|method, _| match method {
-            "pane.get" => ok(&pane("w1:p2", "claude", "idle")),
+            "pane.get" => pane_get(&pane("w1:p2", "claude", "idle")),
             _ => ok(&json!({})),
         });
 
@@ -390,6 +407,59 @@ mod tests {
         let sent = fake.requests.lock().unwrap().last().cloned().unwrap();
         assert_eq!(sent["params"]["pane_id"], "w1:p2");
         assert_eq!(sent["params"]["text"], "[agent-talk] #1\n");
+    }
+
+    /// `pane.read` は `result.read.text` を読む。封筒の欠けた応答を
+    /// 空画面へ劣化させない (壊れた応答と空画面を混同しない)。
+    #[tokio::test]
+    async fn read_returns_nested_text_and_rejects_a_missing_envelope() {
+        let fake = FakeHerdr::start(|method, _| match method {
+            "pane.read" => ok(&json!({
+                "type": "read",
+                "read": {
+                    "pane_id": "w1:p2",
+                    "source": "visible",
+                    "format": "text",
+                    "text": "screen body",
+                    "revision": 3,
+                    "truncated": false,
+                },
+            })),
+            _ => ok(&json!({})),
+        });
+        assert_eq!(fake.client().read("w1:p2").await.unwrap(), "screen body");
+
+        // 旧フラット形 (実装が誤読していた形) は protocol error になる。
+        let flat = FakeHerdr::start(|method, _| match method {
+            "pane.read" => ok(&json!({"type": "read", "text": "flat"})),
+            _ => ok(&json!({})),
+        });
+        let error = flat.client().read("w1:p2").await.unwrap_err().to_string();
+        assert!(error.contains("read.text"), "{error}");
+    }
+
+    /// `pane.get` の封筒が欠けた応答は Unknown ではなく protocol error。
+    /// どちらの場合も `send_text` は一文字も出ない。
+    #[tokio::test]
+    async fn a_flat_pane_get_response_is_a_protocol_error_not_unknown() {
+        let fake = FakeHerdr::start(|method, _| match method {
+            "pane.get" => ok(&pane("w1:p1", "codex", "idle")),
+            _ => ok(&json!({})),
+        });
+        let error = fake
+            .client()
+            .deliver("w1:p1", "bell")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("pane object"), "{error}");
+        assert!(
+            !fake
+                .methods()
+                .iter()
+                .any(|method| method == "pane.send_text"),
+            "壊れた応答でも send_text を発行してはならない"
+        );
     }
 
     /// herdr の error 応答を握り潰さない。
