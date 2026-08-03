@@ -548,6 +548,7 @@ mod tests {
                     pane("w2:p1", "claude", "idle"),
                     pane("w3:p1", "cursor", "idle"),
                     pane("w4:p1", "gemini", "idle"),
+                    pane("w5:p1", "devin", "idle"),
                 ],
             })),
             // 実機封筒 (2026-08-03 採取): result.workspaces[] に label が入る。
@@ -558,16 +559,19 @@ mod tests {
                     {"workspace_id": "w2", "number": 2, "label": "has space"},
                     {"workspace_id": "w3", "number": 3, "label": "a/b"},
                     {"workspace_id": "w4", "number": 4, "label": ""},
+                    {"workspace_id": "w5", "number": 5, "label": "label:colon"},
                 ],
             })),
             _ => ok(&json!({})),
         });
         let panes = fake.client().panes().await.unwrap();
         assert_eq!(panes[0].workspace_label.as_deref(), Some("knowledge"));
-        // 空白 / `/` / 空文字の label は宛先構文と衝突するので採用しない。
+        // 空白 / `/` / 空文字 / `:` の label は宛先・pane id 構文と衝突するので
+        // 採用しない (workspace_id 表示へ fallback)。
         assert_eq!(panes[1].workspace_label, None);
         assert_eq!(panes[2].workspace_label, None);
         assert_eq!(panes[3].workspace_label, None);
+        assert_eq!(panes[4].workspace_label, None);
 
         // workspace.list が失敗しても pane 列挙は劣化継続 (label なし)。
         let degraded = FakeHerdr::start(|method, _| match method {

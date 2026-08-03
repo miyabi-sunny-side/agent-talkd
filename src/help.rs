@@ -77,11 +77,11 @@ pub const COMMANDS: &[CommandHelp] = &[
     },
     CommandHelp {
         command: "resolve",
-        text: "usage: agent-talk resolve [scope/]<name> | %pane\n\n宛先agentをpaneへ解決します。",
+        text: "usage: agent-talk resolve [backend/][scope/]<name> | <pane-id>\n\n宛先agentをpaneへ解決します。backendはtmux|herdr (同名scopeの正式名称)、pane-idは %5 / w1:p2 形式です。",
     },
     CommandHelp {
         command: "send",
-        text: "usage: agent-talk send [scope/]<name> [--from <source>] [--skill <name>] [--no-reply] [--] [message]\n\nagentへ依頼または一方向連絡を送信します。--from/--skill/--no-replyを指定できます。",
+        text: "usage: agent-talk send [backend/][scope/]<name> [--from <source>] [--skill <name>] [--no-reply] [--] [message]\n\nagentへ依頼または一方向連絡を送信します。backendはtmux|herdr (同名scopeの正式名称)、pane-id直指定 (%5 / w1:p2) も可。--from/--skill/--no-replyを指定できます。",
     },
     CommandHelp {
         command: "read",
