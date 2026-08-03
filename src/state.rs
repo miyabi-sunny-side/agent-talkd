@@ -178,7 +178,10 @@ impl BrokerState {
             bell: make_bell(id),
             target_name: expected_name.to_owned(),
         };
-        let dispatch = if agent.state == AgentState::Busy {
+        // queue が残っている間は Idle でも直接配達しない。直接配達を許すと、
+        // 配達失敗で requeue された古い message を新規 message が追い越す
+        // (FIFO の破れ)。queue の先頭は turn-end と health tick の再配達が流す。
+        let dispatch = if agent.state == AgentState::Busy || !agent.queue.is_empty() {
             agent.queue.insert(id);
             Dispatch::Queued(id)
         } else {

@@ -27,7 +27,7 @@ use tokio::{
     net::{TcpListener, UnixListener, UnixStream},
     sync::{mpsc, oneshot},
 };
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     backend::{BackendKind, Multiplexer, PaneInfo},
@@ -349,6 +349,7 @@ pub async fn run(config: Config) -> Result<()> {
             Event::ServerCheck => match mux.still_serving(&baseline).await {
                 Ok(true) => {
                     failed_health_checks = 0;
+                    broker.drain_queued().await;
                     broker.nag_unacked().await;
                 }
                 Ok(false) => break,
@@ -1123,8 +1124,25 @@ impl Broker {
             pane: pane.clone(),
             state: AgentState::Idle,
         })?;
+        let delivered = match self.deliver_queued_head(&pane, "turn-end").await {
+            Ok(delivered) => delivered,
+            Err(reason) => return Ok(Response::error(reason)),
+        };
+        info!(%pane, source = "turn-end", queued = delivered, "turn ended");
+        Ok(Response::ok(""))
+    }
+
+    /// queue 先頭を1件だけ配達する。turn-end と health tick の再配達が共有する
+    /// 唯一の配送状態遷移 (成功: State Busy → Complete / 失敗: 同 ID requeue +
+    /// State Idle)。呼び出し時点で pane は daemon memory 上 Idle であること。
+    /// 返り値は「配達対象があったか」。journal へ書けない場合だけ Err。
+    async fn deliver_queued_head(
+        &mut self,
+        pane: &str,
+        source: &'static str,
+    ) -> std::result::Result<bool, String> {
         let message_id = loop {
-            let Some(id) = self.state.turn_end(&pane) else {
+            let Some(id) = self.state.turn_end(pane) else {
                 break None;
             };
             if self.state.message(id).is_some() {
@@ -1132,51 +1150,77 @@ impl Broker {
             }
             error!(%pane, id, "queued message body missing; skipping");
             if let Err(error) = self.journal.append(&Record::Complete {
-                pane: pane.clone(),
+                pane: pane.to_owned(),
                 id,
             }) {
-                return Ok(Response::error(format!(
+                return Err(format!(
                     "欠損メッセージのskipをjournalへ書き込めません: {error}"
-                )));
+                ));
             }
         };
-        info!(%pane, source = "turn-end", queued = message_id.is_some(), "turn ended");
-        if let Some(id) = message_id {
-            if let Err(error) = self.journal.append(&Record::State {
-                pane: pane.clone(),
-                state: AgentState::Busy,
-            }) {
-                self.state.requeue_after_delivery_failure(&pane, id);
-                return Ok(Response::error(format!(
-                    "配達状態を journal に書き込めません: {error}"
-                )));
-            }
-            let Some(stored) = self.state.message(id) else {
-                error!(%pane, id, "message body disappeared before delivery");
-                self.state.set_state(&pane, AgentState::Idle);
-                return Ok(Response::error(format!(
-                    "message #{id} の本文が見つからないため配達を中止しました"
-                )));
-            };
-            let bell = stored.message.bell.clone();
-            if self.mux.deliver(&pane, &bell).await.is_ok() {
-                self.journal.append(&Record::Complete {
-                    pane: pane.clone(),
-                    id,
-                })?;
-                self.state.complete_delivery(&pane, id);
-                info!(%pane, id, source = "turn-end", "delivered");
-            } else {
-                self.state.requeue_after_delivery_failure(&pane, id);
-                self.journal.append(&Record::State {
-                    pane,
-                    state: AgentState::Idle,
-                })?;
-            }
-        } else {
-            self.state.set_state(&pane, AgentState::Idle);
+        let Some(id) = message_id else {
+            self.state.set_state(pane, AgentState::Idle);
+            return Ok(false);
+        };
+        if let Err(error) = self.journal.append(&Record::State {
+            pane: pane.to_owned(),
+            state: AgentState::Busy,
+        }) {
+            self.state.requeue_after_delivery_failure(pane, id);
+            return Err(format!("配達状態を journal に書き込めません: {error}"));
         }
-        Ok(Response::ok(""))
+        let Some(stored) = self.state.message(id) else {
+            error!(%pane, id, "message body disappeared before delivery");
+            self.state.set_state(pane, AgentState::Idle);
+            return Err(format!(
+                "message #{id} の本文が見つからないため配達を中止しました"
+            ));
+        };
+        let bell = stored.message.bell.clone();
+        if self.mux.deliver(pane, &bell).await.is_ok() {
+            if let Err(error) = self.journal.append(&Record::Complete {
+                pane: pane.to_owned(),
+                id,
+            }) {
+                return Err(error.to_string());
+            }
+            self.state.complete_delivery(pane, id);
+            info!(%pane, id, source, "delivered");
+        } else {
+            self.state.requeue_after_delivery_failure(pane, id);
+            // 配達失敗は正常系 (相手が busy 判定など)。次の契機で再試行される。
+            // silent にすると診断できないので debug には残す。
+            debug!(%pane, id, source, "queued delivery failed; will retry");
+            if let Err(error) = self.journal.append(&Record::State {
+                pane: pane.to_owned(),
+                state: AgentState::Idle,
+            }) {
+                return Err(error.to_string());
+            }
+        }
+        Ok(true)
+    }
+
+    /// Idle のまま queue が残っている pane の先頭を、health tick ごとに拾い直す。
+    ///
+    /// turn-end の一瞬は herdr の画面検出がまだ working を返すことがあり、
+    /// その1回の失敗で再契機が無いと message が滞留する。idle の正の証拠が
+    /// 次に得られた時点 (最大 tick 間隔 + API 時間) で同じ ID を再配達する。
+    /// backend は限定しない — 新規 send が queue を追い越さない規則 (dispatch)
+    /// と組むため、tmux 側の失敗残留もこの経路が掃く。
+    async fn drain_queued(&mut self) {
+        let candidates: Vec<String> = self
+            .state
+            .agents
+            .iter()
+            .filter(|(_, agent)| agent.state == AgentState::Idle && !agent.queue.is_empty())
+            .map(|(pane, _)| pane.clone())
+            .collect();
+        for pane in candidates {
+            if let Err(reason) = self.deliver_queued_head(&pane, "queued-retry").await {
+                warn!(%pane, %reason, source = "queued-retry", "queued delivery attempt failed");
+            }
+        }
     }
 
     async fn who(&self, request: &Request) -> Result<Response> {
@@ -3049,6 +3093,53 @@ mod tests {
                 && bell.contains(&format!("#{id}")),
             "未読には read を促す: {bell}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_new_send_never_overtakes_the_queue_and_the_tick_drains_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut broker = registered_pair(&dir).await;
+        // send1 で %2 は Busy になり、send2 は queue に入る。
+        let first = json(&broker.handle(send_request("%1", "claude", "first")).await);
+        assert_eq!(first["path"], "sent");
+        let second = json(&broker.handle(send_request("%1", "claude", "second")).await);
+        assert_eq!(second["path"], "queued");
+        let second_id = second["id"].as_u64().unwrap();
+
+        // 配達失敗後に Idle へ戻った状態 (queue が残ったまま idle) を作る。
+        broker.state.ack(first["id"].as_u64().unwrap());
+        broker.state.set_state("%2", AgentState::Idle);
+
+        // Idle でも queue が残っている間、新規 send は直接配達で追い越さない。
+        let third = json(&broker.handle(send_request("%1", "claude", "third")).await);
+        assert_eq!(
+            third["path"], "queued",
+            "queue が残る pane への新規 send が FIFO を追い越してはならない"
+        );
+        let third_id = third["id"].as_u64().unwrap();
+
+        // health tick の drain が queue 先頭 (send2) だけを配達する。
+        let before = bells(&broker).len();
+        broker.drain_queued().await;
+        let after: Vec<_> = bells(&broker)[before..].to_vec();
+        assert_eq!(after.len(), 1, "1 tick で流すのは先頭の1件だけ");
+        assert!(
+            after[0].1.contains(&format!("read_message {second_id}")),
+            "先頭 (send2) が先に配達される: {:?}",
+            after[0]
+        );
+        assert!(broker.state.is_busy("%2"), "配達後は Busy に戻る");
+        assert!(broker.state.is_queued("%2", third_id));
+
+        // 受信側の turn-end で send3 が続き、順序が送信順と一致する。
+        broker.turn_end(Some("%2".into())).await.unwrap();
+        let drained: Vec<_> = bells(&broker)[before..].to_vec();
+        assert_eq!(drained.len(), 2);
+        assert!(
+            drained[1].1.contains(&format!("read_message {third_id}")),
+            "{drained:?}"
+        );
+        assert_eq!(broker.state.queue_len("%2"), 0, "queue は空になる");
     }
 
     #[tokio::test]

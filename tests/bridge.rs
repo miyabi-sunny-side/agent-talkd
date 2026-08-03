@@ -47,6 +47,8 @@ struct FakeHerdr {
     socket: PathBuf,
     requests: Arc<Mutex<Vec<Value>>>,
     alive: Arc<Mutex<bool>>,
+    /// `pane.get` が報告する `agent_status`。画面検出のラグを模すために可変。
+    status: Arc<Mutex<String>>,
 }
 
 impl FakeHerdr {
@@ -55,8 +57,10 @@ impl FakeHerdr {
         let listener = UnixListener::bind(&socket).unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let alive = Arc::new(Mutex::new(true));
+        let status = Arc::new(Mutex::new("idle".to_owned()));
         let recorded = Arc::clone(&requests);
         let serving = Arc::clone(&alive);
+        let reported = Arc::clone(&status);
         thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(stream) = stream else { break };
@@ -65,19 +69,26 @@ impl FakeHerdr {
                     continue;
                 }
                 let recorded = Arc::clone(&recorded);
-                thread::spawn(move || serve_one(stream, &recorded));
+                let reported = Arc::clone(&reported);
+                thread::spawn(move || serve_one(stream, &recorded, &reported));
             }
         });
         Self {
             socket,
             requests,
             alive,
+            status,
         }
     }
 
     /// herdr が落ちた状態にする。socket file は残るが応答しなくなる。
     fn stop(&self) {
         *self.alive.lock().unwrap() = false;
+    }
+
+    /// 画面検出の報告値を切り替える (working = 検出ラグ中を模す)。
+    fn report_status(&self, status: &str) {
+        status.clone_into(&mut self.status.lock().unwrap());
     }
 
     fn prompts(&self) -> Vec<(String, String)> {
@@ -95,7 +106,7 @@ impl FakeHerdr {
     }
 }
 
-fn serve_one(stream: UnixStream, recorded: &Arc<Mutex<Vec<Value>>>) {
+fn serve_one(stream: UnixStream, recorded: &Arc<Mutex<Vec<Value>>>, status: &Arc<Mutex<String>>) {
     let mut reader = BufReader::new(stream.try_clone().unwrap());
     let mut line = String::new();
     if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
@@ -106,6 +117,7 @@ fn serve_one(stream: UnixStream, recorded: &Arc<Mutex<Vec<Value>>>) {
     };
     let method = request["method"].as_str().unwrap_or_default().to_owned();
     recorded.lock().unwrap().push(request);
+    let agent_status = status.lock().unwrap().clone();
     let pane = json!({
         "pane_id": "w1:p1",
         "terminal_id": "term_fake",
@@ -113,7 +125,7 @@ fn serve_one(stream: UnixStream, recorded: &Arc<Mutex<Vec<Value>>>) {
         "tab_id": "w1:t1",
         "cwd": "/tmp",
         "agent": "codex",
-        "agent_status": "idle",
+        "agent_status": agent_status,
     });
     let result = match method.as_str() {
         "ping" => json!({"type": "pong", "version": "0.7.5", "protocol": 17}),
@@ -409,6 +421,69 @@ fn one_daemon_bridges_tmux_and_herdr_and_serves_mobile_over_tcp() {
     assert!(response.contains("agent-talk"), "{response}");
 
     let _ = harness.as_tmux_pane(&["internal-daemon-shutdown"]);
+}
+
+/// 検出ラグの回帰: turn-end の一瞬に herdr がまだ working を返しても、
+/// queue は滞留せず、idle の正の証拠が出た時点の health tick が同じ ID を
+/// FIFO のまま流す。新規 send は queue を追い越さない。
+#[test]
+#[ignore = "requires permission to create a real tmux server"]
+fn a_lagging_herdr_detection_does_not_strand_queued_messages() {
+    let harness = Harness::start();
+    harness.ok(&harness.as_tmux_pane(&["register", "claude"]));
+    wait_for(|| harness.tmux_rpc_socket().exists() && harness.herdr_rpc_socket().exists());
+    harness.ok(&harness.as_herdr_pane(&["register", "codex"]));
+
+    // 画面検出のラグを模す: herdr は working を報告し続ける。
+    harness.herdr.report_status("working");
+    let first = harness.ok(&harness.as_tmux_pane(&["send", "w1:p1", "--", "first letter"]));
+    let first_id = trailing_id(&first);
+    let second = harness.ok(&harness.as_tmux_pane(&["send", "w1:p1", "--", "second letter"]));
+    let second_id = trailing_id(&second);
+    assert!(second.contains("queued"), "{second}");
+    // working の間は何度 tick が回っても prompt は出ない。
+    thread::sleep(Duration::from_secs(3));
+    assert!(
+        harness.herdr.prompts().is_empty(),
+        "working 中に prompt してはならない: {:?}",
+        harness.herdr.prompts()
+    );
+
+    // 検出が idle に追いついた後、turn-end を発火させなくても tick が流す。
+    harness.herdr.report_status("idle");
+    wait_for(|| !harness.herdr.prompts().is_empty());
+    let prompts = harness.herdr.prompts();
+    assert!(
+        prompts[0].1.contains(&format!("read_message {first_id}")),
+        "先に送った ID が先に配達される: {prompts:?}"
+    );
+    assert_eq!(
+        prompts.len(),
+        1,
+        "1 tick で流すのは先頭の1件だけ: {prompts:?}"
+    );
+
+    // 受信側の turn-end で2通目が続き、順序が送信順と一致する。
+    harness.ok(&harness.as_herdr_pane(&["turn-end"]));
+    wait_for(|| harness.herdr.prompts().len() >= 2);
+    let prompts = harness.herdr.prompts();
+    assert!(
+        prompts[1].1.contains(&format!("read_message {second_id}")),
+        "{prompts:?}"
+    );
+
+    let _ = harness.as_tmux_pane(&["internal-daemon-shutdown"]);
+}
+
+/// `sent -> ... : #N` / `queued (busy) -> ... : #N` の末尾 ID。
+fn trailing_id(output: &str) -> u64 {
+    output
+        .rsplit_once('#')
+        .unwrap_or_else(|| panic!("id missing from {output:?}"))
+        .1
+        .trim()
+        .parse()
+        .unwrap()
 }
 
 /// 達成条件 1 の後半: **片方が落ちても、もう片方の会話は続く**。
