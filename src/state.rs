@@ -69,7 +69,7 @@ pub struct StoredMessage {
     /// (docs/decisions/0002-message-retention-ack.md「journal 形式と旧データの移行」)。
     /// `false` が `Pending`。
     pub acked: bool,
-    /// 読了 (`read` / `read-v1` が本文を返した)。受領催促の文言分岐にだけ使う。
+    /// 読了 (`read` / `read-message` が本文を返した)。受領催促の文言分岐にだけ使う。
     /// **memory のみ**で journal には残さない。restart 後は未読へ戻るが、
     /// 催促文言が保守側 (「未読なら読んでくれ」) に倒れるだけで害がない。
     pub read: bool,
@@ -281,7 +281,7 @@ impl BrokerState {
         }
     }
 
-    /// 読了を記録する (`read` / `read-v1` が本文を返したとき)。
+    /// 読了を記録する (`read` / `read-message` が本文を返したとき)。
     pub fn mark_read(&mut self, id: u64) {
         if let Some(stored) = self.messages.get_mut(&id) {
             stored.read = true;

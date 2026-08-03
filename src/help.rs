@@ -12,7 +12,7 @@ pub const GLOBAL: &str = r"agent-talk: tmux 上の対話エージェント同士
   agent-talk daemon-status
   agent-talk run <name> <executable> [args...]
   agent-talk reply <original-id> [body]
-  agent-talk mailbox-list-v1 <mailbox> [--after <id>] [--limit <n>]
+  agent-talk mailbox-list <mailbox> [--after <id>] [--limit <n>]
   agent-talk register <name>
   agent-talk unregister
   agent-talk busy | idle
@@ -23,7 +23,7 @@ pub const GLOBAL: &str = r"agent-talk: tmux 上の対話エージェント同士
   agent-talk send <addr> [--from <source>] [--skill <name>] [--] [message]
   agent-talk send <addr> [--no-reply] [--] [message]
   agent-talk read <id>
-  agent-talk ack-v1 <id>
+  agent-talk ack-message <id>
 ";
 
 pub const COMMANDS: &[CommandHelp] = &[
@@ -88,28 +88,28 @@ pub const COMMANDS: &[CommandHelp] = &[
         text: "usage: agent-talk read <id>\n\n現在のpane宛の依頼本文を確認します。",
     },
     CommandHelp {
-        command: "send-message-v1",
-        text: "usage: agent-talk send-message-v1 <addr>\n\n登録済みagent paneからの送信結果をJSONで返します (MCP adapter用)。",
+        command: "send-message",
+        text: "usage: agent-talk send-message <addr>\n\n登録済みagent paneからの送信結果をJSONで返します (MCP adapter用)。",
     },
     CommandHelp {
-        command: "read-v1",
-        text: "usage: agent-talk read-v1 <id>\n\n依頼本文をJSONで返します (MCP adapter用)。配達未完了は拒否します。",
+        command: "read-message",
+        text: "usage: agent-talk read-message <id>\n\n依頼本文をJSONで返します (MCP adapter用)。配達未完了は拒否します。",
     },
     CommandHelp {
-        command: "ack-v1",
-        text: "usage: agent-talk ack-v1 <id>\n\n受領報告を送りmessageを削除対象にします。存在しないIDは冪等成功です。",
+        command: "ack-message",
+        text: "usage: agent-talk ack-message <id>\n\n受領報告を送りmessageを削除対象にします。存在しないIDは冪等成功です。",
     },
     CommandHelp {
-        command: "peers-v1",
-        text: "usage: agent-talk peers-v1\n\n登録agentと両方向の未受領IDをJSONで返します (MCP adapter用)。",
+        command: "list-peers",
+        text: "usage: agent-talk list-peers\n\n登録agentと両方向の未受領IDをJSONで返します (MCP adapter用)。",
     },
     CommandHelp {
         command: "reply",
         text: "usage: agent-talk reply <original-id> [body]\n\n外部mailboxの依頼へ返信します。",
     },
     CommandHelp {
-        command: "mailbox-list-v1",
-        text: "usage: agent-talk mailbox-list-v1 <mailbox> [--after <id>] [--limit <n>]\n\nmailbox eventをJSONで非consume取得します。--afterは排他、--limitは1〜500です。",
+        command: "mailbox-list",
+        text: "usage: agent-talk mailbox-list <mailbox> [--after <id>] [--limit <n>]\n\nmailbox eventをJSONで非consume取得します。--afterは排他、--limitは1〜500です。",
     },
     CommandHelp {
         command: "daemon",
@@ -172,12 +172,12 @@ mod tests {
             "resolve",
             "send",
             "read",
-            "send-message-v1",
-            "read-v1",
-            "ack-v1",
-            "peers-v1",
+            "send-message",
+            "read-message",
+            "ack-message",
+            "list-peers",
             "reply",
-            "mailbox-list-v1",
+            "mailbox-list",
             "daemon",
             "internal-daemon-status",
             "internal-daemon-shutdown",

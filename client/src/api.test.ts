@@ -31,7 +31,7 @@ describe("HTTP API", () => {
       pane_id: "%1",
       screen: "safe text",
     });
-    expect(fetch.mock.calls[1]?.[0]).toBe("/v1/agents/%251/screen");
+    expect(fetch.mock.calls[1]?.[0]).toBe("/api/agents/%251/screen");
   });
 
   it("builds incremental mailbox queries and validates event fields", async () => {
@@ -68,7 +68,7 @@ describe("HTTP API", () => {
       mailbox: "mobile",
     });
     expect(fetch.mock.calls[1]?.[0]).toBe(
-      "/v1/mailbox/mobile?after=9&limit=100",
+      "/api/mailbox/mobile?after=9&limit=100",
     );
   });
 

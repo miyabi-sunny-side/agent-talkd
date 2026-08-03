@@ -35,7 +35,7 @@ it("renders loading then agent status", async () => {
 it("opens a screen from the keyboard and restores focus when returning", async () => {
   const fetch = vi.fn((path: string) =>
     Promise.resolve(
-      path === "/v1/who"
+      path === "/api/who"
         ? new Response(
             JSON.stringify({
               agents: [

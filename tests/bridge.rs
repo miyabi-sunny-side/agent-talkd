@@ -337,7 +337,7 @@ fn one_daemon_bridges_tmux_and_herdr_and_serves_mobile_over_tcp() {
     let mut stream = TcpStream::connect(("127.0.0.1", harness.http_port)).unwrap();
     stream
         .write_all(
-            b"GET /v1/hello HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+            b"GET /api/hello HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
         )
         .unwrap();
     let mut response = String::new();

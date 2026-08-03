@@ -151,15 +151,23 @@ fn daemon_journal_read_recovery_and_pane_exit() {
         &["daemon-status"],
     ));
     assert!(status.contains("\"ready\":true"));
-    let hello = http_request(&http, "GET", "/v1/hello");
+    let hello = http_request(&http, "GET", "/api/hello");
     assert!(hello.starts_with("HTTP/1.1 200"), "{hello}");
     assert!(hello.contains("\"name\":\"agent-talk\""), "{hello}");
-    let web_who = http_request(&http, "GET", "/v1/who");
+    // 撤去済みの旧 /v1/* は SPA (200) へ落とさず明示的に拒否する。
+    // 200 を返すと残存する旧 updater の health probe が fail-open になる。
+    let legacy_hello = http_request(&http, "GET", "/v1/hello");
+    assert!(legacy_hello.starts_with("HTTP/1.1 404"), "{legacy_hello}");
+    assert!(
+        legacy_hello.contains("\"error\"") && !legacy_hello.contains("<!doctype"),
+        "旧 path に SPA 本文を返してはならない: {legacy_hello}"
+    );
+    let web_who = http_request(&http, "GET", "/api/who");
     assert!(web_who.starts_with("HTTP/1.1 200"), "{web_who}");
     assert!(web_who.contains("\"name\":\"claude\""), "{web_who}");
-    let empty_screen = http_request(&http, "GET", "/v1/agents/screen");
+    let empty_screen = http_request(&http, "GET", "/api/agents/screen");
     assert!(empty_screen.starts_with("HTTP/1.1 400"), "{empty_screen}");
-    let web_who_after_empty_screen = http_request(&http, "GET", "/v1/who");
+    let web_who_after_empty_screen = http_request(&http, "GET", "/api/who");
     assert!(
         web_who_after_empty_screen.starts_with("HTTP/1.1 200"),
         "{web_who_after_empty_screen}"
@@ -169,7 +177,7 @@ fn daemon_journal_read_recovery_and_pane_exit() {
         &["send-keys", "-t", &panes[1], "-l", "screen-capture-marker"],
     );
     let encoded_pane = panes[1].replace('%', "%25");
-    let web_screen = http_request(&http, "GET", &format!("/v1/agents/{encoded_pane}/screen"));
+    let web_screen = http_request(&http, "GET", &format!("/api/agents/{encoded_pane}/screen"));
     assert!(web_screen.starts_with("HTTP/1.1 200"), "{web_screen}");
     assert!(
         web_screen.contains(&format!("\"pane_id\":\"{}\"", panes[1])),
@@ -180,44 +188,44 @@ fn daemon_journal_read_recovery_and_pane_exit() {
     let unknown_screen = http_request(
         &http,
         "GET",
-        &format!("/v1/agents/{unregistered_pane}/screen"),
+        &format!("/api/agents/{unregistered_pane}/screen"),
     );
     assert!(
         unknown_screen.starts_with("HTTP/1.1 404"),
         "{unknown_screen}"
     );
-    let malformed_screen = http_request(&http, "GET", "/v1/agents/%2F/screen");
+    let malformed_screen = http_request(&http, "GET", "/api/agents/%2F/screen");
     assert!(
         malformed_screen.starts_with("HTTP/1.1 400"),
         "{malformed_screen}"
     );
-    let invalid_screen = http_request(&http, "GET", "/v1/agents/%25bad/screen");
+    let invalid_screen = http_request(&http, "GET", "/api/agents/%25bad/screen");
     assert!(
         invalid_screen.starts_with("HTTP/1.1 404"),
         "{invalid_screen}"
     );
-    let mailboxes = http_request(&http, "GET", "/v1/mailboxes");
+    let mailboxes = http_request(&http, "GET", "/api/mailboxes");
     assert!(mailboxes.starts_with("HTTP/1.1 200"), "{mailboxes}");
     assert!(mailboxes.contains("\"mobile\""), "{mailboxes}");
-    let empty_mailbox = http_request(&http, "GET", "/v1/mailbox/mobile?limit=1");
+    let empty_mailbox = http_request(&http, "GET", "/api/mailbox/mobile?limit=1");
     assert!(empty_mailbox.starts_with("HTTP/1.1 200"), "{empty_mailbox}");
     assert!(empty_mailbox.contains("\"events\":[]"), "{empty_mailbox}");
-    let unknown_mailbox = http_request(&http, "GET", "/v1/mailbox/not-allowed");
+    let unknown_mailbox = http_request(&http, "GET", "/api/mailbox/not-allowed");
     assert!(
         unknown_mailbox.starts_with("HTTP/1.1 404"),
         "{unknown_mailbox}"
     );
-    let invalid_mailbox = http_request(&http, "GET", "/v1/mailbox/Bad");
+    let invalid_mailbox = http_request(&http, "GET", "/api/mailbox/Bad");
     assert!(
         invalid_mailbox.starts_with("HTTP/1.1 404"),
         "{invalid_mailbox}"
     );
-    let malformed_mailbox = http_request(&http, "GET", "/v1/mailbox/bad%2Fname");
+    let malformed_mailbox = http_request(&http, "GET", "/api/mailbox/bad%2Fname");
     assert!(
         malformed_mailbox.starts_with("HTTP/1.1 400"),
         "{malformed_mailbox}"
     );
-    let invalid_mailbox_query = http_request(&http, "GET", "/v1/mailbox/mobile?limit=0");
+    let invalid_mailbox_query = http_request(&http, "GET", "/api/mailbox/mobile?limit=0");
     assert!(
         invalid_mailbox_query.starts_with("HTTP/1.1 400"),
         "{invalid_mailbox_query}"
@@ -225,13 +233,13 @@ fn daemon_journal_read_recovery_and_pane_exit() {
     let web_static = http_request(&http, "GET", "/nested/spa/route");
     assert!(web_static.starts_with("HTTP/1.1 200"), "{web_static}");
     assert!(web_static.contains("agent talk · registry"), "{web_static}");
-    let unknown_api = http_request(&http, "GET", "/v1/missing");
+    let unknown_api = http_request(&http, "GET", "/api/missing");
     assert!(unknown_api.starts_with("HTTP/1.1 404"), "{unknown_api}");
     for path in [
-        "/v1/who",
-        "/v1/letters",
-        "/v1/recover",
-        "/v1/mailbox/mobile",
+        "/api/who",
+        "/api/letters",
+        "/api/recover",
+        "/api/mailbox/mobile",
     ] {
         let write_rejected = http_request(&http, "POST", path);
         assert!(
@@ -680,7 +688,7 @@ fn daemon_journal_read_recovery_and_pane_exit() {
         &runtime,
         &state,
         &legacy_mail,
-        &["mailbox-list-v1", "mobile"],
+        &["mailbox-list", "mobile"],
     ));
     assert!(mailbox.contains("\"version\":1"));
     assert!(mailbox.contains("external body"));
@@ -691,7 +699,7 @@ fn daemon_journal_read_recovery_and_pane_exit() {
         &state,
         &legacy_mail,
         &[
-            "mailbox-list-v1",
+            "mailbox-list",
             "mobile",
             "--after",
             &external_id.to_string(),
@@ -703,7 +711,7 @@ fn daemon_journal_read_recovery_and_pane_exit() {
     let web_mailbox = http_request(
         &http,
         "GET",
-        &format!("/v1/mailbox/mobile?after={external_id}&limit=1"),
+        &format!("/api/mailbox/mobile?after={external_id}&limit=1"),
     );
     assert!(web_mailbox.starts_with("HTTP/1.1 200"), "{web_mailbox}");
     assert!(web_mailbox.contains("reply body"), "{web_mailbox}");
@@ -1115,7 +1123,7 @@ fn message_retention_follows_the_acknowledgement_contract() {
     fixture.rejected(0, &["read", &first.to_string()], "このpane宛ではありません");
     fixture.rejected(
         0,
-        &["ack-v1", &first.to_string()],
+        &["ack-message", &first.to_string()],
         "このpane宛ではありません",
     );
     assert!(
@@ -1125,7 +1133,7 @@ fn message_retention_follows_the_acknowledgement_contract() {
     );
 
     // 存在しない ID の ack は mutation なしで冪等成功する。
-    let unknown = fixture.run(0, &["ack-v1", "99999"]);
+    let unknown = fixture.run(0, &["ack-message", "99999"]);
     assert!(
         unknown.contains("\"outcome\":\"no_pending_message\""),
         "{unknown}"
@@ -1138,14 +1146,14 @@ fn message_retention_follows_the_acknowledgement_contract() {
     );
 
     // 受領報告すると消える。再送は冪等成功。
-    let acked = fixture.run(1, &["ack-v1", &first.to_string()]);
+    let acked = fixture.run(1, &["ack-message", &first.to_string()]);
     assert!(acked.contains("\"outcome\":\"acked\""), "{acked}");
     fixture.rejected(
         1,
         &["read", &first.to_string()],
         "見つかりません (受領報告済みの可能性があります)",
     );
-    let reacked = fixture.run(1, &["ack-v1", &first.to_string()]);
+    let reacked = fixture.run(1, &["ack-message", &first.to_string()]);
     assert!(
         reacked.contains("\"outcome\":\"no_pending_message\""),
         "{reacked}"
@@ -1161,7 +1169,7 @@ fn message_retention_follows_the_acknowledgement_contract() {
     fixture.rejected(1, &["read", &second.to_string()], "まだ配達されていません");
     fixture.rejected(
         1,
-        &["ack-v1", &second.to_string()],
+        &["ack-message", &second.to_string()],
         "まだ配達されていません",
     );
     assert!(!fixture.run(1, &["who"]).contains("pending-to-me"));
@@ -1194,7 +1202,7 @@ fn message_retention_follows_the_acknowledgement_contract() {
     );
     assert!(
         fixture
-            .run(1, &["ack-v1", &second.to_string()])
+            .run(1, &["ack-message", &second.to_string()])
             .contains("\"outcome\":\"acked\"")
     );
 

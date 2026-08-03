@@ -83,8 +83,12 @@ impl Drop for Session {
     }
 }
 
-/// 受け取った `Request` を記録しつつ、command ごとに定型の `Response` を返す fake daemon。
-fn fake_daemon(socket: &Path) -> mpsc::Receiver<Value> {
+/// fake daemon の共通 socket loop。受けた `Request` を記録しつつ、
+/// response policy (request -> Response JSON) だけを差し替える。
+fn scripted_daemon(
+    socket: &Path,
+    policy: impl Fn(&Value) -> Value + Send + 'static,
+) -> mpsc::Receiver<Value> {
     std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
     let listener = UnixListener::bind(socket).unwrap();
     let (tx, rx) = mpsc::channel();
@@ -96,74 +100,98 @@ fn fake_daemon(socket: &Path) -> mpsc::Receiver<Value> {
                 continue;
             }
             let request: Value = serde_json::from_str(&line).unwrap();
-            let response = match request["command"].as_str().unwrap() {
-                "peers-v1" => json!({
-                    "code": 0,
-                    "stdout": "{\"version\":1,\"self\":\"%1\",\"pending_to_me\":[3],\"peers\":[{\"name\":\"codex\",\"state\":\"idle\",\"location\":\"work:0.0\",\"pane\":\"%2\",\"cwd\":\"/tmp\",\"queued\":0,\"pending_from_me\":[9]}]}\n",
-                    "stderr": "",
-                }),
-                "send-message-v1" => json!({
-                    "code": 0,
-                    "stdout": "{\"version\":1,\"id\":9,\"path\":\"sent\",\"to\":\"%2\",\"name\":\"codex\"}\n",
-                    "stderr": "",
-                }),
-                "read-v1" => json!({
-                    "code": 0,
-                    "stdout": "{\"version\":1,\"id\":3,\"from\":\"codex\",\"reply_to\":\"%2\",\"body\":\"# agent-talk 依頼書\\n本文\"}\n",
-                    "stderr": "",
-                }),
-                "ack-v1" => json!({
-                    "code": 0,
-                    "stdout": "{\"version\":1,\"id\":3,\"outcome\":\"acked\"}\n",
-                    "stderr": "",
-                }),
-                other => json!({
-                    "code": 1,
-                    "stdout": "",
-                    "stderr": format!("agent-talk: unknown command {other}\n"),
-                }),
-            };
+            let response = policy(&request);
             let mut stream = stream;
             let mut encoded = serde_json::to_vec(&response).unwrap();
             encoded.push(b'\n');
             stream.write_all(&encoded).unwrap();
             stream.flush().unwrap();
-            tx.send(request).unwrap();
+            // 記録は best-effort。receiver を捨てた caller (記録不要の fake) でも
+            // accept loop を止めない。
+            let _ = tx.send(request);
         }
     });
     rx
 }
 
+/// 実 daemon の `Response::error("unknown command")` と同形の応答。
+fn unknown_command() -> Value {
+    json!({
+        "code": 1,
+        "stdout": "",
+        "stderr": "agent-talk: unknown command\n",
+    })
+}
+
+fn ok_response(stdout: &str) -> Value {
+    json!({ "code": 0, "stdout": stdout, "stderr": "" })
+}
+
+/// canonical 名で応答する現行 daemon の代役。
+fn fake_daemon(socket: &Path) -> mpsc::Receiver<Value> {
+    scripted_daemon(socket, |request| {
+        match request["command"].as_str().unwrap() {
+            "list-peers" => ok_response(
+                "{\"version\":1,\"self\":\"%1\",\"pending_to_me\":[3],\"peers\":[{\"name\":\"codex\",\"state\":\"idle\",\"location\":\"work:0.0\",\"pane\":\"%2\",\"cwd\":\"/tmp\",\"queued\":0,\"pending_from_me\":[9]}]}\n",
+            ),
+            "send-message" => ok_response(
+                "{\"version\":1,\"id\":9,\"path\":\"sent\",\"to\":\"%2\",\"name\":\"codex\"}\n",
+            ),
+            "read-message" => ok_response(
+                "{\"version\":1,\"id\":3,\"from\":\"codex\",\"reply_to\":\"%2\",\"body\":\"# agent-talk 依頼書\\n本文\"}\n",
+            ),
+            "ack-message" => ok_response("{\"version\":1,\"id\":3,\"outcome\":\"acked\"}\n"),
+            _ => unknown_command(),
+        }
+    })
+}
+
+/// canonical 名を知らない旧 daemon の代役。canonical 名には実 daemon と同形の
+/// `unknown command` を返し、旧 `*-v1` 名にだけ成功応答を返す。
+fn legacy_daemon(socket: &Path) -> mpsc::Receiver<Value> {
+    scripted_daemon(socket, |request| {
+        match request["command"].as_str().unwrap() {
+            "peers-v1" => {
+                ok_response("{\"version\":1,\"self\":\"%1\",\"pending_to_me\":[],\"peers\":[]}\n")
+            }
+            "read-v1" => ok_response(
+                "{\"version\":1,\"id\":3,\"from\":\"codex\",\"reply_to\":null,\"body\":\"本文\"}\n",
+            ),
+            "ack-v1" => ok_response("{\"version\":1,\"id\":3,\"outcome\":\"acked\"}\n"),
+            "send-message-v1" if request["send_options"].is_object() => ok_response(
+                "{\"version\":1,\"id\":9,\"path\":\"sent\",\"to\":\"%2\",\"name\":\"codex\"}\n",
+            ),
+            _ => unknown_command(),
+        }
+    })
+}
+
+/// どの command にも「登録されていない」型の (unknown ではない) エラーを返す fake daemon。
+fn rejecting_daemon(socket: &Path) -> mpsc::Receiver<Value> {
+    scripted_daemon(socket, |_| {
+        json!({
+            "code": 1,
+            "stdout": "",
+            "stderr": "agent-talk: この操作は登録済みのagent paneからのみ実行できます\n",
+        })
+    })
+}
+
 /// 契約外の「成功」応答だけを返す fake daemon。
 /// MCP は暗黙に劣化させず、すべて `isError: true` にしなければならない。
 fn degraded_daemon(socket: &Path) {
-    std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
-    let listener = UnixListener::bind(socket).unwrap();
-    thread::spawn(move || {
-        while let Ok((stream, _)) = listener.accept() {
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut line = String::new();
-            if reader.read_line(&mut line).is_err() || line.is_empty() {
-                continue;
-            }
-            let request: Value = serde_json::from_str(&line).unwrap();
-            let stdout = match request["command"].as_str().unwrap() {
-                // 旧テキスト形式 (versioned JSON への移行前の形)
-                "send-message-v1" => "sent -> %2 (codex): #9\n",
-                // version フィールドが無い
-                "read-v1" => "{\"id\":3,\"from\":\"codex\"}\n",
-                // object ではない
-                "ack-v1" => "[1,2,3]\n",
-                // 空応答
-                _ => "\n",
-            };
-            let response = json!({ "code": 0, "stdout": stdout, "stderr": "" });
-            let mut stream = stream;
-            let mut encoded = serde_json::to_vec(&response).unwrap();
-            encoded.push(b'\n');
-            stream.write_all(&encoded).unwrap();
-            stream.flush().unwrap();
-        }
+    let _requests = scripted_daemon(socket, |request| {
+        let stdout = match request["command"].as_str().unwrap() {
+            // 旧テキスト形式 (versioned JSON への移行前の形)
+            "send-message" => "sent -> %2 (codex): #9\n",
+            // version フィールドが無い
+            "read-message" => "{\"id\":3,\"from\":\"codex\"}\n",
+            // object ではない
+            "ack-message" => "[1,2,3]\n",
+            // 空応答
+            _ => "\n",
+        };
+        ok_response(stdout)
     });
 }
 
@@ -308,7 +336,7 @@ fn home_fallback_reaches_the_same_socket_layout_as_the_daemon() {
     }));
     assert_eq!(response["result"]["isError"], false, "{response}");
     let request = requests.recv().unwrap();
-    assert_eq!(request["command"], "peers-v1");
+    assert_eq!(request["command"], "list-peers");
     assert_eq!(request["pane"], "%7");
 }
 
@@ -388,20 +416,116 @@ fn the_four_tools_round_trip_over_the_derived_unix_socket() {
     assert_eq!(acked["result"]["structuredContent"]["outcome"], "acked");
 
     let observed: Vec<Value> = (0..4).map(|_| requests.recv().unwrap()).collect();
-    assert_eq!(observed[0]["command"], "peers-v1");
+    assert_eq!(observed[0]["command"], "list-peers");
     // 呼び出し元 identity は adapter が spawn 時の TMUX_PANE から導出する。
     for request in &observed {
         assert_eq!(request["pane"], "%1");
     }
-    assert_eq!(observed[1]["command"], "send-message-v1");
+    assert_eq!(observed[1]["command"], "send-message");
     assert_eq!(observed[1]["args"], json!(["codex"]));
     assert_eq!(observed[1]["stdin"], "本文\n2行目");
     assert_eq!(observed[1]["send_options"]["no_reply"], true);
     assert_eq!(observed[1]["send_options"]["skill"], Value::Null);
     assert_eq!(observed[1]["send_options"]["from"], Value::Null);
-    assert_eq!(observed[2]["command"], "read-v1");
+    assert_eq!(observed[2]["command"], "read-message");
     assert_eq!(observed[2]["args"], json!(["3"]));
-    assert_eq!(observed[3]["command"], "ack-v1");
+    assert_eq!(observed[3]["command"], "ack-message");
+}
+
+#[test]
+fn a_new_adapter_falls_back_to_legacy_names_only_on_unknown_command() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = root.path().join("run");
+    let tmux_socket = root.path().join("tmux/legacy");
+    let tmux_socket = tmux_socket.to_str().unwrap();
+    let requests = legacy_daemon(&derived_socket(&runtime, tmux_socket));
+
+    let mut session = Session::start(&[
+        ("TMUX", &format!("{tmux_socket},1,0")),
+        ("TMUX_PANE", "%1"),
+        ("XDG_RUNTIME_DIR", runtime.to_str().unwrap()),
+    ]);
+    // 旧 daemon 相手でも 4 tool すべて成功する (canonical → unknown → 旧名で成立)。
+    let peers = session.call(&json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "list_peers", "arguments": {}}
+    }));
+    assert_eq!(peers["result"]["isError"], false, "{peers}");
+    let read = session.call(&json!({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "params": {"name": "read_message", "arguments": {"id": 3}}
+    }));
+    assert_eq!(read["result"]["structuredContent"]["id"], 3, "{read}");
+    let sent = session.call(&json!({
+        "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+        "params": {"name": "send_message", "arguments": {"to": "codex", "body": "本文"}}
+    }));
+    assert_eq!(
+        sent["result"]["structuredContent"]["path"], "sent",
+        "{sent}"
+    );
+    let acked = session.call(&json!({
+        "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+        "params": {"name": "ack_message", "arguments": {"id": 3}}
+    }));
+    assert_eq!(
+        acked["result"]["structuredContent"]["outcome"], "acked",
+        "{acked}"
+    );
+
+    // 各 tool は canonical を先に送り、明示 unknown を見てから旧名で1回だけ再試行する。
+    let observed: Vec<String> = (0..8)
+        .map(|_| {
+            requests.recv().unwrap()["command"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect();
+    assert_eq!(
+        observed,
+        [
+            "list-peers",
+            "peers-v1",
+            "read-message",
+            "read-v1",
+            "send-message",
+            "send-message-v1",
+            "ack-message",
+            "ack-v1"
+        ]
+    );
+    assert!(
+        requests.try_recv().is_err(),
+        "再試行は operation ごとに1回まで"
+    );
+}
+
+#[test]
+fn an_error_other_than_unknown_command_is_never_retried() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = root.path().join("run");
+    let tmux_socket = root.path().join("tmux/rejecting");
+    let tmux_socket = tmux_socket.to_str().unwrap();
+    let requests = rejecting_daemon(&derived_socket(&runtime, tmux_socket));
+
+    let mut session = Session::start(&[
+        ("TMUX", &format!("{tmux_socket},1,0")),
+        ("TMUX_PANE", "%1"),
+        ("XDG_RUNTIME_DIR", runtime.to_str().unwrap()),
+    ]);
+    // unknown command 以外のエラーで旧名 fallback すると send が二重配送になり得る。
+    let sent = session.call(&json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "send_message", "arguments": {"to": "codex", "body": "本文"}}
+    }));
+    assert_eq!(sent["result"]["isError"], true, "{sent}");
+    let first = requests.recv().unwrap();
+    assert_eq!(first["command"], "send-message");
+    assert!(
+        requests.try_recv().is_err(),
+        "unknown 以外のエラーでは再試行しない (二重配送の禁止)"
+    );
 }
 
 #[test]

@@ -51,7 +51,7 @@ it("discovers mailboxes, distinguishes directions, and requests incremental even
   await fireEvent.click(screen.getByRole("button", { name: "更新" }));
   await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(3));
   expect(fetch.mock.calls[2]?.[0]).toBe(
-    "/v1/mailbox/mobile?after=13&limit=100",
+    "/api/mailbox/mobile?after=13&limit=100",
   );
 });
 

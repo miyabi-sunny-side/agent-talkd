@@ -148,7 +148,7 @@ impl SendReport {
     fn usage_command(self) -> &'static str {
         match self {
             Self::Text => "send",
-            Self::Json => "send-message-v1",
+            Self::Json => "send-message",
         }
     }
 
@@ -650,12 +650,12 @@ fn classify_http(method: &Method, path: &str) -> HttpRoute {
         return HttpRoute::MethodNotAllowed;
     }
     match path {
-        "/v1/hello" => HttpRoute::Hello,
-        "/v1/who" => HttpRoute::Who,
-        "/v1/mailboxes" => HttpRoute::Mailboxes,
-        path if path.starts_with("/v1/agents/") && path.ends_with("/screen") => {
+        "/api/hello" => HttpRoute::Hello,
+        "/api/who" => HttpRoute::Who,
+        "/api/mailboxes" => HttpRoute::Mailboxes,
+        path if path.starts_with("/api/agents/") && path.ends_with("/screen") => {
             let encoded = path
-                .strip_prefix("/v1/agents/")
+                .strip_prefix("/api/agents/")
                 .and_then(|rest| rest.strip_suffix("/screen"))
                 .unwrap_or_default();
             match decode_path_segment(encoded) {
@@ -664,13 +664,17 @@ fn classify_http(method: &Method, path: &str) -> HttpRoute {
                 None => HttpRoute::BadRequest,
             }
         }
-        path if let Some(encoded) = path.strip_prefix("/v1/mailbox/") => {
+        path if let Some(encoded) = path.strip_prefix("/api/mailbox/") => {
             match decode_path_segment(encoded) {
                 Some(mailbox) if is_safe_token(&mailbox) => HttpRoute::Mailbox(mailbox),
                 Some(_) => HttpRoute::NotFound,
                 None => HttpRoute::BadRequest,
             }
         }
+        path if path.starts_with("/api/") => HttpRoute::ApiNotFound,
+        // 撤去済みの旧 API prefix の墓標。SPA fallback (200) に落とすと、残存する旧
+        // updater の health probe が「旧 API がまだ正常」と誤認して fail-open になる。
+        // alias ではなく拒否 — 旧 path は API としてもう存在しない。
         path if path.starts_with("/v1/") => HttpRoute::ApiNotFound,
         _ => HttpRoute::Static,
     }
@@ -948,7 +952,7 @@ impl Broker {
     }
 
     async fn handle(&mut self, request: Request) -> Response {
-        let result = match request.command.as_str() {
+        let result = match canonical_command(&request.command) {
             "register" => self.register(request).await,
             "unregister" => self.unregister(request).await,
             "busy" => {
@@ -971,22 +975,22 @@ impl Broker {
             }
             "send-v2" => Ok(Response::error("send-v2 optionsがありません")),
             "read" => Ok(self.read(&request)),
-            // MCP adapter 専用の versioned RPC。ADR 0001 の起動時 contract 5 により
+            // MCP adapter 専用の RPC。ADR 0001 の起動時 contract 5 により
             // 未登録 pane からは何も出来ない。この gate は message 状態の分岐より前に置く。
-            "send-message-v1" | "read-v1" | "ack-v1" | "peers-v1"
+            "send-message" | "read-message" | "ack-message" | "list-peers"
                 if !self.caller_is_registered(request.pane.as_deref()) =>
             {
                 Ok(Response::error(UNREGISTERED_CALLER))
             }
-            "send-message-v1" if request.send_options.is_some() => {
+            "send-message" if request.send_options.is_some() => {
                 self.send(request, SendReport::Json).await
             }
-            "send-message-v1" => Ok(Response::error("send-message-v1 optionsがありません")),
-            "read-v1" => Ok(self.read_json(&request)),
-            "ack-v1" => self.ack(&request),
-            "peers-v1" => self.peers_json(&request).await,
+            "send-message" => Ok(Response::error("send-message optionsがありません")),
+            "read-message" => Ok(self.read_json(&request)),
+            "ack-message" => self.ack(&request),
+            "list-peers" => self.peers_json(&request).await,
             "reply" => self.reply(request),
-            "mailbox-list-v1" => self.mailbox_list(&request),
+            "mailbox-list" => self.mailbox_list(&request),
             "internal-daemon-status" => Ok(Response::ok(format!(
                 "{}\n",
                 serde_json::json!({
@@ -1541,7 +1545,7 @@ impl Broker {
 
     /// 構造化 read。MCP adapter の `read_message` が使う。
     fn read_json(&mut self, request: &Request) -> Response {
-        let (id, pane) = match request_target(request, "read-v1") {
+        let (id, pane) = match request_target(request, "read-message") {
             Ok(target) => target,
             Err(response) => return response,
         };
@@ -1575,7 +1579,7 @@ impl Broker {
 
     /// 受領報告。journal の append + fsync が成功する前に可視性を `Acked` へ進めない。
     fn ack(&mut self, request: &Request) -> Result<Response> {
-        let (id, pane) = match request_target(request, "ack-v1") {
+        let (id, pane) = match request_target(request, "ack-message") {
             Ok(target) => target,
             Err(response) => return Ok(response),
         };
@@ -1695,11 +1699,11 @@ impl Broker {
     fn mailbox_list(&self, request: &Request) -> Result<Response> {
         if request.pane.is_some() {
             return Ok(Response::error(
-                "mailbox-list-v1 は外部caller (TMUX_PANEなし) 専用です",
+                "mailbox-list は外部caller (TMUX_PANEなし) 専用です",
             ));
         }
         let Some(mailbox) = request.args.first() else {
-            return Ok(Response::error(help::usage("mailbox-list-v1")));
+            return Ok(Response::error(help::usage("mailbox-list")));
         };
         if !is_safe_token(mailbox) || !self.config.allowed_sources.contains(mailbox) {
             return Ok(Response::error("mailbox が許可されていません"));
@@ -2273,6 +2277,20 @@ enum BriefMode {
     External(u64),
 }
 
+/// 先受け版号時代の旧 wire 名を canonical 名へ正規化する互換 alias。
+/// daemon は update.timer により agent session の途中でも差し替わるため、
+/// 稼働中の旧 adapter を壊さないための期限付き措置。次の minor で削除する。
+fn canonical_command(command: &str) -> &str {
+    match command {
+        "peers-v1" => "list-peers",
+        "read-v1" => "read-message",
+        "ack-v1" => "ack-message",
+        "send-message-v1" => "send-message",
+        "mailbox-list-v1" => "mailbox-list",
+        other => other,
+    }
+}
+
 /// 受領催促の呼び鈴文言。読了済みと未読で促す操作を変える
 /// (user 原文「読んだんじゃないの？早くackしてくれ、読んでないなら読んでくれ」)。
 fn nag_bell(items: &[(u64, bool)]) -> String {
@@ -2431,7 +2449,7 @@ mod tests {
 
     fn send_request(pane: &str, to: &str, body: &str) -> Request {
         Request {
-            command: "send-message-v1".into(),
+            command: "send-message".into(),
             args: vec![to.to_owned()],
             stdin: body.to_owned(),
             pane: Some(pane.to_owned()),
@@ -2476,10 +2494,10 @@ mod tests {
 
         // %9 は登録されていない。4つの RPC すべてが拒否される。
         for (command, args) in [
-            ("send-message-v1", vec!["claude"]),
-            ("read-v1", vec![id.to_string().as_str()]),
-            ("ack-v1", vec![id.to_string().as_str()]),
-            ("peers-v1", vec![]),
+            ("send-message", vec!["claude"]),
+            ("read-message", vec![id.to_string().as_str()]),
+            ("ack-message", vec![id.to_string().as_str()]),
+            ("list-peers", vec![]),
         ] {
             let mut denied = request(command, Some("%9"), &args);
             denied.stdin = "body".into();
@@ -2497,7 +2515,7 @@ mod tests {
 
         // 不在 ID への ack も、登録確認の前に成功を返さない。
         let unknown = broker
-            .handle(request("ack-v1", Some("%9"), &["4242"]))
+            .handle(request("ack-message", Some("%9"), &["4242"]))
             .await;
         assert_eq!(unknown.code, 1);
         assert!(unknown.stderr.contains("登録済みのagent pane"));
@@ -2521,7 +2539,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_message_v1_returns_versioned_json_for_both_paths() {
+    async fn send_message_rpc_returns_versioned_json_for_both_paths() {
         let dir = tempfile::tempdir().unwrap();
         let mut broker = registered_pair(&dir).await;
         let sent = json(&broker.handle(send_request("%1", "claude", "body")).await);
@@ -2546,7 +2564,7 @@ mod tests {
 
         let read = json(
             &broker
-                .handle(request("read-v1", Some("%2"), &[&id.to_string()]))
+                .handle(request("read-message", Some("%2"), &[&id.to_string()]))
                 .await,
         );
         assert_eq!(read["from"], "codex");
@@ -2558,7 +2576,7 @@ mod tests {
             .await;
         let after = json(
             &broker
-                .handle(request("read-v1", Some("%2"), &[&id.to_string()]))
+                .handle(request("read-message", Some("%2"), &[&id.to_string()]))
                 .await,
         );
         assert_eq!(after["from"], "codex", "現在のレジストリを引き直さない");
@@ -2583,7 +2601,7 @@ mod tests {
         );
         let read = json(
             &restarted
-                .handle(request("read-v1", Some("%2"), &[&id.to_string()]))
+                .handle(request("read-message", Some("%2"), &[&id.to_string()]))
                 .await,
         );
         assert_eq!(read["from"], "codex");
@@ -2602,7 +2620,7 @@ mod tests {
         // (a) append 失敗は error 応答になる。
         broker.journal.fail_next_appends(1);
         let failed = broker
-            .handle(request("ack-v1", Some("%2"), &[&id.to_string()]))
+            .handle(request("ack-message", Some("%2"), &[&id.to_string()]))
             .await;
         assert_eq!(failed.code, 1, "{failed:?}");
         assert!(failed.stderr.contains("injected journal append failure"));
@@ -2617,7 +2635,7 @@ mod tests {
 
         // (c) 再 read が成功する。
         let reread = broker
-            .handle(request("read-v1", Some("%2"), &[&id.to_string()]))
+            .handle(request("read-message", Some("%2"), &[&id.to_string()]))
             .await;
         assert_eq!(reread.code, 0, "{}", reread.stderr);
         assert!(json(&reread)["body"].as_str().unwrap().contains("body"));
@@ -2625,7 +2643,7 @@ mod tests {
         // (d) 後から ack すると成功する。
         let acked = json(
             &broker
-                .handle(request("ack-v1", Some("%2"), &[&id.to_string()]))
+                .handle(request("ack-message", Some("%2"), &[&id.to_string()]))
                 .await,
         );
         assert_eq!(acked["outcome"], "acked");
@@ -2906,7 +2924,7 @@ mod tests {
             .unwrap();
         // 配達済み → %2 が読んだが ack せず turn を終えた。
         let read = broker
-            .handle(request("read-v1", Some("%2"), &[&id.to_string()]))
+            .handle(request("read-message", Some("%2"), &[&id.to_string()]))
             .await;
         assert_eq!(read.code, 0, "{}", read.stderr);
         broker.turn_end(Some("%2".into())).await.unwrap();
@@ -2953,7 +2971,7 @@ mod tests {
         // ack すれば止まる。
         broker.turn_end(Some("%2".into())).await.unwrap();
         let acked = broker
-            .handle(request("ack-v1", Some("%2"), &[&id.to_string()]))
+            .handle(request("ack-message", Some("%2"), &[&id.to_string()]))
             .await;
         assert_eq!(acked.code, 0, "{}", acked.stderr);
         tokio::time::advance(std::time::Duration::from_mins(10)).await;
@@ -2987,6 +3005,46 @@ mod tests {
                 && bell.contains(&format!("#{id}")),
             "未読には read を促す: {bell}"
         );
+    }
+
+    #[tokio::test]
+    async fn legacy_wire_names_still_reach_the_same_operations() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut broker = registered_pair(&dir).await;
+        // 旧 adapter が送る *-v1 名は canonical と同じ operation へ正規化される。
+        let mut legacy_send = request("send-message-v1", Some("%1"), &["claude"]);
+        legacy_send.stdin = "legacy body".into();
+        legacy_send.send_options = Some(SendOptions::default());
+        let sent = json(&broker.handle(legacy_send).await);
+        assert_eq!(sent["path"], "sent");
+        let id = sent["id"].as_u64().unwrap();
+
+        let read = json(
+            &broker
+                .handle(request("read-v1", Some("%2"), &[&id.to_string()]))
+                .await,
+        );
+        assert!(read["body"].as_str().unwrap().contains("legacy body"));
+
+        let peers = json(&broker.handle(request("peers-v1", Some("%2"), &[])).await);
+        assert_eq!(peers["pending_to_me"][0], id);
+
+        let acked = json(
+            &broker
+                .handle(request("ack-v1", Some("%2"), &[&id.to_string()]))
+                .await,
+        );
+        assert_eq!(acked["outcome"], "acked");
+
+        // alias 表の5件目。外部 caller (pane なし) 専用 RPC も旧名で同じ operation に届く。
+        broker.config.allowed_sources.insert("mobile".into());
+        let mailbox = json(
+            &broker
+                .handle(request("mailbox-list-v1", None, &["mobile"]))
+                .await,
+        );
+        assert_eq!(mailbox["version"], 1);
+        assert_eq!(mailbox["mailbox"], "mobile");
     }
 
     #[tokio::test]
@@ -3040,44 +3098,50 @@ mod tests {
 
     #[test]
     fn http_routes_are_read_only_and_api_misses_do_not_fall_back() {
-        assert_eq!(classify_http(&Method::GET, "/v1/hello"), HttpRoute::Hello);
-        assert_eq!(classify_http(&Method::GET, "/v1/who"), HttpRoute::Who);
+        assert_eq!(classify_http(&Method::GET, "/api/hello"), HttpRoute::Hello);
+        assert_eq!(classify_http(&Method::GET, "/api/who"), HttpRoute::Who);
         assert_eq!(
-            classify_http(&Method::GET, "/v1/agents/%251/screen"),
+            classify_http(&Method::GET, "/api/agents/%251/screen"),
             HttpRoute::Screen("%1".into())
         );
         assert_eq!(
-            classify_http(&Method::GET, "/v1/mailboxes"),
+            classify_http(&Method::GET, "/api/mailboxes"),
             HttpRoute::Mailboxes
         );
         assert_eq!(
-            classify_http(&Method::GET, "/v1/mailbox/review%3Asecurity"),
+            classify_http(&Method::GET, "/api/mailbox/review%3Asecurity"),
             HttpRoute::Mailbox("review:security".into())
         );
         assert_eq!(
-            classify_http(&Method::GET, "/v1/missing"),
+            classify_http(&Method::GET, "/api/missing"),
             HttpRoute::ApiNotFound
         );
         assert_eq!(
             classify_http(&Method::GET, "/agents/one"),
             HttpRoute::Static
         );
+        // 撤去済みの旧 /v1/* は SPA へ fallthrough させず、明示的に拒否する
+        // (旧 updater の health probe に 200 を返す fail-open の防止)。
         assert_eq!(
-            classify_http(&Method::POST, "/v1/who"),
+            classify_http(&Method::GET, "/v1/hello"),
+            HttpRoute::ApiNotFound
+        );
+        assert_eq!(
+            classify_http(&Method::POST, "/api/who"),
             HttpRoute::MethodNotAllowed
         );
         for path in [
-            "/v1/agents/screen",
-            "/v1/agents/%1/screen",
-            "/v1/agents//screen",
-            "/v1/mailbox/bad%2Fname",
+            "/api/agents/screen",
+            "/api/agents/%1/screen",
+            "/api/agents//screen",
+            "/api/mailbox/bad%2Fname",
         ] {
             assert_eq!(classify_http(&Method::GET, path), HttpRoute::BadRequest);
         }
         for path in [
-            "/v1/agents/%252F/screen",
-            "/v1/agents/%250x/screen",
-            "/v1/mailbox/Bad",
+            "/api/agents/%252F/screen",
+            "/api/agents/%250x/screen",
+            "/api/mailbox/Bad",
         ] {
             assert_eq!(classify_http(&Method::GET, path), HttpRoute::NotFound);
         }

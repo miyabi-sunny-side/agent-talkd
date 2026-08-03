@@ -80,11 +80,16 @@ set -g @plugin 'miyabi-sunny-side/agent-talkd'
 
 `run`, `register`, `unregister`, `busy`, `idle`, `turn-end`, `who`, `resolve`,
 `send`, `read`, `update`, `ensure-daemon`, `daemon-status` を提供します。
-`read-v1`, `ack-v1`, `peers-v1` は MCP adapter が使う配管コマンドで、依頼本文・
+`read-message`, `ack-message`, `list-peers` は MCP adapter が使う配管コマンドで、依頼本文・
 受領報告の結果・登録agentと未受領IDをそれぞれJSONで返します。送信側の
-`send-message-v1` は MCP adapter 専用の daemon RPC です。CLI からは必要なオプションを
-渡せず `send-message-v1 optionsがありません` で失敗するので、CLI から送るときは `send`
+`send-message` は MCP adapter 専用の daemon RPC です。CLI からは必要なオプションを
+渡せず `send-message optionsがありません` で失敗するので、CLI から送るときは `send`
 を使ってください。この4つは未登録の pane から呼ぶと拒否されます。
+移行注記: 旧 wire 名 (`read-v1` / `ack-v1` / `peers-v1` / `send-message-v1` /
+`mailbox-list-v1`) は稼働中の旧 adapter を session 途中で壊さないための互換 alias
+として受理されます。次の minor release で削除予定です。新しい adapter は canonical
+名を先に送り、daemon が明示的に `unknown command` を返したときだけ旧名で1回
+再試行します (接続失敗や timeout では再試行せず、send の二重配送を防ぎます)。
 互換用の `gc`, `watch` は no-op です。デーモンが未起動なら CLI が tmux
 サーバー単位で自動起動し、既存デーモンの版が古ければ安全に交代します。
 インストール済みのversionは `agent-talk --version` で確認できます。
@@ -97,13 +102,13 @@ set -g @plugin 'miyabi-sunny-side/agent-talkd'
 agent-talk run codex codex "$@"
 ```
 
-外部連携は `--from` で許可された mailbox に送信し、`mailbox-list-v1` で
+外部連携は `--from` で許可された mailbox に送信し、`mailbox-list` で
 read-only に取得できます。返信は agent pane 内で `agent-talk reply <id> 本文`
 を実行します。mailbox event は consume されず、各 mailbox の最新500件を保持します。
 `TMUX_PANE` なしは外部callerの誤用防止規約であり、実際のRPC境界は同一UIDのUnix
 socketです。
 
-`mailbox-list-v1` の安定JSON schema:
+`mailbox-list` の安定JSON schema:
 
 ```json
 {"version":1,"mailbox":"mobile","events":[{"id":12,"created_at":"2026-07-21T11:00:00Z","mailbox":"mobile","source_label":"mobile","direction":"out","body":"依頼","skill":"deliver","target_name":"claude","target_pane":"%1","reply_to":null}]}
@@ -111,7 +116,7 @@ socketです。
 
 `--after` は排他的ID、`--limit` は1〜500です。allowlistから外したmailboxの既存eventは
 保持されますが閲覧できず、再許可すると再び取得できます。旧daemonは新しい
-`reply`/`mailbox-list-v1` commandを未知commandとして失敗させ、別commandへ降格しません。
+`reply`/`mailbox-list` commandを未知commandとして失敗させ、別commandへ降格しません。
 
 `agent-talk update` は Linux x86_64 / macOS Apple Silicon の公開GitHub
 Releaseだけを対象に、タグ固定assetとSHA-256を検証して更新します。ローカル版が
@@ -191,17 +196,19 @@ HTTP-over-UDSで提供します。これはTCP listenerではなくUnix domain s
 `AGENT_TALK_RPC_SOCKET=/path/custom.sock`でRPC socketを上書きした場合も、同じ親directoryの
 `/path/custom.http.sock`へ追随します。
 
-- `GET /v1/hello`: 製品名とversionをJSONで返します。
-- `GET /v1/who`: 現在登録中のagent名、idle/busy状態、pane、session、location、cwdを
+- `GET /api/hello`: 製品名とversionをJSONで返します。
+- `GET /api/who`: 現在登録中のagent名、idle/busy状態、pane、session、location、cwdを
   JSONで返します。
-- `GET /v1/agents/<pane>/screen`: 登録中のpaneの現在の表示範囲を、plain textの
+- `GET /api/agents/<pane>/screen`: 登録中のpaneの現在の表示範囲を、plain textの
   `screen` fieldを持つJSONで返します。`%1`のようなpane IDはURL上では
   `%251`のようにpercent encodeします。
-- `GET /v1/mailboxes`: `@agent_talkd_allowed_sources`で現在許可されているmailbox名を返します。
-- `GET /v1/mailbox/<mailbox>?after=<id>&limit=<n>`: mailbox eventをID順に非consume取得します。
+- `GET /api/mailboxes`: `@agent_talkd_allowed_sources`で現在許可されているmailbox名を返します。
+- `GET /api/mailbox/<mailbox>?after=<id>&limit=<n>`: mailbox eventをID順に非consume取得します。
   `after`は排他、`limit`は1〜500で既定100です。JSON event schemaは
-  `mailbox-list-v1`と同一です。
-- 未知の`/v1/`以下: JSONの404を返します。
+  `mailbox-list`と同一です。
+- 未知の`/api/`以下: JSONの404を返します。撤去済みの旧 `/v1/*` も同じJSON 404で
+  明示的に拒否します (SPA entryへはfallbackさせません。200を返すと残存する旧
+  updaterのhealth probeが旧APIを正常と誤認するためです)。
 - GET以外: `Allow: GET`付きの405を返します。
 - その他のGET: 埋め込み静的ファイルを返し、未知の画面パスはSPA entryへfallbackします。
   静的ファイルを埋め込まずにビルドした場合はJSONの503を返します。
@@ -222,15 +229,15 @@ agent_talk_tmux_name="$(tmux display-message -p '#{socket_path}' \
   | sed 's|.*/||; s/[^A-Za-z0-9_-]/_/g')"
 curl --unix-socket \
   "$agent_talk_runtime/agent-talkd/$agent_talk_tmux_name.http.sock" \
-  http://localhost/v1/who
+  http://localhost/api/who
 
 curl --unix-socket \
   "$agent_talk_runtime/agent-talkd/$agent_talk_tmux_name.http.sock" \
-  http://localhost/v1/agents/%251/screen
+  http://localhost/api/agents/%251/screen
 
 curl --unix-socket \
   "$agent_talk_runtime/agent-talkd/$agent_talk_tmux_name.http.sock" \
-  'http://localhost/v1/mailbox/mobile?after=0&limit=10'
+  'http://localhost/api/mailbox/mobile?after=0&limit=10'
 ```
 
 この例は`AGENT_TALK_RPC_SOCKET`を上書きしていない既定設定向けです。
@@ -247,9 +254,9 @@ userからの接続を拒む境界であり、同一UID内の人間を識別・�
 まま受領報告が1分間ないメッセージには、宛先がidleのときにdaemonが受領催促の
 呼び鈴を送ります（読了済みならackを、未読なら読むことを促し、5分間隔より
 詰めて連打しません）。
-メッセージが消えるのは受信側が受領報告（`ack-v1` / MCP の `ack_message`）を
+メッセージが消えるのは受信側が受領報告（`ack-message` / MCP の `ack_message`）を
 送った後で、それまでは何度でも読み直せます。配達が完了していないqueue中の
-メッセージは、呼び鈴より先に本文を読ませないため `read` も `ack-v1` も拒否します。
+メッセージは、呼び鈴より先に本文を読ませないため `read` も `ack-message` も拒否します。
 本文、未配達queue、状態遷移は既定で
 `$XDG_STATE_HOME/agent-talkd/`（未設定時は `~/.local/state/agent-talkd/`）
 のjournalに保存します。従来の `~/.cache/agent-talk/*.md` は新規作成せず、

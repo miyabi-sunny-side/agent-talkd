@@ -53,7 +53,7 @@ async function getJson(path: string, signal?: AbortSignal): Promise<unknown> {
 }
 
 export async function fetchAgents(signal?: AbortSignal): Promise<Agent[]> {
-  const body = await getJson("/v1/who", signal);
+  const body = await getJson("/api/who", signal);
   if (!isWhoResponse(body))
     throw new Error("registry returned an invalid response");
   return body.agents;
@@ -64,7 +64,7 @@ export async function fetchScreen(
   signal?: AbortSignal,
 ): Promise<ScreenCapture> {
   const body = await getJson(
-    `/v1/agents/${encodeURIComponent(paneId)}/screen`,
+    `/api/agents/${encodeURIComponent(paneId)}/screen`,
     signal,
   );
   if (!isScreenCapture(body) || body.pane_id !== paneId)
@@ -73,7 +73,7 @@ export async function fetchScreen(
 }
 
 export async function fetchMailboxes(signal?: AbortSignal): Promise<string[]> {
-  const body = await getJson("/v1/mailboxes", signal);
+  const body = await getJson("/api/mailboxes", signal);
   if (!isMailboxesResponse(body))
     throw new Error("mailboxes returned an invalid response");
   return body.mailboxes;
@@ -88,7 +88,7 @@ export async function fetchMailbox(
   if (options.limit !== undefined) query.set("limit", String(options.limit));
   const suffix = query.size === 0 ? "" : `?${query}`;
   const body = await getJson(
-    `/v1/mailbox/${encodeURIComponent(mailbox)}${suffix}`,
+    `/api/mailbox/${encodeURIComponent(mailbox)}${suffix}`,
     options.signal,
   );
   if (!isMailboxResponse(body) || body.mailbox !== mailbox)

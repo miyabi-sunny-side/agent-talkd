@@ -341,10 +341,18 @@ async fn call_tool(context: &Context, params: &Value) -> Result<Value, String> {
         .ok_or("tool name がありません")?;
     let arguments = params.get("arguments").unwrap_or(&Value::Null);
     let payload = match name {
-        "list_peers" => request(context, "peers-v1", Vec::new()),
+        "list_peers" => request(context, "list-peers", Vec::new()),
         "send_message" => send_payload(context, arguments)?,
-        "read_message" => request(context, "read-v1", vec![message_id(arguments)?.to_string()]),
-        "ack_message" => request(context, "ack-v1", vec![message_id(arguments)?.to_string()]),
+        "read_message" => request(
+            context,
+            "read-message",
+            vec![message_id(arguments)?.to_string()],
+        ),
+        "ack_message" => request(
+            context,
+            "ack-message",
+            vec![message_id(arguments)?.to_string()],
+        ),
         other => return Err(format!("unknown tool: {other}")),
     };
     Ok(run(context, payload).await)
@@ -371,7 +379,7 @@ fn send_payload(context: &Context, arguments: &Value) -> Result<Request, String>
     let no_reply = arguments.get("no_reply").map_or(Ok(false), |value| {
         value.as_bool().ok_or("no_reply には真偽値が必要です")
     })?;
-    let mut payload = request(context, "send-message-v1", vec![to.to_owned()]);
+    let mut payload = request(context, "send-message", vec![to.to_owned()]);
     body.clone_into(&mut payload.stdin);
     payload.send_options = Some(SendOptions {
         from: None,
@@ -393,13 +401,41 @@ fn request(context: &Context, command: &str, args: Vec<String>) -> Request {
     }
 }
 
+/// canonical 名をまだ知らない旧 daemon 向けの旧 wire 名。
+///
+/// daemon (release tarball) と adapter (ローカルビルド) は更新タイミングが
+/// 別なので、新 adapter が旧 daemon に当たる skew は実在する。fallback の
+/// 発火条件は daemon が**明示的に** `unknown command` を返したときだけ —
+/// 接続失敗・timeout・壊れた応答では再試行しない (daemon が dispatch して
+/// いない証拠がある場合に限ることで、send の二重配送を構造的に防ぐ)。
+/// 旧 daemon の淘汰後、次の minor で削除する。
+fn legacy_command(command: &str) -> Option<&'static str> {
+    match command {
+        "list-peers" => Some("peers-v1"),
+        "read-message" => Some("read-v1"),
+        "ack-message" => Some("ack-v1"),
+        "send-message" => Some("send-message-v1"),
+        _ => None,
+    }
+}
+
 /// daemon の応答を tool result へ写す。
 ///
 /// **暗黙に劣化させない。** 4つの RPC はいずれも versioned JSON を返す契約なので、
 /// 期待した形でない成功応答は成功として扱わず `isError: true` にする。
 async fn run(context: &Context, payload: Request) -> Value {
     let command = payload.command.clone();
-    match exchange(context, &payload).await {
+    let mut outcome = exchange(context, &payload).await;
+    if let Ok(response) = &outcome
+        && response.code != 0
+        && response.stderr.trim() == "agent-talk: unknown command"
+        && let Some(legacy) = legacy_command(&command)
+    {
+        let mut retry = payload;
+        retry.command = legacy.to_owned();
+        outcome = exchange(context, &retry).await;
+    }
+    match outcome {
         Err(error) => tool_text(error, true),
         Ok(response) if response.code != 0 => tool_text(response.stderr.trim(), true),
         Ok(response) => match structured_result(&response.stdout) {

@@ -56,14 +56,14 @@ peer credentialのUIDがdaemonのeffective UIDと一致することを要求し�
 routeは次の順で分類します。
 
 1. GET以外は、pathにかかわらず`Allow: GET`付きのJSON 405にする。
-2. `GET /v1/hello`は製品名とversion、`GET /v1/who`はregistry snapshotをJSONで返す。
-3. `GET /v1/agents/<pane>/screen`はstrictにdecode・検証した登録paneだけをtmux adapterへ
+2. `GET /api/hello`は製品名とversion、`GET /api/who`はregistry snapshotをJSONで返す。
+3. `GET /api/agents/<pane>/screen`はstrictにdecode・検証した登録paneだけをtmux adapterへ
    渡し、現在の表示範囲をJSON内のplain-text文字列で返す。pane形式と登録確認は
    subprocessより先に行う。
-4. `GET /v1/mailboxes`は現在のallowlist、`GET /v1/mailbox/<mailbox>`は既存の
-   `mailbox-list-v1`と同じ非consume event viewを返す。mailbox tokenとallowlist、
+4. `GET /api/mailboxes`は現在のallowlist、`GET /api/mailbox/<mailbox>`は既存の
+   `mailbox-list`と同じ非consume event viewを返す。mailbox tokenとallowlist、
    `after`、`limit`の検査は既存primitiveと共有する。
-5. 未知の`/v1/`以下は静的fallbackへ流さずJSON 404にする。
+5. 未知の`/api/`以下は静的fallbackへ流さずJSON 404にする。
 6. その他のGETは埋め込みassetを返し、該当assetがなければ`/index.html`へfallbackする。
 
 失敗応答は`{"error":"<code>"}`です。statusはcallerが再試行と選択修正を区別できるよう
@@ -185,14 +185,14 @@ restartで未読へ戻っても、催促文言が保守側（「未読なら読�
 
 daemonは`read`と`ack`で同じ宛先・配達状態の検査を使います。
 
-| 対象 | `read` / `read-v1` | `ack-v1` |
+| 対象 | `read` / `read-message` | `ack-message` |
 | --- | --- | --- |
 | 呼び出し元pane宛・配達完了済み・未受領 | 本文を返し、読了だけをmemoryに記録（受領・削除の状態は変えない） | append＋fsyncの後に`Acked`。`outcome: acked` |
 | 配達未完了（queue中） | 拒否 | 拒否 |
 | 他pane宛 | 拒否 | 拒否 |
 | 存在しない、または受領報告済み | not-found | mutationなしで冪等成功（`outcome: no_pending_message`） |
 
-この表はversioned RPC（`read-v1` / `ack-v1`）では、呼び出し元paneが登録済みagentである
+この表はMCP adapter用RPC（`read-message` / `ack-message`）では、呼び出し元paneが登録済みagentである
 場合にだけ適用されます。未登録paneはこの分岐へ入る前に拒否されます（「MCP adapter」を
 参照）。
 
@@ -256,12 +256,18 @@ journal appendで行い、journal replayでも`remove`後に同じ最終状態�
 
 | tool | daemonのコマンド |
 | --- | --- |
-| `list_peers` | `peers-v1` |
-| `send_message` | `send-message-v1` |
-| `read_message` | `read-v1` |
-| `ack_message` | `ack-v1` |
+| `list_peers` | `list-peers` |
+| `send_message` | `send-message` |
+| `read_message` | `read-message` |
+| `ack_message` | `ack-message` |
 
-`send_message`がCLIと同じ`send-v2`ではなく専用の`send-message-v1`を使うのは、成功応答の
+旧wire名（`peers-v1` / `send-message-v1` / `read-v1` / `ack-v1` / `mailbox-list-v1`）は
+稼働中の旧adapterをsession途中で壊さないための互換aliasとして残り、次のminorで
+削除されます。逆方向のskew（新adapter→旧daemon）は、daemonが明示的に
+`unknown command`を返したときだけadapterが旧名で1回再試行して吸収します。
+接続失敗・timeout・壊れた応答では再試行しません（sendの二重配送の防止）。
+
+`send_message`がCLIと同じ`send-v2`ではなく専用の`send-message`を使うのは、成功応答の
 形が違うためです。CLIは人間向けテキスト（`sent -> %2 (claude): #0`）を返し、MCPは
 versioned JSON（`{"version":1,"id":0,"path":"sent","to":"%2","name":"claude"}`）を
 返します。1つのコマンドに2つの応答形を持たせると、どちらを返すかが呼び出し元の申告に
@@ -284,7 +290,7 @@ skillを消した意味が失われます。
 
 ### 未登録paneからの呼び出しは状態を見る前に拒否する
 
-`send-message-v1` / `read-v1` / `ack-v1` / `peers-v1`の4つは、呼び出し元paneが現在
+`send-message` / `read-message` / `ack-message` / `list-peers`の4つは、呼び出し元paneが現在
 登録済みのagentであることを最初に確認し、満たさなければmessageの状態分岐へ進む前に
 拒否します。判定を分岐より前に置くのは、未登録callerへ「存在しない」「他pane宛」
 「配達未完了」の区別を返さないためです。区別が漏れると、未登録paneからID空間を
@@ -365,7 +371,7 @@ pane IDと登録agent名が元eventと一致する場合だけ `direction=in` ev
 返信はtmuxへ打鍵しません。paneを同名agentが再登録した場合は後継paneとして返信を
 許可する既知の挙動です。
 
-`mailbox-list-v1` は非consumeのversioned JSON APIで、ID順・`--after`排他・limit最大500、
+`mailbox-list` は非consumeのversioned JSON APIで、ID順・`--after`排他・limit最大500、
 mailboxごとの最新500件retentionです。保存時刻はepoch秒、出力時にRFC3339へ変換します。
 `TMUX_PANE`なしは外部callerの規約であり、セキュリティ境界は同一UIDのRPC socketです。
 allowlistから外したmailboxのeventは削除せず閲覧だけ拒否します。新しいjournal variantを
