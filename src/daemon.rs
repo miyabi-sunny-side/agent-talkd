@@ -1905,12 +1905,12 @@ impl Broker {
                         .map(|agent| agent.name.clone())
                 })
                 .flatten()
-                .filter(|expected| {
+                .filter(|_| {
+                    // 生存判定は pane の存在だけ。名前は registry (唯一の真実) から
+                    // 引いた時点で確定しており、表示ミラー `@agent` の drift を理由に
+                    // 失敗通知を silent に退役させない。
                     Some(sender.as_str()) != excluded_pane
-                        && panes.iter().any(|pane| {
-                            pane.pane_id == sender
-                                && pane.agent.as_deref() == Some(expected.as_str())
-                        })
+                        && panes.iter().any(|pane| pane.pane_id == sender)
                 });
             let Some(expected) = sender_target else {
                 // 通知先が居ない場合も、残った `Pending` を terminal `Acked` にする。
@@ -2119,22 +2119,40 @@ impl Broker {
     }
 
     async fn reconcile(&mut self, startup: bool) {
-        let Ok(panes) = self.mux.panes().await else {
+        // 不完全な一覧を「pane 不在」と読むと、落ちている backend 側の生存登録を
+        // 全滅させる。evict は全 backend が答えたときにだけ判定する。
+        let Ok(panes) = self.mux.panes_from_all_backends().await else {
             return;
         };
+        // evict の条件は **pane の消滅だけ**。daemon memory が唯一の真実であり、
+        // `@agent` は表示用ミラーにすぎない (docs/design.md「状態と配送」)。
+        // ミラーの欠落・不一致を根拠に生存 pane の登録を消すと、drift のたびに
+        // その pane は理由の表示なく MCP 全拒否になる。
         let stale: Vec<_> = self
             .state
             .agents
-            .iter()
-            .filter(|(pane_id, agent)| {
-                !panes.iter().any(|pane| {
-                    pane.pane_id == **pane_id && pane.agent.as_deref() == Some(agent.name.as_str())
-                })
-            })
-            .map(|(pane, _)| pane.clone())
+            .keys()
+            .filter(|pane_id| !panes.iter().any(|pane| pane.pane_id == **pane_id))
+            .cloned()
             .collect();
         for pane in stale {
             self.remove_agent(&pane, "宛先が不在の").await;
+        }
+        // 生存 pane のミラーが drift していたら、memory を正として修復する。
+        // 修復失敗は表示の問題でしかないので warn に留める。
+        for pane in &panes {
+            if let Some(agent) = self.state.agents.get(&pane.pane_id)
+                && pane.agent.as_deref() != Some(agent.name.as_str())
+            {
+                let name = agent.name.clone();
+                if let Err(error) = self
+                    .mux
+                    .set_option(&pane.pane_id, "@agent", Some(&name))
+                    .await
+                {
+                    warn!(pane = %pane.pane_id, %error, source = "reconcile", "mirror repair failed");
+                }
+            }
         }
         if !startup {
             return;
@@ -2393,6 +2411,7 @@ mod tests {
     use crate::{
         backend::{Multiplexer, PaneInfo},
         config::Config,
+        herdr::Herdr,
         state::AgentState,
         tmux::Tmux,
     };
@@ -3005,6 +3024,107 @@ mod tests {
                 && bell.contains(&format!("#{id}")),
             "未読には read を促す: {bell}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_live_pane_survives_mirror_drift_and_gets_its_mirror_repaired() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut broker = registered_pair(&dir).await;
+        // %2 は生存しているが `@agent` mirror が消えている (drift)。
+        broker.mux = Multiplexer::new(
+            Some(Tmux::scripted(vec![
+                pane_info("%1", Some("codex")),
+                pane_info("%2", None),
+            ])),
+            None,
+        );
+        broker.reconcile(false).await;
+        assert!(
+            broker.state.agents.contains_key("%2"),
+            "mirror 欠落だけで生存 pane を evict してはならない"
+        );
+        let repairs: Vec<_> = broker
+            .mux
+            .tmux()
+            .unwrap()
+            .options
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(pane, key, _)| pane == "%2" && key == "@agent")
+            .map(|(_, _, value)| value.clone())
+            .collect();
+        assert_eq!(
+            repairs,
+            [Some("claude".to_owned())],
+            "memory を正として mirror を修復する"
+        );
+
+        // mirror が別名へ drift しても、registry (唯一の真実) が勝つ。
+        broker.mux = Multiplexer::new(
+            Some(Tmux::scripted(vec![
+                pane_info("%1", Some("codex")),
+                pane_info("%2", Some("cursor")),
+            ])),
+            None,
+        );
+        broker.reconcile(false).await;
+        assert!(broker.state.agents.contains_key("%2"));
+        assert_eq!(broker.state.agents["%2"].name, "claude");
+
+        // pane そのものが消えたときは従来どおり evict する。
+        broker.mux = Multiplexer::new(
+            Some(Tmux::scripted(vec![pane_info("%1", Some("codex"))])),
+            None,
+        );
+        broker.reconcile(false).await;
+        assert!(!broker.state.agents.contains_key("%2"));
+    }
+
+    #[tokio::test]
+    async fn failure_notices_survive_sender_mirror_drift() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut broker = registered_pair(&dir).await;
+        let original = json(&broker.handle(send_request("%1", "claude", "body")).await)["id"]
+            .as_u64()
+            .unwrap();
+        // 送信者 %1 は生存しているが mirror が欠落。宛先 %2 は消滅。
+        broker.mux = Multiplexer::new(Some(Tmux::scripted(vec![pane_info("%1", None)])), None);
+        assert!(
+            broker
+                .remove_agent("%2", "宛先エージェントが退出した")
+                .await
+        );
+        assert_eq!(
+            notices_for(&broker, original),
+            1,
+            "mirror drift した送信者にも失敗通知が届く (silent 退役の禁止)"
+        );
+        assert!(broker.state.message(original).unwrap().acked);
+    }
+
+    #[tokio::test]
+    async fn reconcile_defers_eviction_while_a_backend_is_unreachable() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut broker = registered_pair(&dir).await;
+        // herdr が応答しない間は、tmux 一覧に居ない %2 も evict しない
+        // (不完全な一覧を「不在」と読まない)。
+        broker.mux = Multiplexer::new(
+            Some(Tmux::scripted(vec![pane_info("%1", Some("codex"))])),
+            Some(Herdr::new("/nonexistent/herdr.sock".into())),
+        );
+        broker.reconcile(false).await;
+        assert!(
+            broker.state.agents.contains_key("%2"),
+            "backend 部分失敗中の evict は見送る"
+        );
+        // 全 backend が答えたら通常どおり evict する。
+        broker.mux = Multiplexer::new(
+            Some(Tmux::scripted(vec![pane_info("%1", Some("codex"))])),
+            None,
+        );
+        broker.reconcile(false).await;
+        assert!(!broker.state.agents.contains_key("%2"));
     }
 
     #[tokio::test]

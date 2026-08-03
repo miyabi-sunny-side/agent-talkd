@@ -1085,6 +1085,54 @@ impl Drop for McpSession {
 
 #[test]
 #[ignore = "requires permission to create a real tmux server"]
+fn mirror_drift_does_not_unregister_a_live_pane() {
+    let fixture = Fixture::new("drift", 2);
+    fixture.run(0, &["register", "codex"]);
+    fixture.run(1, &["register", "claude"]);
+
+    // 表示ミラー `@agent` だけを人為的に落とす (drift の再現)。
+    tmux(
+        fixture.name(),
+        &["set-option", "-p", "-t", &fixture.panes[1], "-u", "@agent"],
+    );
+    fixture.run(0, &["internal-reconcile"]);
+
+    // 生存 pane の登録は残り、会話も継続できる。
+    let who = fixture.run(0, &["who"]);
+    assert!(common::has_agent(&who, "claude"), "{who}");
+    let sent = fixture.run(0, &["send", "claude", "--no-reply", "--", "drift check"]);
+    assert!(sent.contains('#'), "{sent}");
+
+    // mirror は daemon memory を正として修復されている。
+    let repaired = text(tmux(
+        fixture.name(),
+        &[
+            "show-options",
+            "-p",
+            "-t",
+            &fixture.panes[1],
+            "-v",
+            "@agent",
+        ],
+    ));
+    assert_eq!(repaired.trim(), "claude");
+
+    // pane が本当に消えたときは従来どおり登録が外れる。
+    tmux(fixture.name(), &["kill-pane", "-t", &fixture.panes[1]]);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        fixture.run(0, &["internal-reconcile"]);
+        let who = fixture.run(0, &["who"]);
+        if !common::has_agent(&who, "claude") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "eviction timed out: {who}");
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+#[ignore = "requires permission to create a real tmux server"]
 #[allow(clippy::too_many_lines)]
 fn message_retention_follows_the_acknowledgement_contract() {
     let fixture = Fixture::new("ack", 3);

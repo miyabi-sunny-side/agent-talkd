@@ -20,7 +20,14 @@ pub struct Tmux {
     /// clone 間で共有されるので、broker へ渡した後からでも観測できる。
     #[cfg(test)]
     pub(crate) delivered: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    /// scripted モードで `set_option` された (pane, key, value) の記録 (test 専用)。
+    #[cfg(test)]
+    pub(crate) options: OptionLog,
 }
+
+/// (pane, key, value) の共有記録 (test 専用)。
+#[cfg(test)]
+type OptionLog = std::sync::Arc<std::sync::Mutex<Vec<(String, String, Option<String>)>>>;
 
 const MAX_CAPTURE_BYTES: usize = 1024 * 1024;
 
@@ -32,6 +39,8 @@ impl Tmux {
             scripted: None,
             #[cfg(test)]
             delivered: std::sync::Arc::default(),
+            #[cfg(test)]
+            options: std::sync::Arc::default(),
         }
     }
 
@@ -42,6 +51,7 @@ impl Tmux {
             socket: String::new(),
             scripted: Some(panes),
             delivered: std::sync::Arc::default(),
+            options: std::sync::Arc::default(),
         }
     }
 
@@ -72,6 +82,15 @@ impl Tmux {
     }
 
     pub async fn set_option(&self, pane: &str, key: &str, value: Option<&str>) -> Result<()> {
+        #[cfg(test)]
+        if self.scripted.is_some() {
+            self.options.lock().unwrap().push((
+                pane.to_owned(),
+                key.to_owned(),
+                value.map(str::to_owned),
+            ));
+            return Ok(());
+        }
         let mut args = vec!["set-option", "-p", "-t", pane];
         if value.is_none() {
             args.push("-u");

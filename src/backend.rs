@@ -113,6 +113,27 @@ impl Multiplexer {
     /// 「tmux は生きているが herdr を止めた」が普通に起きるため、
     /// 全体を失敗させると会話が全滅する。
     pub async fn panes(&self) -> Result<Vec<PaneInfo>> {
+        let (panes, failures, configured) = self.collect_panes().await;
+        if configured > 0 && failures == configured {
+            bail!("すべての multiplexer から pane 一覧を取得できません");
+        }
+        Ok(panes)
+    }
+
+    /// **全** backend が答えたときだけ pane 一覧を返す。
+    ///
+    /// reconcile の evict 判定用。片 backend が落ちた部分的な一覧を
+    /// 「pane 不在」と読むと、その backend の生存登録を全滅させてしまう。
+    /// 不完全な証拠では消さない — evict は次の完全な一覧まで見送る。
+    pub async fn panes_from_all_backends(&self) -> Result<Vec<PaneInfo>> {
+        let (panes, failures, _) = self.collect_panes().await;
+        if failures > 0 {
+            bail!("一部の multiplexer から pane 一覧を取得できません");
+        }
+        Ok(panes)
+    }
+
+    async fn collect_panes(&self) -> (Vec<PaneInfo>, u8, u8) {
         let mut panes = Vec::new();
         let mut failures = 0_u8;
         let mut configured = 0_u8;
@@ -137,10 +158,7 @@ impl Multiplexer {
                 }
             }
         }
-        if configured > 0 && failures == configured {
-            bail!("すべての multiplexer から pane 一覧を取得できません");
-        }
-        Ok(panes)
+        (panes, failures, configured)
     }
 
     /// pane id から backend を選んで配送する。
