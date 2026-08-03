@@ -30,7 +30,7 @@ use tokio::{
 use tracing::{error, info, warn};
 
 use crate::{
-    backend::{Multiplexer, PaneInfo},
+    backend::{BackendKind, Multiplexer, PaneInfo},
     config::{Config, is_safe_token},
     help,
     herdr::Herdr,
@@ -1905,12 +1905,14 @@ impl Broker {
                         .map(|agent| agent.name.clone())
                 })
                 .flatten()
-                .filter(|_| {
-                    // 生存判定は pane の存在だけ。名前は registry (唯一の真実) から
-                    // 引いた時点で確定しており、表示ミラー `@agent` の drift を理由に
-                    // 失敗通知を silent に退役させない。
+                .filter(|expected| {
+                    // 生存判定は backend 別 (`pane_backs_registration`)。tmux は
+                    // 表示ミラーの drift で失敗通知を silent に退役させない。
+                    // herdr は占有者が入れ替わった pane へ旧名宛て通知を送らない。
                     Some(sender.as_str()) != excluded_pane
-                        && panes.iter().any(|pane| pane.pane_id == sender)
+                        && panes.iter().any(|pane| {
+                            pane.pane_id == sender && pane_backs_registration(pane, expected)
+                        })
                 });
             let Some(expected) = sender_target else {
                 // 通知先が居ない場合も、残った `Pending` を terminal `Acked` にする。
@@ -2124,23 +2126,32 @@ impl Broker {
         let Ok(panes) = self.mux.panes_from_all_backends().await else {
             return;
         };
-        // evict の条件は **pane の消滅だけ**。daemon memory が唯一の真実であり、
+        // tmux の evict 条件は **pane の消滅だけ**。daemon memory が唯一の真実であり、
         // `@agent` は表示用ミラーにすぎない (docs/design.md「状態と配送」)。
         // ミラーの欠落・不一致を根拠に生存 pane の登録を消すと、drift のたびに
         // その pane は理由の表示なく MCP 全拒否になる。
+        // herdr は native identity の一致まで要求する (`pane_backs_registration`)。
         let stale: Vec<_> = self
             .state
             .agents
-            .keys()
-            .filter(|pane_id| !panes.iter().any(|pane| pane.pane_id == **pane_id))
-            .cloned()
+            .iter()
+            .filter(|(pane_id, agent)| {
+                !panes.iter().any(|pane| {
+                    pane.pane_id == **pane_id && pane_backs_registration(pane, &agent.name)
+                })
+            })
+            .map(|(pane, _)| pane.clone())
             .collect();
         for pane in stale {
             self.remove_agent(&pane, "宛先が不在の").await;
         }
         // 生存 pane のミラーが drift していたら、memory を正として修復する。
         // 修復失敗は表示の問題でしかないので warn に留める。
+        // 対象は tmux だけ — herdr の agent 欄はミラーではなく native identity。
         for pane in &panes {
+            if pane.backend != BackendKind::Tmux {
+                continue;
+            }
             if let Some(agent) = self.state.agents.get(&pane.pane_id)
                 && pane.agent.as_deref() != Some(agent.name.as_str())
             {
@@ -2293,6 +2304,20 @@ enum BriefMode {
     Normal,
     NoReply,
     External(u64),
+}
+
+/// pane がその登録の生存根拠になるか (backend 別)。
+///
+/// tmux の `PaneInfo.agent` は daemon 自身が書く表示ミラー (`@agent`) なので、
+/// 欠落・不一致は drift にすぎず pane の存在だけで生存とみなす (ミラーは修復する)。
+/// herdr の `PaneInfo.agent` は herdr が返す **native identity** で、pane ID は
+/// 位置依存のため占有者が入れ替わりうる。identity の一致まで要求しないと、
+/// 旧名宛ての通知を新しい占有者へ送り続けることになる。
+fn pane_backs_registration(pane: &PaneInfo, registered_name: &str) -> bool {
+    match pane.backend {
+        BackendKind::Tmux => true,
+        BackendKind::Herdr => pane.agent.as_deref() == Some(registered_name),
+    }
 }
 
 /// 先受け版号時代の旧 wire 名を canonical 名へ正規化する互換 alias。
@@ -3079,6 +3104,65 @@ mod tests {
         );
         broker.reconcile(false).await;
         assert!(!broker.state.agents.contains_key("%2"));
+    }
+
+    fn herdr_pane_info(pane_id: &str, agent: Option<&str>) -> PaneInfo {
+        PaneInfo {
+            backend: crate::backend::BackendKind::Herdr,
+            ..pane_info(pane_id, agent)
+        }
+    }
+
+    #[tokio::test]
+    async fn liveness_is_judged_per_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut broker = broker(
+            &dir,
+            vec![
+                pane_info("%1", Some("codex")),
+                herdr_pane_info("w1:p2", Some("claude")),
+            ],
+        );
+        for (pane, name) in [("%1", "codex"), ("w1:p2", "claude")] {
+            let response = broker
+                .handle(request("register", Some(pane), &[name]))
+                .await;
+            assert_eq!(response.code, 0, "{}", response.stderr);
+        }
+
+        // 判定表: tmux の agent 欄はミラー (欠落/別名でも生存)、
+        // herdr の agent 欄は native identity (欠落/別名は stale)。
+        for (tmux_agent, herdr_agent, herdr_survives) in [
+            (None, Some("claude"), true),
+            (Some("cursor"), Some("claude"), true),
+            (None, None, false),
+            (None, Some("cursor"), false),
+        ] {
+            broker.mux = Multiplexer::new(
+                Some(Tmux::scripted(vec![
+                    pane_info("%1", tmux_agent),
+                    herdr_pane_info("w1:p2", herdr_agent),
+                ])),
+                None,
+            );
+            broker.reconcile(false).await;
+            assert!(
+                broker.state.agents.contains_key("%1"),
+                "tmux ({tmux_agent:?}) はミラー drift で消えない"
+            );
+            assert_eq!(
+                broker.state.agents.contains_key("w1:p2"),
+                herdr_survives,
+                "herdr ({herdr_agent:?}) は native identity の一致で判定する"
+            );
+            if !herdr_survives {
+                // 次の周回のために登録を戻す。
+                let response = broker
+                    .handle(request("register", Some("w1:p2"), &["claude"]))
+                    .await;
+                assert_eq!(response.code, 0, "{}", response.stderr);
+            }
+        }
     }
 
     #[tokio::test]
