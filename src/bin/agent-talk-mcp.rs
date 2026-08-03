@@ -19,6 +19,19 @@ use std::process::ExitCode;
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    let mut args = std::env::args().skip(1);
+    if let Some(argument) = args.next() {
+        // serve は引数を取らない。`--version` だけを環境 contract の検査より先に
+        // 処理し (daemon との世代ずれの機械検出用)、それ以外の引数は server 起動へ
+        // 落とさず usage で拒否する。
+        return if argument == "--version" && args.next().is_none() {
+            println!("agent-talk-mcp {}", env!("CARGO_PKG_VERSION"));
+            ExitCode::SUCCESS
+        } else {
+            eprintln!("usage: agent-talk-mcp [--version]");
+            ExitCode::FAILURE
+        };
+    }
     match mcp::serve().await {
         Ok(()) => ExitCode::SUCCESS,
         // 環境が起動時 contract を満たさない場合はここで fail closed する。

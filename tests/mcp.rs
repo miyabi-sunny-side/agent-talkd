@@ -240,6 +240,32 @@ fn a_success_response_outside_the_contract_never_degrades_into_a_tool_success() 
 }
 
 #[test]
+fn version_flag_answers_without_any_environment_contract() {
+    // daemon との世代ずれの機械検出用。TMUX も XDG も無い環境で成立すること。
+    let output = mcp(&[]).arg("--version").output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        format!("agent-talk-mcp {}", env!("CARGO_PKG_VERSION"))
+    );
+}
+
+#[test]
+fn unexpected_arguments_are_rejected_before_the_server_starts() {
+    for args in [&["--help"][..], &["--version", "extra"][..]] {
+        let mut command = mcp(&[]);
+        command.args(args).stdin(Stdio::null());
+        let output = command.output().unwrap();
+        assert!(!output.status.success(), "{args:?} must be rejected");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("usage"),
+            "server 起動 (環境 contract 検査) へ落とさず usage で拒否する: {:?}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
 fn missing_or_malformed_startup_inputs_fail_closed_without_serving_tools() {
     let root = tempfile::tempdir().unwrap();
     let runtime = root.path().join("run");

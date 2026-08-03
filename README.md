@@ -57,8 +57,10 @@ install -m755 target/release/agent-talk-mcp ~/.local/bin/agent-talk-mcp
 ```
 
 このcrateは`agent-talk`（CLI・デーモン）と`agent-talk-mcp`（stdio MCP server）の
-2つのバイナリを作ります。リリースアーカイブと `agent-talk update` が扱うのは
-`agent-talk` だけなので、`agent-talk-mcp` はソースからビルドしてください。
+2つのバイナリを作ります。リリースアーカイブには両方が入っており、同じreleaseから
+取り出せば世代が揃います（`agent-talk-mcp --version` で確認できます）。
+`agent-talk update`（self-update）が置き換えるのは`agent-talk`自身だけなので、
+adapterはアーカイブ側から配置してください。
 
 フロントエンドのビルドにはNode.js 24とnpmを使います。`client/dist`を先に生成すると、
 続くCargoビルドがその静的ファイルを単一の`agent-talk`バイナリへ埋め込みます。
