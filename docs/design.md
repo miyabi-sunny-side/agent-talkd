@@ -122,6 +122,14 @@ mailbox選択時に履歴をresetし、手動更新では末尾IDを排他的`af
 
 ## 状態と配送
 
+herdr paneの表示・解決上のsession名は、herdr自身が持つworkspace **label**
+（`workspace.list`、tmux session名の意味的対応物）を使い、labelが無い・
+宛先構文と衝突する場合はworkspace_idへfallbackする。workspace_idは互換alias
+として解決だけに残す。宛先は`[backend/]scope/name`文法で、backend修飾
+（`tmux/…`・`herdr/…`）が同名scopeの衝突を一意化する正式名称、bare名は
+自backend限定の近接解決である。bridgeはlabelをread-onlyで消費し、
+`workspace.rename`を呼ばない。
+
 daemonのメモリを稼働中の唯一の真実とし、`@agent` と `@agent_state` は
 既存hookとの互換性を保つ表示用ミラーです。daemon起動時は`@agent`だけを
 登録復旧のヒントとして読み、stateは必ずidleに倒します。stale busyには

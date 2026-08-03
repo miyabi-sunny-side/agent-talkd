@@ -345,9 +345,21 @@ herdr の pane の中に居る場合（`HERDR_PANE_ID` / `HERDR_SOCKET_PATH` が
 
 pane id は tmux が `%5`、herdr が `w1:p2` で形式が交わらないため、
 1 つの registry に混ぜても曖昧になりません。宛先に pane id を直接
-指定する場合は両方の形式が使えます。ただし **tmux の session と herdr の
-workspace は別の名前空間**なので、backend をまたぐときは
-`w1/codex` のような明示 scope か pane id が必要です。
+指定する場合は両方の形式が使えます。
+
+herdr の workspace には人間向けの **label** があり (`workspace.list`)、
+tmux の session 名の対応物として表示 (`who` の location、`:5002` UI) と
+宛先解決の両方に使います。`knowledge/codex` のような **label/agent 形は
+どの backend からでも**引けます。label の無い workspace と旧来の
+`w2/codex` 形は workspace_id で引き続き解決できます。`/`・`:`・空白を
+含む label は宛先構文と衝突するため採用せず、workspace_id 表示へ
+fallback します (rename は次回取得で自動追従)。
+
+tmux の session と herdr の label が同名になった場合は、**正式名称
+`tmux/<scope>/<name>` / `herdr/<scope>/<name>`** で一意に指定します
+(素の `<scope>/<name>` は曖昧エラーになり、正式名称を案内します)。
+素の `codex` のような bare 名は**自分と同じ backend だけ**を近接規則
+(同 window → 同 session) で探し、backend を暗黙にまたぎません。
 
 herdr への配送は、herdr が **idle と積極的に判定した pane にだけ**、
 `agent.prompt` で agent 本人へ submit まで行います（agent が居ない pane には

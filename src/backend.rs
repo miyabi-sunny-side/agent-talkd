@@ -58,7 +58,12 @@ fn digits(value: &str) -> bool {
 /// backend 非依存の pane 情報。既存の宛先解決 (`session/agent`) はこの形のまま動く。
 #[derive(Debug, Clone)]
 pub struct PaneInfo {
+    /// 表示と scope 解決の主名。tmux は session 名、herdr は workspace label
+    /// (label が使えないときは `workspace_id` へ fallback)。
     pub session: String,
+    /// scope 解決の互換 alias。herdr で label を主名にしたときの `workspace_id`。
+    /// 旧来の `w2/codex` 形を壊さないために解決だけに使い、表示には使わない。
+    pub scope_alias: Option<String>,
     pub window_id: String,
     pub pane_id: String,
     pub cwd: String,
@@ -297,8 +302,17 @@ fn herdr_pane_info(pane: crate::herdr::HerdrPane) -> PaneInfo {
         .pane_id
         .rsplit_once(":p")
         .map_or_else(|| pane.pane_id.clone(), |(_, index)| index.to_owned());
+    let scope_alias = pane
+        .workspace_label
+        .is_some()
+        .then(|| pane.workspace_id.clone());
     PaneInfo {
-        session: pane.workspace_id.clone(),
+        // 人間が知っている名前 (workspace label) を tmux の session 名の対応物に
+        // する。label が無い workspace は従来どおり workspace_id。
+        session: pane
+            .workspace_label
+            .unwrap_or_else(|| pane.workspace_id.clone()),
+        scope_alias,
         window_id: pane.tab_id,
         pane_id: pane.pane_id,
         cwd: pane.cwd,
@@ -338,12 +352,27 @@ mod tests {
             pane_id: "w2:p3".into(),
             terminal_id: "term_x".into(),
             workspace_id: "w2".into(),
+            workspace_label: Some("knowledge".into()),
             tab_id: "w2:t1".into(),
             cwd: "/home/miyabi/projects/agent-talkd".into(),
             agent: Some("codex".into()),
             status: AgentStatus::Blocked,
         });
-        assert_eq!(info.session, "w2");
+        // 人間向けの label が主名、workspace_id は互換 alias。
+        assert_eq!(info.session, "knowledge");
+        assert_eq!(info.scope_alias.as_deref(), Some("w2"));
+        let unlabeled = herdr_pane_info(crate::herdr::HerdrPane {
+            pane_id: "w9:p1".into(),
+            terminal_id: "term_y".into(),
+            workspace_id: "w9".into(),
+            workspace_label: None,
+            tab_id: "w9:t1".into(),
+            cwd: "/tmp".into(),
+            agent: None,
+            status: AgentStatus::Unknown,
+        });
+        assert_eq!(unlabeled.session, "w9");
+        assert_eq!(unlabeled.scope_alias, None);
         assert_eq!(info.window_id, "w2:t1");
         assert_eq!(info.window_index, "1");
         assert_eq!(info.pane_index, "3");

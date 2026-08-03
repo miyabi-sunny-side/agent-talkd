@@ -130,6 +130,13 @@ fn serve_one(stream: UnixStream, recorded: &Arc<Mutex<Vec<Value>>>, status: &Arc
     let result = match method.as_str() {
         "ping" => json!({"type": "pong", "version": "0.7.5", "protocol": 17}),
         "pane.list" => json!({"type": "pane_list", "panes": [pane]}),
+        // 実機封筒 (2026-08-03 採取): workspace の人間向け名は label に入る。
+        "workspace.list" => json!({
+            "type": "workspace_list",
+            "workspaces": [
+                {"workspace_id": "w1", "number": 1, "label": "knowledge", "focused": true},
+            ],
+        }),
         // 実 herdr は method 別の封筒を持つ (2026-08-03 実機採取)。
         // pane.get の中身は result.pane にネストする。
         "pane.get" => json!({"type": "pane", "pane": pane}),
@@ -358,6 +365,10 @@ fn one_daemon_bridges_tmux_and_herdr_and_serves_mobile_over_tcp() {
     // backend 列は「どの agent がどちらに居るか」まで含めて確かめる。
     assert_eq!(common::agent_backend(&who, "claude"), Some("tmux"), "{who}");
     assert_eq!(common::agent_backend(&who, "codex"), Some("herdr"), "{who}");
+    assert!(
+        who.contains("knowledge:"),
+        "location は workspace label で表示される: {who}"
+    );
 
     // 逆向きも成立する: herdr 側のクライアントから tmux 側の agent が見える。
     let who_from_herdr = harness.ok(&harness.as_herdr_pane(&["who"]));
@@ -371,8 +382,15 @@ fn one_daemon_bridges_tmux_and_herdr_and_serves_mobile_over_tcp() {
     // 宛先は pane id で明示する。tmux の session と herdr の workspace は別の
     // 名前空間であり、「セッションを跨ぐ暗黙の解決はしない」という既存契約が
     // そのまま効くため、backend をまたぐときは明示 scope が要る。
-    let sent = harness.ok(&harness.as_tmux_pane(&["send", "w1:p1", "--", "cross backend hello"]));
-    assert!(sent.contains("w1:p1"), "{sent}");
+    // 宛先は pane id ではなく **workspace label** で引く (user 目的:
+    // 「何処からでも knowledge/codex をすぐに見つけられる」)。
+    let sent = harness.ok(&harness.as_tmux_pane(&[
+        "send",
+        "knowledge/codex",
+        "--",
+        "cross backend hello",
+    ]));
+    assert!(sent.contains("w1:p1"), "label が pane に解決される: {sent}");
     wait_for(|| !harness.herdr.prompts().is_empty());
     let (target, bell) = harness.herdr.prompts().remove(0);
     // 呼び鈴は agent.prompt として正しい pane の agent へ届く (send_text では

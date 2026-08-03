@@ -68,6 +68,7 @@ impl Tmux {
                 let fields: Vec<_> = line.split('\t').collect();
                 (fields.len() == 7).then(|| PaneInfo {
                     session: fields[0].into(),
+                    scope_alias: None,
                     window_id: fields[1].into(),
                     pane_id: fields[2].into(),
                     cwd: fields[3].into(),

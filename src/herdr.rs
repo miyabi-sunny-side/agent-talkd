@@ -74,6 +74,9 @@ pub struct HerdrPane {
     pub pane_id: String,
     pub terminal_id: String,
     pub workspace_id: String,
+    /// workspace の人間向け名 (`workspace.list` の label)。tmux の session 名の
+    /// 意味的対応物。未設定・宛先構文と衝突する文字を含む場合は `None`。
+    pub workspace_label: Option<String>,
     pub tab_id: String,
     pub cwd: String,
     pub agent: Option<String>,
@@ -105,7 +108,36 @@ impl Herdr {
             .get("panes")
             .and_then(Value::as_array)
             .context("herdr pane.list に panes がありません")?;
-        Ok(panes.iter().filter_map(parse_pane).collect())
+        // workspace の label (人間向け名) を引く。取得失敗は pane 列挙を
+        // 失敗させず、label なし (workspace_id 表示) へ劣化させる。
+        // rename は次回の取得で自然に追従する (bridge は read-only 消費のみ)。
+        let labels = self.workspace_labels().await.unwrap_or_default();
+        Ok(panes
+            .iter()
+            .filter_map(parse_pane)
+            .map(|mut pane| {
+                pane.workspace_label = labels.get(&pane.workspace_id).cloned();
+                pane
+            })
+            .collect())
+    }
+
+    /// `workspace.list` から `workspace_id` → label の対応を作る。
+    /// 宛先構文 (`scope/name`, `w1:p2`) と誤解される文字を含む label は捨てる。
+    async fn workspace_labels(&self) -> Result<std::collections::HashMap<String, String>> {
+        let result = self.call("workspace.list", json!({})).await?;
+        let workspaces = result
+            .get("workspaces")
+            .and_then(Value::as_array)
+            .context("herdr workspace.list に workspaces がありません")?;
+        Ok(workspaces
+            .iter()
+            .filter_map(|workspace| {
+                let id = workspace.get("workspace_id")?.as_str()?;
+                let label = workspace.get("label")?.as_str()?;
+                usable_label(label).then(|| (id.to_owned(), label.to_owned()))
+            })
+            .collect())
     }
 
     /// idle と確認できた pane の **agent** にだけ呼び鈴を届ける。
@@ -220,11 +252,21 @@ fn parse_pane(value: &Value) -> Option<HerdrPane> {
         pane_id: field("pane_id")?,
         terminal_id: field("terminal_id").unwrap_or_default(),
         workspace_id: field("workspace_id").unwrap_or_default(),
+        workspace_label: None,
         tab_id: field("tab_id").unwrap_or_default(),
         cwd: field("cwd").unwrap_or_default(),
         agent: field("agent").filter(|agent| !agent.is_empty()),
         status: status_from(value),
     })
+}
+
+/// 宛先・表示に安全に使える label か。`/` は scope 区切り、`:` は pane id 形式、
+/// 空白は表の列区切りと衝突するため拒否する (拒否時は `workspace_id` へ fallback)。
+fn usable_label(label: &str) -> bool {
+    !label.is_empty()
+        && !label
+            .chars()
+            .any(|c| c == '/' || c == ':' || c.is_whitespace())
 }
 
 #[cfg(test)]
@@ -492,6 +534,56 @@ mod tests {
             vec!["pane.get"],
             "壊れた応答でも入力系 API を発行してはならない"
         );
+    }
+
+    /// workspace.list の label が pane に結び付き、宛先構文と衝突する label は
+    /// `workspace_id` へ fallback する。workspace.list の失敗は pane 列挙を壊さない。
+    #[tokio::test]
+    async fn workspace_labels_join_panes_and_unusable_labels_fall_back() {
+        let fake = FakeHerdr::start(|method, _| match method {
+            "pane.list" => ok(&json!({
+                "type": "pane_list",
+                "panes": [
+                    pane("w1:p1", "codex", "idle"),
+                    pane("w2:p1", "claude", "idle"),
+                    pane("w3:p1", "cursor", "idle"),
+                    pane("w4:p1", "gemini", "idle"),
+                ],
+            })),
+            // 実機封筒 (2026-08-03 採取): result.workspaces[] に label が入る。
+            "workspace.list" => ok(&json!({
+                "type": "workspace_list",
+                "workspaces": [
+                    {"workspace_id": "w1", "number": 1, "label": "knowledge"},
+                    {"workspace_id": "w2", "number": 2, "label": "has space"},
+                    {"workspace_id": "w3", "number": 3, "label": "a/b"},
+                    {"workspace_id": "w4", "number": 4, "label": ""},
+                ],
+            })),
+            _ => ok(&json!({})),
+        });
+        let panes = fake.client().panes().await.unwrap();
+        assert_eq!(panes[0].workspace_label.as_deref(), Some("knowledge"));
+        // 空白 / `/` / 空文字の label は宛先構文と衝突するので採用しない。
+        assert_eq!(panes[1].workspace_label, None);
+        assert_eq!(panes[2].workspace_label, None);
+        assert_eq!(panes[3].workspace_label, None);
+
+        // workspace.list が失敗しても pane 列挙は劣化継続 (label なし)。
+        let degraded = FakeHerdr::start(|method, _| match method {
+            "pane.list" => ok(&json!({
+                "type": "pane_list",
+                "panes": [pane("w1:p1", "codex", "idle")],
+            })),
+            "workspace.list" => json!({
+                "id": "agent-talkd",
+                "error": {"code": "internal", "message": "boom"},
+            }),
+            _ => ok(&json!({})),
+        });
+        let panes = degraded.client().panes().await.unwrap();
+        assert_eq!(panes.len(), 1);
+        assert_eq!(panes[0].workspace_label, None);
     }
 
     /// herdr の error 応答を握り潰さない。

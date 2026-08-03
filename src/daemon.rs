@@ -1832,9 +1832,23 @@ impl Broker {
                     Response::error(format!("pane {addr} は @agent 登録されていません"))
                 });
         }
-        let (scope, name) = addr
+        // 正式名称 `tmux/<scope>/<name>` / `herdr/<scope>/<name>`。tmux の session と
+        // herdr の workspace label が同名でも一意に指せる (user 指定の正式形)。
+        let (backend, rest) = match addr.split_once('/') {
+            Some((prefix, rest)) if rest.contains('/') => match prefix {
+                "tmux" => (Some(BackendKind::Tmux), rest),
+                "herdr" => (Some(BackendKind::Herdr), rest),
+                other => {
+                    return Err(Response::error(format!(
+                        "backend '{other}' は不明です (tmux/<scope>/<name> か herdr/<scope>/<name>)"
+                    )));
+                }
+            },
+            _ => (None, addr),
+        };
+        let (scope, name) = rest
             .split_once('/')
-            .map_or((None, addr), |(scope, name)| (Some(scope), name));
+            .map_or((None, rest), |(scope, name)| (Some(scope), name));
         let mut candidates: Vec<_> = panes
             .iter()
             .filter(|pane| Some(pane.pane_id.as_str()) != self_pane)
@@ -1846,13 +1860,23 @@ impl Broker {
                     .map(|agent| (pane, agent))
             })
             .collect();
+        if let Some(backend) = backend {
+            candidates.retain(|(pane, _)| pane.backend == backend);
+        }
         if let Some(scope) = scope {
+            // 主名 (tmux session / herdr label)、herdr の workspace_id alias
+            // (`w2/codex` の後方互換)、cwd の basename のどれでも引ける。
             candidates.retain(|(pane, _)| {
-                pane.session == scope || Path::new(&pane.cwd).file_name() == Some(OsStr::new(scope))
+                pane.session == scope
+                    || pane.scope_alias.as_deref() == Some(scope)
+                    || Path::new(&pane.cwd).file_name() == Some(OsStr::new(scope))
             });
         } else if let Some(self_pane) = self_pane
             && let Some(origin) = panes.iter().find(|pane| pane.pane_id == self_pane)
         {
+            // bare 名は**自 backend 限定** — herdr label と tmux session の同名を
+            // 暗黙に跨いで誤配しない。他 backend は scope か正式名称で明示する。
+            candidates.retain(|(pane, _)| pane.backend == origin.backend);
             let same_window: Vec<_> = candidates
                 .iter()
                 .copied()
@@ -1878,7 +1902,7 @@ impl Broker {
             }
             _ => {
                 let mut stderr = format!(
-                    "agent-talk: 宛先 '{addr}' の候補が複数あります。<scope>/<name> で指定してください:\n"
+                    "agent-talk: 宛先 '{addr}' の候補が複数あります。<scope>/<name> か、backend を跨ぐ同名なら tmux/<scope>/<name> ・ herdr/<scope>/<name> で指定してください:\n"
                 );
                 for (pane, agent) in candidates {
                     stderr.push_str(&pretty(agent.name.as_str(), agent.state, pane));
@@ -2488,6 +2512,7 @@ mod tests {
     fn pane_info(pane_id: &str, agent: Option<&str>) -> PaneInfo {
         PaneInfo {
             session: "test".into(),
+            scope_alias: None,
             window_id: "@0".into(),
             pane_id: pane_id.into(),
             cwd: "/tmp".into(),
@@ -3093,6 +3118,103 @@ mod tests {
                 && bell.contains(&format!("#{id}")),
             "未読には read を促す: {bell}"
         );
+    }
+
+    #[tokio::test]
+    async fn cross_backend_scopes_resolve_by_label_alias_and_formal_name() {
+        let dir = tempfile::tempdir().unwrap();
+        // tmux session "settings" と herdr label "settings" が同名で共存し、
+        // herdr には label "knowledge" (workspace_id w2) も居る、という実在の配置。
+        let tmux_codex = PaneInfo {
+            session: "settings".into(),
+            ..pane_info("%1", Some("codex"))
+        };
+        let tmux_claude = PaneInfo {
+            session: "settings".into(),
+            ..pane_info("%2", Some("claude"))
+        };
+        let herdr_codex = PaneInfo {
+            session: "settings".into(),
+            scope_alias: Some("w1".into()),
+            window_id: "w1:t1".into(),
+            backend: crate::backend::BackendKind::Herdr,
+            ..pane_info("w1:p1", Some("codex"))
+        };
+        let herdr_claude = PaneInfo {
+            session: "knowledge".into(),
+            scope_alias: Some("w2".into()),
+            window_id: "w2:t1".into(),
+            cwd: "/home/miyabi/.local/share/arona-knowledge".into(),
+            backend: crate::backend::BackendKind::Herdr,
+            ..pane_info("w2:p1", Some("claude"))
+        };
+        let mut broker = broker(
+            &dir,
+            vec![tmux_codex, tmux_claude, herdr_codex, herdr_claude],
+        );
+        for (pane, name) in [
+            ("%1", "codex"),
+            ("%2", "claude"),
+            ("w1:p1", "codex"),
+            ("w2:p1", "claude"),
+        ] {
+            let response = broker
+                .handle(request("register", Some(pane), &[name]))
+                .await;
+            assert_eq!(response.code, 0, "{}", response.stderr);
+        }
+
+        // label で backend を跨いで引ける (user 目的の本丸)。
+        let resolved = broker
+            .resolve("knowledge/claude", Some("%1"))
+            .await
+            .unwrap();
+        assert_eq!(resolved.0, "w2:p1");
+        // workspace_id alias の後方互換。
+        let resolved = broker.resolve("w2/claude", Some("%1")).await.unwrap();
+        assert_eq!(resolved.0, "w2:p1");
+        // cwd basename でも従来どおり。
+        let resolved = broker
+            .resolve("arona-knowledge/claude", Some("%1"))
+            .await
+            .unwrap();
+        assert_eq!(resolved.0, "w2:p1");
+
+        // backend を跨いだ同名 scope は曖昧 fail + 正式名称の案内。
+        let error = broker
+            .resolve("settings/codex", Some("%2"))
+            .await
+            .unwrap_err();
+        assert!(
+            error.stderr.contains("tmux/<scope>/<name>"),
+            "{}",
+            error.stderr
+        );
+        // 正式名称なら一意。
+        let resolved = broker
+            .resolve("tmux/settings/codex", Some("%2"))
+            .await
+            .unwrap();
+        assert_eq!(resolved.0, "%1");
+        let resolved = broker
+            .resolve("herdr/settings/codex", Some("%2"))
+            .await
+            .unwrap();
+        assert_eq!(resolved.0, "w1:p1");
+        // 不明な backend は明示エラー。
+        let error = broker
+            .resolve("wayland/settings/codex", Some("%2"))
+            .await
+            .unwrap_err();
+        assert!(error.stderr.contains("不明"), "{}", error.stderr);
+
+        // bare 名は自 backend 限定: tmux の %2 から "codex" は herdr の
+        // settings (w1:p1) を拾わず、同 session の %1 に一意化する。
+        let resolved = broker.resolve("codex", Some("%2")).await.unwrap();
+        assert_eq!(resolved.0, "%1");
+        // herdr 側からの bare 名も tmux を拾わない (同 session 候補なし = 不在)。
+        let error = broker.resolve("claude", Some("w1:p1")).await.unwrap_err();
+        assert!(error.stderr.contains("見つかりません"), "{}", error.stderr);
     }
 
     #[tokio::test]
