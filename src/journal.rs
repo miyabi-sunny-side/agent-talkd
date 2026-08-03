@@ -39,6 +39,14 @@ pub enum Record {
         /// 黙って無視するため読み出し互換も保たれる。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         retires: Option<u64>,
+        /// `retires` に加えて、同じ append で terminal `Acked` にする ID 群。
+        ///
+        /// 未受領通知を送信元ごとに1通へ集約するとき、回収した original 全件の
+        /// 退役を通知の永続化と同一 append に保つために必要 (atomicity の理由は
+        /// `retires` と同じ)。`retires` を list へ型変更すると旧 daemon が新 journal を
+        /// 読めなくなるため、未知フィールドとして無視される別 field にしている。
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        also_retires: Vec<u64>,
     },
     Complete {
         pane: String,
@@ -220,6 +228,7 @@ impl Journal {
                     message: stored.message.clone(),
                     // retire 関係は replay 済み。snapshot では独立した Consumed で表す。
                     retires: None,
+                    also_retires: Vec::new(),
                 },
             )?;
             if stored.delivered {
@@ -302,11 +311,12 @@ fn replay(state: &mut BrokerState, record: Record) {
             pane,
             mut message,
             retires,
+            also_retires,
         } => {
             migrate_legacy_brief(&mut message);
             state.restore_message(pane, message);
-            // 1レコードなので、通知の復元と original の退役は必ず同時に起きる。
-            if let Some(retired) = retires {
+            // 1レコードなので、通知の復元と originals の退役は必ず同時に起きる。
+            for retired in retires.into_iter().chain(also_retires) {
                 state.ack(retired);
             }
         }
@@ -330,7 +340,7 @@ fn migrate_legacy_brief(message: &mut Message) {
             )
         });
         message.bell = format!(
-            "[agent-talk] 依頼が届きました。agent-talk read {} で本文を確認して対応してください。",
+            "[agent-talk] 依頼が届きました。read_message {} で本文を確認し、作業前に ack_message で受領報告してから対応してください。",
             message.id
         );
     }
@@ -372,6 +382,7 @@ mod tests {
                     pane: "%1".into(),
                     message: message(7, "brief"),
                     retires: None,
+                    also_retires: Vec::new(),
                 })
                 .unwrap();
             journal
@@ -407,12 +418,17 @@ mod tests {
                     pane: "%1".into(),
                     message: message(7, &brief_path.to_string_lossy()),
                     retires: None,
+                    also_retires: Vec::new(),
                 })
                 .unwrap();
         }
         let (_, state) = Journal::open(journal_path).unwrap();
         assert_eq!(state.message(7).unwrap().message.brief, "# legacy body\n");
-        assert!(state.message(7).unwrap().message.bell.contains("read 7"));
+        let bell = &state.message(7).unwrap().message.bell;
+        assert!(
+            bell.contains("read_message 7") && bell.contains("ack_message"),
+            "旧 journal からの復元も MCP 文言の呼び鈴になる: {bell}"
+        );
     }
 
     #[test]
@@ -465,6 +481,7 @@ mod tests {
                     pane: "%1".into(),
                     message: state.message(id).unwrap().message.clone(),
                     retires: None,
+                    also_retires: Vec::new(),
                 })
                 .unwrap();
             state.complete_delivery("%1", id);
@@ -539,6 +556,7 @@ mod tests {
                 pane: "%1".into(),
                 message: state.message(id).unwrap().message.clone(),
                 retires: None,
+                also_retires: Vec::new(),
             })
             .unwrap();
         journal.append(&Record::Consumed { id }).unwrap();
@@ -577,6 +595,7 @@ mod tests {
                 pane: "%2".into(),
                 message: state.message(failure_id).unwrap().message.clone(),
                 retires: None,
+                also_retires: Vec::new(),
             })
             .unwrap();
         journal
@@ -650,6 +669,7 @@ mod tests {
                 pane: "%1".into(),
                 message: state.message(id).unwrap().message.clone(),
                 retires: None,
+                also_retires: Vec::new(),
             })
             .unwrap();
         noise(&mut journal, 255);
@@ -729,6 +749,7 @@ mod tests {
                     pane: "%1".into(),
                     message: state.message(id).unwrap().message.clone(),
                     retires: None,
+                    also_retires: Vec::new(),
                 })
                 .unwrap();
             journal

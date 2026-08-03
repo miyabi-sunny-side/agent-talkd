@@ -16,6 +16,10 @@ pub struct Tmux {
     /// production build にはこのフィールド自体が存在しない。
     #[cfg(test)]
     scripted: Option<Vec<PaneInfo>>,
+    /// scripted モードで `deliver` された (pane, bell) の記録 (test 専用)。
+    /// clone 間で共有されるので、broker へ渡した後からでも観測できる。
+    #[cfg(test)]
+    pub(crate) delivered: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
 }
 
 const MAX_CAPTURE_BYTES: usize = 1024 * 1024;
@@ -26,6 +30,8 @@ impl Tmux {
             socket,
             #[cfg(test)]
             scripted: None,
+            #[cfg(test)]
+            delivered: std::sync::Arc::default(),
         }
     }
 
@@ -35,6 +41,7 @@ impl Tmux {
         Self {
             socket: String::new(),
             scripted: Some(panes),
+            delivered: std::sync::Arc::default(),
         }
     }
 
@@ -79,7 +86,10 @@ impl Tmux {
     pub async fn deliver(&self, pane: &str, bell: &str) -> Result<()> {
         #[cfg(test)]
         if self.scripted.is_some() {
-            let _ = (pane, bell);
+            self.delivered
+                .lock()
+                .unwrap()
+                .push((pane.to_owned(), bell.to_owned()));
             return Ok(());
         }
         self.set_option(pane, "@agent_state", Some("busy")).await?;

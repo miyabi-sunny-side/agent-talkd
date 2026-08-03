@@ -67,8 +67,16 @@ pub struct StoredMessage {
     /// 製品用語では `Acked`（受領報告済み = 削除対象）。
     /// journal の wire tag は旧 daemon 互換のため `Record::Consumed` のまま維持している
     /// (docs/decisions/0002-message-retention-ack.md「journal 形式と旧データの移行」)。
-    /// `false` が `Pending`。**読んだかどうかは記録しない。**
+    /// `false` が `Pending`。
     pub acked: bool,
+    /// 読了 (`read` / `read-v1` が本文を返した)。受領催促の文言分岐にだけ使う。
+    /// **memory のみ**で journal には残さない。restart 後は未読へ戻るが、
+    /// 催促文言が保守側 (「未読なら読んでくれ」) に倒れるだけで害がない。
+    pub read: bool,
+    /// 配達完了時刻。受領催促のタイマー起点 (memory のみ。restart で今から数え直す)。
+    pub delivered_at: Option<tokio::time::Instant>,
+    /// 最後に受領催促を送った時刻 (memory のみ)。
+    pub last_nag_at: Option<tokio::time::Instant>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -184,6 +192,9 @@ impl BrokerState {
                 target_pane: pane.to_owned(),
                 delivered: false,
                 acked: false,
+                read: false,
+                delivered_at: None,
+                last_nag_at: None,
             },
         );
         Ok(dispatch)
@@ -266,6 +277,14 @@ impl BrokerState {
             && stored.target_pane == pane
         {
             stored.delivered = true;
+            stored.delivered_at = Some(tokio::time::Instant::now());
+        }
+    }
+
+    /// 読了を記録する (`read` / `read-v1` が本文を返したとき)。
+    pub fn mark_read(&mut self, id: u64) {
+        if let Some(stored) = self.messages.get_mut(&id) {
+            stored.read = true;
         }
     }
 
@@ -326,6 +345,9 @@ impl BrokerState {
                 target_pane: pane,
                 delivered: false,
                 acked: false,
+                read: false,
+                delivered_at: None,
+                last_nag_at: None,
             },
         );
     }
@@ -345,6 +367,7 @@ impl BrokerState {
     pub fn requeue_after_delivery_failure(&mut self, pane: &str, id: u64) {
         if let Some(stored) = self.messages.get_mut(&id) {
             stored.delivered = false;
+            stored.delivered_at = None;
         }
         if let Some(agent) = self.agents.get_mut(pane) {
             agent.state = AgentState::Idle;
@@ -352,7 +375,7 @@ impl BrokerState {
         }
     }
 
-    /// pane 宛の **未受領 (`Pending`) 全件**。読了は記録しないので「未読だけ」は判定できない
+    /// pane 宛の **未受領 (`Pending`) 全件**。読了済みかどうかは問わない
     /// (docs/decisions/0002-message-retention-ack.md「pane 消滅時の掃除」)。
     pub fn messages_for_target(&self, pane: &str) -> Vec<Message> {
         self.messages

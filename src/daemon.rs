@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     env,
     ffi::OsStr,
     fmt::Write as _,
@@ -43,6 +44,13 @@ use crate::{
 };
 
 const MAX_BODY_BYTES: usize = 1024 * 1024;
+
+/// 配達完了からこの時間 ack が無ければ受領催促を送る
+/// (docs/design.md「受領報告と保持」の催促契約)。
+const NAG_AFTER: std::time::Duration = std::time::Duration::from_mins(1);
+
+/// 受領催促の再送間隔。連打で pane を荒らさないための下限。
+const NAG_COOLDOWN: std::time::Duration = std::time::Duration::from_mins(5);
 
 /// MCP adapter 経由の操作は、呼び出し元 pane が登録済み agent であることを要求する。
 /// `TMUX_PANE` は routing metadata でしかないが、**未登録 pane を拒否する既存境界は
@@ -262,6 +270,7 @@ mod embedded {
     include!(concat!(env!("OUT_DIR"), "/web_assets.rs"));
 }
 
+#[allow(clippy::too_many_lines)]
 pub async fn run(config: Config) -> Result<()> {
     init_logging(&config.log, &config.log_level)?;
     if let Some(parent) = config.rpc_socket().parent() {
@@ -338,7 +347,10 @@ pub async fn run(config: Config) -> Result<()> {
             // 設定された backend が **すべて** 落ちたときだけ停止する。
             // 片方だけ落ちても、もう片方に居る agent の会話は続く。
             Event::ServerCheck => match mux.still_serving(&baseline).await {
-                Ok(true) => failed_health_checks = 0,
+                Ok(true) => {
+                    failed_health_checks = 0;
+                    broker.nag_unacked().await;
+                }
                 Ok(false) => break,
                 Err(error) => {
                     failed_health_checks += 1;
@@ -1335,11 +1347,11 @@ impl Broker {
             |id| {
                 if intent.no_reply() {
                     format!(
-                        "{skill_prefix}[agent-talk] {from_agent} から連絡が届きました。agent-talk read {id} で本文を確認してください。返信は不要です。"
+                        "{skill_prefix}[agent-talk] {from_agent} から連絡が届きました。read_message {id} で本文を確認し、ack_message で受領報告してください。返信は不要です。"
                     )
                 } else {
                     format!(
-                        "{skill_prefix}[agent-talk] {from_agent} から依頼が届きました。agent-talk read {id} で本文を確認して対応してください。"
+                        "{skill_prefix}[agent-talk] {from_agent} から依頼が届きました。read_message {id} で本文を確認し、作業前に ack_message で受領報告してから対応してください。"
                     )
                 }
             },
@@ -1409,6 +1421,7 @@ impl Broker {
                     pane: pane.clone(),
                     message,
                     retires: None,
+                    also_retires: Vec::new(),
                 }) {
                     if matches!(dispatch, Dispatch::Deliver(_)) {
                         self.state.set_state(&pane, AgentState::Idle);
@@ -1507,30 +1520,44 @@ impl Broker {
         MessageAccess::Pending(stored)
     }
 
-    /// 本文を返すだけで状態を変えない。受領報告が来るまで何度でも読める。
-    fn read(&self, request: &Request) -> Response {
+    /// 本文を返し、読了だけを記録する。受領報告が来るまで何度でも読める。
+    fn read(&mut self, request: &Request) -> Response {
         let (id, pane) = match request_target(request, "read") {
             Ok(target) => target,
             Err(response) => return response,
         };
-        match self.access(id, &pane) {
-            MessageAccess::Pending(stored) => Response::ok(stored.message.brief.clone()),
-            other => Response::error(other.reject_reason(id)),
+        let brief = match self.access(id, &pane) {
+            MessageAccess::Pending(stored) => Ok(stored.message.brief.clone()),
+            other => Err(other.reject_reason(id)),
+        };
+        match brief {
+            Ok(brief) => {
+                self.state.mark_read(id);
+                Response::ok(brief)
+            }
+            Err(reason) => Response::error(reason),
         }
     }
 
     /// 構造化 read。MCP adapter の `read_message` が使う。
-    fn read_json(&self, request: &Request) -> Response {
+    fn read_json(&mut self, request: &Request) -> Response {
         let (id, pane) = match request_target(request, "read-v1") {
             Ok(target) => target,
             Err(response) => return response,
         };
-        match self.access(id, &pane) {
+        let payload = match self.access(id, &pane) {
             MessageAccess::Pending(stored) => {
                 // 送信時点で捕捉した名前を返す。現在のレジストリを引き直さない。
                 let from = stored.message.sender_label().to_owned();
                 // 返信先は、捕捉時と同じ identity で今も登録中の pane のときだけ。
                 let reply_to = self.state.reply_target(&stored.message);
+                Ok((from, reply_to, stored.message.brief.clone()))
+            }
+            other => Err(other.reject_reason(id)),
+        };
+        match payload {
+            Ok((from, reply_to, body)) => {
+                self.state.mark_read(id);
                 Response::ok(format!(
                     "{}\n",
                     serde_json::json!({
@@ -1538,11 +1565,11 @@ impl Broker {
                         "id": id,
                         "from": from,
                         "reply_to": reply_to,
-                        "body": stored.message.brief,
+                        "body": body,
                     })
                 ))
             }
-            other => Response::error(other.reject_reason(id)),
+            Err(reason) => Response::error(reason),
         }
     }
 
@@ -1855,82 +1882,187 @@ impl Broker {
         excluded_pane: Option<&str>,
     ) -> bool {
         let panes = self.mux.panes().await.unwrap_or_default();
-        for original in messages {
-            let sender_target = original
-                .sender
+        // 送信元 pane ごとに1通へ集約する。10通未受領でも呼び鈴は送信元あたり1回
+        // (BTreeMap の values は ID 昇順なので、group 内も ID 昇順が保たれる)。
+        let mut groups: BTreeMap<String, Vec<Message>> = BTreeMap::new();
+        for message in messages {
+            groups
+                .entry(message.sender.clone())
+                .or_default()
+                .push(message);
+        }
+        for (sender, originals) in groups {
+            let sender_target = sender
                 .starts_with('%')
                 .then(|| {
                     self.state
                         .agents
-                        .get(&original.sender)
+                        .get(&sender)
                         .map(|agent| agent.name.clone())
                 })
                 .flatten()
                 .filter(|expected| {
-                    Some(original.sender.as_str()) != excluded_pane
+                    Some(sender.as_str()) != excluded_pane
                         && panes.iter().any(|pane| {
-                            pane.pane_id == original.sender
+                            pane.pane_id == sender
                                 && pane.agent.as_deref() == Some(expected.as_str())
                         })
                 });
-            if let Some(expected) = sender_target {
-                // 「配達されなかった」ではなく受領報告の欠如を表す文言にする
-                // (docs/decisions/0002-message-retention-ack.md「pane 消滅時の掃除」)。
-                let failure_brief = format!(
-                    "# agent-talk 未受領通知\n- from: system\n- to: {expected}\n- reply: 不要\n- original: #{}\n- reason: 受領報告されないまま{reason}\n\n## 元の依頼\n{}",
-                    original.id, original.brief
-                );
-                let dispatch = self.state.dispatch(
-                    &original.sender,
-                    Origin::new("system", "system"),
-                    failure_brief,
-                    &expected,
-                    |id| {
-                        format!(
-                            "[agent-talk] 未受領のまま終了: message #{} は受領報告されないまま{reason}ため回収されました。agent-talk read {id} で元の依頼内容を確認してください。",
-                            original.id
-                        )
-                    },
-                );
-                let Ok(dispatch) = dispatch else {
-                    return false;
-                };
-                let id = match dispatch {
-                    Dispatch::Deliver(id) | Dispatch::Queued(id) => id,
-                };
-                let Some(stored) = self.state.message(id) else {
-                    error!(id, "failure notification body missing before persistence");
-                    self.rollback_notice(&original.sender, id, dispatch);
-                    return false;
-                };
-                let message = stored.message.clone();
-                // **通知の永続化と original の退役を1回の append にまとめる。**
-                // 2回に分けると、その間のクラッシュ / append 失敗で original が
-                // `Pending` のまま通知だけ残り、次の reconcile がもう1通作ってしまう。
-                if let Err(error) = self.journal.append(&Record::Enqueue {
-                    pane: original.sender.clone(),
-                    message,
-                    retires: Some(original.id),
-                }) {
-                    // 永続化前なので何も起きていない。再試行が唯一の通知を作る。
-                    self.rollback_notice(&original.sender, id, dispatch);
-                    error!(%error, "cannot persist failure notification");
-                    return false;
+            let Some(expected) = sender_target else {
+                // 通知先が居ない場合も、残った `Pending` を terminal `Acked` にする。
+                for original in &originals {
+                    if let Err(error) = self.journal.append(&Record::Consumed { id: original.id }) {
+                        error!(%error, id = original.id, "cannot retire unacked message");
+                        return false;
+                    }
+                    self.state.ack(original.id);
                 }
-                self.state.ack(original.id);
-                // ここから先は通知が durable。以後の失敗は queue 済み通知の
-                // **配達の再試行**であって、新しい通知の生成ではない。
-                self.deliver_notice(&original.sender, id, dispatch).await;
                 continue;
+            };
+            let listed = originals
+                .iter()
+                .map(|original| format!("#{}", original.id))
+                .collect::<Vec<_>>()
+                .join(" ");
+            // 「配達されなかった」ではなく受領報告の欠如を表す文言にする
+            // (docs/decisions/0002-message-retention-ack.md「pane 消滅時の掃除」)。
+            let mut failure_brief = format!(
+                "# agent-talk 未受領通知\n- from: system\n- to: {expected}\n- reply: 不要\n- original: {listed}\n- reason: 受領報告されないまま{reason}\n",
+            );
+            // 集約しても journal record を単発肥大させない: 収録する元本文の合計を
+            // 送信本文と同じ 1MiB 上限に収め、超過分は ID を残して本文だけ省略する。
+            let mut body_budget = MAX_BODY_BYTES;
+            for original in &originals {
+                if original.brief.len() <= body_budget {
+                    body_budget -= original.brief.len();
+                    let _ = write!(
+                        failure_brief,
+                        "\n## 元の依頼 #{}\n{}\n",
+                        original.id, original.brief
+                    );
+                } else {
+                    let _ = write!(
+                        failure_brief,
+                        "\n## 元の依頼 #{}\n(本文 {} bytes は集約通知の上限を超えるため省略)\n",
+                        original.id,
+                        original.brief.len()
+                    );
+                }
             }
-            // 通知先が居ない場合も、残った `Pending` を terminal `Acked` にする。
-            if let Err(error) = self.journal.append(&Record::Consumed { id: original.id }) {
-                error!(%error, id = original.id, "cannot retire unacked message");
+            let dispatch = self.state.dispatch(
+                &sender,
+                Origin::new("system", "system"),
+                failure_brief,
+                &expected,
+                |id| {
+                    format!(
+                        "[agent-talk] 未受領のまま終了: message {listed} は受領報告されないまま{reason}ため回収されました。read_message {id} で元の依頼内容を確認してください。",
+                    )
+                },
+            );
+            let Ok(dispatch) = dispatch else {
+                return false;
+            };
+            let id = match dispatch {
+                Dispatch::Deliver(id) | Dispatch::Queued(id) => id,
+            };
+            let Some(stored) = self.state.message(id) else {
+                error!(id, "failure notification body missing before persistence");
+                self.rollback_notice(&sender, id, dispatch);
+                return false;
+            };
+            let message = stored.message.clone();
+            // **通知の永続化と originals の退役を1回の append にまとめる。**
+            // 2回に分けると、その間のクラッシュ / append 失敗で original が
+            // `Pending` のまま通知だけ残り、次の reconcile がもう1通作ってしまう。
+            let mut retire_ids = originals.iter().map(|original| original.id);
+            if let Err(error) = self.journal.append(&Record::Enqueue {
+                pane: sender.clone(),
+                message,
+                retires: retire_ids.next(),
+                also_retires: retire_ids.collect(),
+            }) {
+                // 永続化前なので何も起きていない。再試行が唯一の通知を作る。
+                self.rollback_notice(&sender, id, dispatch);
+                error!(%error, "cannot persist failure notification");
                 return false;
             }
-            self.state.ack(original.id);
+            for original in &originals {
+                self.state.ack(original.id);
+            }
+            // ここから先は通知が durable。以後の失敗は queue 済み通知の
+            // **配達の再試行**であって、新しい通知の生成ではない。
+            self.deliver_notice(&sender, id, dispatch).await;
         }
         true
+    }
+
+    /// 配達済みのまま受領報告が無い message について、宛先が idle のときだけ
+    /// 受領催促の呼び鈴を送る。催促は message を新規作成しない
+    /// (催促自体が受領報告の対象になる再帰を避ける)。
+    /// タイマーは memory のみで、restart 後は配達時刻から数え直す。
+    async fn nag_unacked(&mut self) {
+        let now = tokio::time::Instant::now();
+        // pane ごとに1回の呼び鈴へ集約する: (id, 読了済みか) の列。
+        let mut due: BTreeMap<String, Vec<(u64, bool)>> = BTreeMap::new();
+        for stored in self.state.messages.values() {
+            if stored.acked || !stored.delivered {
+                continue;
+            }
+            let Some(agent) = self.state.agents.get(&stored.target_pane) else {
+                continue;
+            };
+            // busy 中は撃たない。identity が変わった pane にも撃たない。
+            if agent.state != AgentState::Idle || agent.name != stored.message.target_name {
+                continue;
+            }
+            let Some(delivered_at) = stored.delivered_at else {
+                continue;
+            };
+            if now.duration_since(delivered_at) < NAG_AFTER {
+                continue;
+            }
+            if let Some(last) = stored.last_nag_at
+                && now.duration_since(last) < NAG_COOLDOWN
+            {
+                continue;
+            }
+            due.entry(stored.target_pane.clone())
+                .or_default()
+                .push((stored.message.id, stored.read));
+        }
+        for (pane, items) in due {
+            let bell = nag_bell(&items);
+            // 通常配達と同じく、鍵盤へ触れる前に Busy を永続化する (steer 安全)。
+            if let Err(error) = self.journal.append(&Record::State {
+                pane: pane.clone(),
+                state: AgentState::Busy,
+            }) {
+                warn!(%error, %pane, "cannot persist nag state; skipping reminder");
+                continue;
+            }
+            self.state.set_state(&pane, AgentState::Busy);
+            let delivered = self.mux.deliver(&pane, &bell).await.is_ok();
+            if !delivered {
+                self.state.set_state(&pane, AgentState::Idle);
+                if let Err(error) = self.journal.append(&Record::State {
+                    pane: pane.clone(),
+                    state: AgentState::Idle,
+                }) {
+                    warn!(%error, %pane, "cannot restore state after failed reminder");
+                }
+            }
+            // 失敗時も cooldown は消費する。2秒ごとの health tick で連打しない。
+            for (id, _) in &items {
+                if let Some(stored) = self.state.messages.get_mut(id) {
+                    stored.last_nag_at = Some(now);
+                }
+            }
+            if delivered {
+                let ids: Vec<u64> = items.iter().map(|(id, _)| *id).collect();
+                info!(%pane, ?ids, source = "nag", "receipt reminder delivered");
+            }
+        }
     }
 
     /// 永続化前に作りかけた通知を in-memory から取り消す。
@@ -2141,6 +2273,34 @@ enum BriefMode {
     External(u64),
 }
 
+/// 受領催促の呼び鈴文言。読了済みと未読で促す操作を変える
+/// (user 原文「読んだんじゃないの？早くackしてくれ、読んでないなら読んでくれ」)。
+fn nag_bell(items: &[(u64, bool)]) -> String {
+    let list = |read: bool| {
+        items
+            .iter()
+            .filter(|(_, item_read)| *item_read == read)
+            .map(|(id, _)| format!("#{id}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let read_ids = list(true);
+    let unread_ids = list(false);
+    if unread_ids.is_empty() {
+        format!(
+            "[agent-talk] 受領催促: message {read_ids} は読まれたまま受領報告がありません。ack_message で受領報告してください。"
+        )
+    } else if read_ids.is_empty() {
+        format!(
+            "[agent-talk] 受領催促: message {unread_ids} が未読のままです。read_message で本文を確認し、ack_message で受領報告してください。"
+        )
+    } else {
+        format!(
+            "[agent-talk] 受領催促: message {read_ids} は未 ack、{unread_ids} は未読です。read_message / ack_message で処理してください。"
+        )
+    }
+}
+
 fn build_brief(
     addr: &str,
     from: &str,
@@ -2163,7 +2323,7 @@ fn build_brief(
             || "不要 (人間からの依頼。結果は自分の画面に表示すれば読まれる)".to_owned(),
             |pane| {
                 format!(
-                    "agent-talk send '{}' に返信本文を stdin で渡す (pane ID 指定は曖昧にならない)",
+                    "send_message で '{}' 宛に返信する (pane ID 指定は曖昧にならない)",
                     pane.pane_id
                 )
             },
@@ -2208,9 +2368,9 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        Broker, HttpRoute, Journal, MailboxPageError, Request, SendIntent, SendOptions, WebAgent,
-        capture_failure, classify_http, decode_path_segment, parse_mailbox_page,
-        parse_mailbox_query, peer_uid_allowed, rfc3339, static_response,
+        Broker, HttpRoute, Journal, MAX_BODY_BYTES, MailboxPageError, Request, SendIntent,
+        SendOptions, WebAgent, capture_failure, classify_http, decode_path_segment,
+        parse_mailbox_page, parse_mailbox_query, peer_uid_allowed, rfc3339, static_response,
     };
     use crate::{
         backend::{Multiplexer, PaneInfo},
@@ -2584,6 +2744,298 @@ mod tests {
             1,
             "再起動後の reconcile も2通目を作らない"
         );
+    }
+
+    /// scripted tmux が配達した (pane, bell) の記録。
+    fn bells(broker: &Broker) -> Vec<(String, String)> {
+        broker.mux.tmux().unwrap().delivered.lock().unwrap().clone()
+    }
+
+    #[tokio::test]
+    async fn reclaimed_messages_collapse_into_one_notice_per_sender() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut broker = broker(
+            &dir,
+            vec![
+                pane_info("%1", Some("codex")),
+                pane_info("%2", Some("claude")),
+                pane_info("%3", Some("cursor")),
+            ],
+        );
+        for (pane, name) in [("%1", "codex"), ("%2", "claude"), ("%3", "cursor")] {
+            let response = broker
+                .handle(request("register", Some(pane), &[name]))
+                .await;
+            assert_eq!(response.code, 0, "{}", response.stderr);
+        }
+        let mut from_codex = Vec::new();
+        for body in ["first", "second", "third"] {
+            from_codex.push(
+                json(&broker.handle(send_request("%1", "claude", body)).await)["id"]
+                    .as_u64()
+                    .unwrap(),
+            );
+        }
+        let from_cursor = json(&broker.handle(send_request("%3", "claude", "fourth")).await)["id"]
+            .as_u64()
+            .unwrap();
+
+        // %2 が4通 (未受領) を抱えたまま消える。
+        broker.mux = Multiplexer::new(
+            Some(Tmux::scripted(vec![
+                pane_info("%1", Some("codex")),
+                pane_info("%3", Some("cursor")),
+            ])),
+            None,
+        );
+        let before = bells(&broker).len();
+        assert!(
+            broker
+                .remove_agent("%2", "宛先エージェントが退出した")
+                .await
+        );
+
+        // 通知は送信元ごとにちょうど1通 (bell も1回ずつ)。
+        let to_codex: Vec<_> = broker
+            .state
+            .messages
+            .values()
+            .filter(|stored| stored.target_pane == "%1")
+            .collect();
+        assert_eq!(to_codex.len(), 1, "codex への通知は1通に集約される");
+        let brief = &to_codex[0].message.brief;
+        for id in &from_codex {
+            assert!(
+                brief.contains(&format!("## 元の依頼 #{id}")),
+                "回収された全 message の本文を含む: {brief}"
+            );
+        }
+        assert!(brief.contains(&format!(
+            "- original: #{} #{} #{}",
+            from_codex[0], from_codex[1], from_codex[2]
+        )));
+        assert!(!brief.contains(&format!("#{from_cursor}")));
+
+        let to_cursor: Vec<_> = broker
+            .state
+            .messages
+            .values()
+            .filter(|stored| stored.target_pane == "%3")
+            .collect();
+        assert_eq!(to_cursor.len(), 1, "cursor への通知は独立に1通");
+        assert!(to_cursor[0].message.brief.contains("## 元の依頼 #"));
+
+        let new_bells: Vec<_> = bells(&broker)[before..].to_vec();
+        assert_eq!(new_bells.len(), 2, "send-keys は送信元 pane ごとに1回だけ");
+        let codex_bell = &new_bells
+            .iter()
+            .find(|(pane, _)| pane == "%1")
+            .expect("codex bell")
+            .1;
+        assert!(
+            codex_bell.contains(&format!(
+                "message #{} #{} #{}",
+                from_codex[0], from_codex[1], from_codex[2]
+            )),
+            "{codex_bell}"
+        );
+        assert!(
+            codex_bell.contains("read_message") && !codex_bell.contains("agent-talk read"),
+            "呼び鈴は MCP 形式で案内する: {codex_bell}"
+        );
+
+        // originals は全件退役済み。
+        for id in from_codex.iter().chain([&from_cursor]) {
+            assert!(broker.state.message(*id).unwrap().acked);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_batched_notice_retires_every_original_across_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let ids = {
+            let mut broker = registered_pair(&dir).await;
+            let ids: Vec<u64> = {
+                let mut ids = Vec::new();
+                for body in ["first", "second"] {
+                    ids.push(
+                        json(&broker.handle(send_request("%1", "claude", body)).await)["id"]
+                            .as_u64()
+                            .unwrap(),
+                    );
+                }
+                ids
+            };
+            broker.mux = Multiplexer::new(
+                Some(Tmux::scripted(vec![pane_info("%1", Some("codex"))])),
+                None,
+            );
+            assert!(
+                broker
+                    .remove_agent("%2", "宛先エージェントが退出した")
+                    .await
+            );
+            ids
+        };
+        // 再起動 (replay): also_retires の分も含めて Pending へ戻らない。
+        let restarted = broker(&dir, vec![pane_info("%1", Some("codex"))]);
+        for id in ids {
+            assert!(
+                restarted
+                    .state
+                    .message(id)
+                    .is_none_or(|stored| stored.acked),
+                "message #{id} が replay で Pending に戻ってはならない"
+            );
+        }
+        let notices = restarted
+            .state
+            .messages
+            .values()
+            .filter(|stored| stored.target_pane == "%1" && !stored.acked)
+            .count();
+        assert_eq!(notices, 1, "通知は restart 後も1通のまま");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_read_but_unacked_message_draws_an_ack_reminder_after_a_minute() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut broker = registered_pair(&dir).await;
+        let id = json(&broker.handle(send_request("%1", "claude", "body")).await)["id"]
+            .as_u64()
+            .unwrap();
+        // 配達済み → %2 が読んだが ack せず turn を終えた。
+        let read = broker
+            .handle(request("read-v1", Some("%2"), &[&id.to_string()]))
+            .await;
+        assert_eq!(read.code, 0, "{}", read.stderr);
+        broker.turn_end(Some("%2".into())).await.unwrap();
+
+        let before = bells(&broker).len();
+        broker.nag_unacked().await;
+        assert_eq!(bells(&broker).len(), before, "1分経過前は催促しない");
+
+        tokio::time::advance(std::time::Duration::from_secs(61)).await;
+        broker.nag_unacked().await;
+        let after: Vec<_> = bells(&broker)[before..].to_vec();
+        assert_eq!(after.len(), 1, "催促はちょうど1回");
+        let (pane, bell) = &after[0];
+        assert_eq!(pane, "%2", "催促は受信者へ送る");
+        assert!(
+            bell.contains("受領催促") && bell.contains(&format!("#{id}")),
+            "{bell}"
+        );
+        assert!(
+            bell.contains("読まれたまま") && bell.contains("ack_message"),
+            "読了済みには ack を促す: {bell}"
+        );
+        assert!(
+            broker.state.is_busy("%2"),
+            "催促も通常配達と同じく Busy を先に立てる"
+        );
+
+        // busy の間も、idle へ戻って cooldown 中も、追い討ちしない。
+        tokio::time::advance(std::time::Duration::from_secs(61)).await;
+        broker.nag_unacked().await;
+        broker.turn_end(Some("%2".into())).await.unwrap();
+        broker.nag_unacked().await;
+        assert_eq!(
+            bells(&broker).len(),
+            before + 1,
+            "cooldown 中は再催促しない"
+        );
+
+        // cooldown が明ければもう一度だけ催促する。
+        tokio::time::advance(std::time::Duration::from_mins(5)).await;
+        broker.nag_unacked().await;
+        assert_eq!(bells(&broker).len(), before + 2);
+
+        // ack すれば止まる。
+        broker.turn_end(Some("%2".into())).await.unwrap();
+        let acked = broker
+            .handle(request("ack-v1", Some("%2"), &[&id.to_string()]))
+            .await;
+        assert_eq!(acked.code, 0, "{}", acked.stderr);
+        tokio::time::advance(std::time::Duration::from_mins(10)).await;
+        broker.nag_unacked().await;
+        assert_eq!(bells(&broker).len(), before + 2, "ack 後は催促しない");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unread_message_is_nagged_to_read_and_a_busy_target_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut broker = registered_pair(&dir).await;
+        let id = json(&broker.handle(send_request("%1", "claude", "body")).await)["id"]
+            .as_u64()
+            .unwrap();
+
+        // 配達直後の %2 は Busy のまま。催促は撃たれない。
+        let before = bells(&broker).len();
+        tokio::time::advance(std::time::Duration::from_mins(2)).await;
+        broker.nag_unacked().await;
+        assert_eq!(bells(&broker).len(), before, "busy 中は催促しない");
+
+        // idle に戻ると未読向けの文言で催促される。
+        broker.turn_end(Some("%2".into())).await.unwrap();
+        broker.nag_unacked().await;
+        let after: Vec<_> = bells(&broker)[before..].to_vec();
+        assert_eq!(after.len(), 1);
+        let bell = &after[0].1;
+        assert!(
+            bell.contains("未読")
+                && bell.contains("read_message")
+                && bell.contains(&format!("#{id}")),
+            "未読には read を促す: {bell}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_oversized_batch_notice_stays_within_the_body_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut broker = registered_pair(&dir).await;
+        let big = "x".repeat(700_000);
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            ids.push(
+                json(&broker.handle(send_request("%1", "claude", &big)).await)["id"]
+                    .as_u64()
+                    .unwrap(),
+            );
+        }
+        broker.mux = Multiplexer::new(
+            Some(Tmux::scripted(vec![pane_info("%1", Some("codex"))])),
+            None,
+        );
+        assert!(
+            broker
+                .remove_agent("%2", "宛先エージェントが退出した")
+                .await
+        );
+
+        let notice = broker
+            .state
+            .messages
+            .values()
+            .find(|stored| stored.target_pane == "%1" && !stored.acked)
+            .expect("collapsed notice");
+        let brief = &notice.message.brief;
+        assert!(
+            brief.len() <= MAX_BODY_BYTES + 4096,
+            "集約通知は単発肥大しない: {} bytes",
+            brief.len()
+        );
+        // 予算内の1通目は全文、超過する2通目は ID を残して本文を省略する。
+        assert!(brief.contains(&format!("## 元の依頼 #{}", ids[0])));
+        assert!(brief.contains(&big));
+        assert!(brief.contains(&format!("## 元の依頼 #{}", ids[1])));
+        assert!(
+            brief.contains("集約通知の上限を超えるため省略"),
+            "超過は明示的に省略と書く"
+        );
+        // 省略された分も含め、originals は全件退役している。
+        for id in ids {
+            assert!(broker.state.message(id).unwrap().acked);
+        }
     }
 
     #[test]

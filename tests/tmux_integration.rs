@@ -410,9 +410,9 @@ fn daemon_journal_read_recovery_and_pane_exit() {
     ));
     let mobile_id = message_id(&mobile_send);
     let claude_screen = text(tmux(&name, &["capture-pane", "-p", "-t", &panes[1]]));
-    assert!(claude_screen.contains(&format!(
-        "/deliver [agent-talk] mobile から依頼が届きました。agent-talk read {mobile_id}"
-    )));
+    assert!(flat(&claude_screen).contains(&flat(&format!(
+        "/deliver [agent-talk] mobile から依頼が届きました。read_message {mobile_id}"
+    ))));
     assert!(!claude_screen.contains("mobile-only-journal-body"));
     let mobile_brief = text(agent(
         &socket,
@@ -444,9 +444,9 @@ fn daemon_journal_read_recovery_and_pane_exit() {
     ));
     let codex_skill_id = message_id(&codex_skill);
     let codex_screen = text(tmux(&name, &["capture-pane", "-p", "-t", &panes[0]]));
-    assert!(codex_screen.contains(&format!(
-        "$deliver [agent-talk] human から依頼が届きました。agent-talk read {codex_skill_id}"
-    )));
+    assert!(flat(&codex_screen).contains(&flat(&format!(
+        "$deliver [agent-talk] human から依頼が届きました。read_message {codex_skill_id}"
+    ))));
     assert!(!codex_screen.contains("codex skill body"));
     agent(
         &socket,
@@ -806,9 +806,9 @@ fn daemon_journal_read_recovery_and_pane_exit() {
         &["turn-end"],
     );
     let recovered_screen = text(tmux(&name, &["capture-pane", "-p", "-t", &panes[1]]));
-    assert!(recovered_screen.contains(&format!(
-        "/deliver [agent-talk] human から依頼が届きました。agent-talk read {queued_id}"
-    )));
+    assert!(flat(&recovered_screen).contains(&flat(&format!(
+        "/deliver [agent-talk] human から依頼が届きました。read_message {queued_id}"
+    ))));
     assert!(!recovered_screen.contains("first durable body"));
     let recovered_brief = text(agent(
         &socket,
@@ -1299,8 +1299,16 @@ fn mcp_tools_talk_to_the_daemon_over_the_derived_socket() {
     let id = sent["structuredContent"]["id"].as_u64().unwrap();
     let doorbell = fixture.screen(1);
     assert!(
-        doorbell.contains(&format!("agent-talk read {id}")),
+        flat(&doorbell).contains(&flat(&format!("read_message {id}"))),
         "doorbell missing: {doorbell}"
+    );
+    assert!(
+        flat(&doorbell).contains("ack_message"),
+        "呼び鈴は受領報告 (ack_message) まで案内する: {doorbell}"
+    );
+    assert!(
+        !flat(&doorbell).contains(&flat("agent-talk read")),
+        "CLI 形式の案内が残ってはならない: {doorbell}"
     );
     assert!(
         !doorbell.contains("mcp round trip body"),
@@ -1338,7 +1346,7 @@ fn mcp_tools_talk_to_the_daemon_over_the_derived_socket() {
     let reply_id = reply["structuredContent"]["id"].as_u64().unwrap();
     let reply_doorbell = fixture.screen(0);
     assert!(
-        reply_doorbell.contains(&format!("agent-talk read {reply_id}")),
+        flat(&reply_doorbell).contains(&flat(&format!("read_message {reply_id}"))),
         "{reply_doorbell}"
     );
     assert!(
@@ -1373,7 +1381,7 @@ fn mcp_tools_talk_to_the_daemon_over_the_derived_socket() {
     fixture.run(1, &["turn-end"]);
     let queued_doorbell = fixture.screen(1);
     assert!(
-        queued_doorbell.contains(&format!("agent-talk read {queued_id}")),
+        flat(&queued_doorbell).contains(&flat(&format!("read_message {queued_id}"))),
         "{queued_doorbell}"
     );
     let delivered = claude.tool(8, "list_peers", &serde_json::json!({}));
@@ -1454,15 +1462,22 @@ fn message_id(output: &str) -> u64 {
 }
 
 fn read_id_from_bell(screen: &str) -> u64 {
-    screen
-        .rsplit_once("read ")
-        .unwrap_or_else(|| panic!("read command missing from {screen:?}"))
+    // capture-pane は行折返しで語の途中にも改行を挟むため、空白を除去してから探す。
+    let joined = flat(screen);
+    joined
+        .rsplit_once("read_message")
+        .unwrap_or_else(|| panic!("read_message missing from {screen:?}"))
         .1
-        .split_whitespace()
-        .next()
-        .unwrap()
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
         .parse()
-        .unwrap()
+        .unwrap_or_else(|_| panic!("message id missing from {screen:?}"))
+}
+
+/// capture-pane の行折返しに影響されない比較のため、全空白を除去する。
+fn flat(text: &str) -> String {
+    text.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
 fn agent(
