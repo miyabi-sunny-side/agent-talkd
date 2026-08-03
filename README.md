@@ -349,14 +349,18 @@ pane id は tmux が `%5`、herdr が `w1:p2` で形式が交わらないため�
 workspace は別の名前空間**なので、backend をまたぐときは
 `w1/codex` のような明示 scope か pane id が必要です。
 
-herdr への配送は、herdr が **idle と積極的に判定した pane にだけ**行います。
-`working` / `blocked` / `unknown` には一文字も送りません。
+herdr への配送は、herdr が **idle と積極的に判定した pane にだけ**、
+`agent.prompt` で agent 本人へ submit まで行います（agent が居ない pane には
+herdr が拒否を返すため、素の shell へ呼び鈴が入ることはありません）。
+`working` / `blocked` / `unknown` には一文字も送りません。配送が拒否された
+メッセージは queue に残り、**宛先が idle である正の証拠が次に得られた時点
+（2秒間隔の health tick）で同じ ID のまま自動再試行**されます。`queued` は
+「捨てられた」ではなく「idle を待って自動配送される」の意味です。
 
 ### 既知の TODO
 
 - **tmux backend は移行のための一時的な足場**です。移行が完了したら削除します
 - herdr の `AttentionRequired`（固着 pane の検知と通知）は未実装
-- `agent-talk-mcp` の herdr 対応は環境変数の解決までで、実 herdr での E2E は未検証
 
 ## 対応環境
 
