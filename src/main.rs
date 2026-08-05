@@ -6,6 +6,7 @@ mod help;
 mod herdr;
 mod journal;
 mod lifecycle;
+mod pane_id;
 mod paths;
 mod protocol;
 mod run;

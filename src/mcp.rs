@@ -24,6 +24,7 @@ use tokio::{
 };
 
 use crate::{
+    pane_id::BackendKind,
     paths::{herdr_rpc_socket_path, rpc_socket_path},
     protocol::{Request, Response, SendOptions},
 };
@@ -103,18 +104,13 @@ fn herdr_socket_of(value: &OsStr) -> Result<PathBuf, String> {
     Ok(PathBuf::from(value))
 }
 
-/// `HERDR_PANE_ID` は `w<digits>:p<digits>`。
+/// `HERDR_PANE_ID` の文法は routing と同じ `BackendKind::of` に委ねる。
+/// herdr と判定できない値 (tmux 形式を含む) は fail closed。
 fn herdr_pane_id_of(value: &OsStr) -> Result<String, String> {
     let value = value
         .to_str()
         .ok_or("HERDR_PANE_ID の値が UTF-8 ではありません".to_owned())?;
-    let valid = value.split_once(":p").is_some_and(|(workspace, pane)| {
-        workspace.strip_prefix('w').is_some_and(|digits| {
-            !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
-        }) && !pane.is_empty()
-            && pane.bytes().all(|byte| byte.is_ascii_digit())
-    });
-    if valid {
+    if BackendKind::of(value) == Some(BackendKind::Herdr) {
         Ok(value.to_owned())
     } else {
         Err(format!("HERDR_PANE_ID が不正です: '{value}'"))
@@ -652,6 +648,29 @@ mod tests {
                 .collect();
             let error = resolve_context(env(&pairs)).unwrap_err();
             assert!(error.contains(missing), "{missing}: {error}");
+        }
+    }
+
+    #[test]
+    fn herdr_inputs_resolve_with_the_routing_pane_grammar() {
+        let base = [
+            ("HERDR_SOCKET_PATH", "/run/user/1000/herdr/herdr.sock"),
+            ("HERDR_PANE_ID", "wX:p5"),
+            ("XDG_RUNTIME_DIR", "/run/user/1000"),
+        ];
+        // 英字入りの実測 ID (wX:p5, w1:pA) を受理する。
+        for pane in ["wX:p5", "w1:pA", "w2:p3"] {
+            let mut pairs = base.to_vec();
+            pairs[1].1 = pane;
+            let context = resolve_context(env(&pairs)).unwrap();
+            assert_eq!(context.pane, pane);
+        }
+        // tmux 形式・小文字・名前・不正形は fail closed。
+        for pane in ["%5", "wx:p1", "w1:pz", "review:security", "", "w1:t1"] {
+            let mut pairs = base.to_vec();
+            pairs[1].1 = pane;
+            let error = resolve_context(env(&pairs)).unwrap_err();
+            assert!(error.contains("HERDR_PANE_ID"), "{pane}: {error}");
         }
     }
 

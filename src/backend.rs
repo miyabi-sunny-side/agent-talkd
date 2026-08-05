@@ -18,42 +18,7 @@ use crate::{
     tmux::Tmux,
 };
 
-/// pane がどちらの multiplexer に属するか。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BackendKind {
-    Tmux,
-    Herdr,
-}
-
-impl BackendKind {
-    /// pane id の形式から所属を決める。
-    ///
-    /// tmux の pane id は必ず `%<digits>`、herdr は `w<digits>:p<digits>`。
-    /// 交わらないので前置詞を足さずに判別できる。
-    ///
-    /// **どちらの形にも厳密に一致しないものは `None`。** 宛先文字列には
-    /// `review:security` のような `:` を含む名前も来るため、`:` を含むだけで
-    /// herdr の pane id と見なすと agent 名を pane id と誤認する。
-    pub fn of(pane_id: &str) -> Option<Self> {
-        if let Some(rest) = pane_id.strip_prefix('%') {
-            return digits(rest).then_some(Self::Tmux);
-        }
-        let (workspace, pane) = pane_id.split_once(":p")?;
-        let workspace = workspace.strip_prefix('w')?;
-        (digits(workspace) && digits(pane)).then_some(Self::Herdr)
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Tmux => "tmux",
-            Self::Herdr => "herdr",
-        }
-    }
-}
-
-fn digits(value: &str) -> bool {
-    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
-}
+pub use crate::pane_id::BackendKind;
 
 /// backend 非依存の pane 情報。既存の宛先解決 (`session/agent`) はこの形のまま動く。
 #[derive(Debug, Clone)]
@@ -363,6 +328,21 @@ mod tests {
         assert_eq!(BackendKind::of("w1:t1"), None);
         assert_eq!(BackendKind::of("wx:p1"), None);
         assert_eq!(BackendKind::of("w1:pz"), None);
+    }
+
+    #[test]
+    fn herdr_ids_advance_to_uppercase_letters_after_the_digits() {
+        // herdr の採番は 9 を超えると英字に進む (実測: wX:p4, w1:pA)。
+        assert_eq!(BackendKind::of("wX:p4"), Some(BackendKind::Herdr));
+        assert_eq!(BackendKind::of("w1:pA"), Some(BackendKind::Herdr));
+        assert_eq!(BackendKind::of("wX:pA"), Some(BackendKind::Herdr));
+        // 小文字まで受けると `web:prod` のような宛先名を
+        // workspace "eb" / pane "rod" と誤読するため、拒否を維持する。
+        assert_eq!(BackendKind::of("web:prod"), None);
+        // 空 segment と非 ASCII は従来どおり拒否。
+        assert_eq!(BackendKind::of("w:p1"), None);
+        assert_eq!(BackendKind::of("w1:p"), None);
+        assert_eq!(BackendKind::of("w1:pÀ"), None);
     }
 
     #[test]
