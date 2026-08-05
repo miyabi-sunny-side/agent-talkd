@@ -21,24 +21,24 @@ describe("HTTP API", () => {
             {
               name: "codex",
               state: "idle",
-              pane_id: "%1",
+              pane_id: "w1:p1",
               session: "dev",
               location: "dev:0.1",
               cwd: "/tmp/project with spaces",
-              backend: "tmux",
+              backend: "herdr",
             },
           ],
         }),
       )
-      .mockResolvedValueOnce(json({ pane_id: "%1", screen: "safe text" }));
+      .mockResolvedValueOnce(json({ pane_id: "w1:p1", screen: "safe text" }));
     vi.stubGlobal("fetch", fetch);
 
     await expect(fetchAgents()).resolves.toHaveLength(1);
-    await expect(fetchScreen("%1")).resolves.toEqual({
-      pane_id: "%1",
+    await expect(fetchScreen("w1:p1")).resolves.toEqual({
+      pane_id: "w1:p1",
       screen: "safe text",
     });
-    expect(fetch.mock.calls[1]?.[0]).toBe("/api/agents/%251/screen");
+    expect(fetch.mock.calls[1]?.[0]).toBe("/api/agents/w1%3Ap1/screen");
   });
 
   it("builds incremental mailbox queries and validates event fields", async () => {
@@ -59,7 +59,7 @@ describe("HTTP API", () => {
               body: "依頼",
               skill: null,
               target_name: "claude",
-              target_pane: "%1",
+              target_pane: "w1:p1",
               reply_to: null,
             },
           ],
@@ -85,9 +85,9 @@ describe("HTTP API", () => {
 
     vi.stubGlobal(
       "fetch",
-      vi.fn().mockResolvedValue(json({ pane_id: "%2", screen: "" })),
+      vi.fn().mockResolvedValue(json({ pane_id: "w1:p2", screen: "" })),
     );
-    await expect(fetchScreen("%1")).rejects.toThrow("invalid response");
+    await expect(fetchScreen("w1:p1")).rejects.toThrow("invalid response");
 
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(json({ mailboxes: [7] })));
     await expect(fetchMailboxes()).rejects.toThrow("invalid response");
@@ -111,15 +111,15 @@ describe("letters", () => {
     const fetch = vi
       .fn()
       .mockResolvedValueOnce(
-        json({ version: 1, id: 9, path: "sent", to: "%1", name: "claude" }),
+        json({ version: 1, id: 9, path: "sent", to: "w1:p1", name: "claude" }),
       );
     vi.stubGlobal("fetch", fetch);
 
-    await expect(sendLetter("mobile", "%1", "hello")).resolves.toEqual({
+    await expect(sendLetter("mobile", "w1:p1", "hello")).resolves.toEqual({
       version: 1,
       id: 9,
       path: "sent",
-      to: "%1",
+      to: "w1:p1",
       name: "claude",
     });
     const [url, init] = fetch.mock.calls[0] as [string, RequestInit];
@@ -130,7 +130,7 @@ describe("letters", () => {
     );
     expect(JSON.parse(String(init.body))).toEqual({
       source: "mobile",
-      target: "%1",
+      target: "w1:p1",
       body: "hello",
     });
   });
@@ -140,7 +140,7 @@ describe("letters", () => {
       "fetch",
       vi.fn().mockResolvedValueOnce(json({ error: "source_not_allowed" }, 403)),
     );
-    await expect(sendLetter("mobile", "%1", "hello")).rejects.toThrow(
+    await expect(sendLetter("mobile", "w1:p1", "hello")).rejects.toThrow(
       "source_not_allowed",
     );
   });

@@ -200,9 +200,8 @@ mod tests {
             writer.write_all(b"\n").await.unwrap();
         });
         let config = Config {
-            tmux_socket: Some(String::new()),
-            herdr_socket: None,
-            rpc_sockets: vec![rpc_socket],
+            herdr_socket: PathBuf::new(),
+            rpc_socket,
             http_socket: PathBuf::new(),
             http_tcp: None,
             journal: PathBuf::new(),

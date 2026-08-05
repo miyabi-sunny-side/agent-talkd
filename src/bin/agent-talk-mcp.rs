@@ -10,7 +10,7 @@ mod mcp;
 #[allow(dead_code)]
 #[path = "../pane_id.rs"]
 mod pane_id;
-// daemon と共有する path 導出。MCP は tmux 由来の path だけを使う。
+// daemon と共有する path 導出。MCP は herdr 由来の path だけを使う。
 #[allow(dead_code)]
 #[path = "../paths.rs"]
 mod paths;

@@ -1,6 +1,6 @@
 export type AgentState = "idle" | "busy";
 
-export type Backend = "tmux" | "herdr";
+export type Backend = "herdr";
 
 export interface Agent {
   name: string;
@@ -159,7 +159,7 @@ function isAgent(value: unknown): value is Agent {
       (key) => typeof value[key] === "string",
     ) &&
     (value.state === "idle" || value.state === "busy") &&
-    (value.backend === "tmux" || value.backend === "herdr")
+    value.backend === "herdr"
   );
 }
 

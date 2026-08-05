@@ -6,17 +6,20 @@ import type { Agent } from "./api";
 const agent: Agent = {
   name: "codex",
   state: "idle",
-  pane_id: "%7",
+  pane_id: "w1:p7",
   session: "work",
-  backend: "tmux",
+  backend: "herdr",
   location: "work:1.0",
   cwd: "/tmp/work",
 };
 
 function capture(screenText: string): Response {
-  return new Response(JSON.stringify({ pane_id: "%7", screen: screenText }), {
-    status: 200,
-  });
+  return new Response(
+    JSON.stringify({ pane_id: "w1:p7", screen: screenText }),
+    {
+      status: 200,
+    },
+  );
 }
 
 afterEach(() => vi.useRealTimers());

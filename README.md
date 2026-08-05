@@ -1,8 +1,8 @@
 # agent-talkd
 
-tmux 上の Claude/Codex などの対話エージェント間で、安全に依頼を受け渡す
+herdr 上の Claude/Codex などの対話エージェント間で、安全に依頼を受け渡す
 Rust 製メッセージブローカーです。デーモンが状態を一元管理し、CLI は Unix
-ドメインソケット経由で既存の hooks と互換な操作を提供します。
+ドメインソケット経由で操作を提供します。
 
 ## インストール
 
@@ -67,17 +67,6 @@ adapterはアーカイブ側から配置してください。
 `build.rs`からnpmは起動しません。`client/dist`がない状態でもCargoビルド自体は成功しますが、
 そのバイナリの静的ページは503を返します。
 
-## tmuxプラグイン
-
-[TPM](https://github.com/tmux-plugins/tpm)を使う場合、`.tmux.conf` に次を追加します。
-
-```tmux
-set -g @plugin 'miyabi-sunny-side/agent-talkd'
-```
-
-`prefix + I` でプラグインを取得します。プラグインはバイナリを自動ビルド・
-ダウンロードしないため、先に `~/.local/bin/agent-talk` を配置してください。
-
 ## CLI
 
 `run`, `register`, `unregister`, `busy`, `idle`, `turn-end`, `who`, `resolve`,
@@ -92,8 +81,8 @@ set -g @plugin 'miyabi-sunny-side/agent-talkd'
 として受理されます。次の minor release で削除予定です。新しい adapter は canonical
 名を先に送り、daemon が明示的に `unknown command` を返したときだけ旧名で1回
 再試行します (接続失敗や timeout では再試行せず、send の二重配送を防ぎます)。
-互換用の `gc`, `watch` は no-op です。デーモンが未起動なら CLI が tmux
-サーバー単位で自動起動し、既存デーモンの版が古ければ安全に交代します。
+互換用の `gc`, `watch` は no-op です。デーモンが未起動なら CLI が herdr
+socket 単位で自動起動し、既存デーモンの版が古ければ安全に交代します。
 インストール済みのversionは `agent-talk --version` で確認できます。
 各サブコマンドの使い方は `agent-talk <command> --help` で確認できます。
 
@@ -107,13 +96,13 @@ agent-talk run codex codex "$@"
 外部連携は `--from` で許可された mailbox に送信し、`mailbox-list` で
 read-only に取得できます。返信は agent pane 内で `agent-talk reply <id> 本文`
 を実行します。mailbox event は consume されず、各 mailbox の最新500件を保持します。
-`TMUX_PANE` なしは外部callerの誤用防止規約であり、実際のRPC境界は同一UIDのUnix
+pane なしは外部callerの誤用防止規約であり、実際のRPC境界は同一UIDのUnix
 socketです。
 
 `mailbox-list` の安定JSON schema:
 
 ```json
-{"version":1,"mailbox":"mobile","events":[{"id":12,"created_at":"2026-07-21T11:00:00Z","mailbox":"mobile","source_label":"mobile","direction":"out","body":"依頼","skill":"deliver","target_name":"claude","target_pane":"%1","reply_to":null}]}
+{"version":1,"mailbox":"mobile","events":[{"id":12,"created_at":"2026-07-21T11:00:00Z","mailbox":"mobile","source_label":"mobile","direction":"out","body":"依頼","skill":"deliver","target_name":"claude","target_pane":"w1:p1","reply_to":null}]}
 ```
 
 `--after` は排他的ID、`--limit` は1〜500です。allowlistから外したmailboxの既存eventは
@@ -122,20 +111,20 @@ socketです。
 
 `agent-talk update` は Linux x86_64 / macOS Apple Silicon の公開GitHub
 Releaseだけを対象に、タグ固定assetとSHA-256を検証して更新します。ローカル版が
-latest以上の場合はdowngradeせず、デーモンの版確認だけを行います。tmux serverが
+latest以上の場合はdowngradeせず、デーモンの版確認だけを行います。herdr が
 無い環境ではCLI更新を完了し、daemonは `not applicable` と表示します。
 
 ## MCP server
 
-`agent-talk-mcp` は agent が触る窓口の stdio MCP server です。tmux サーバーごとに
+`agent-talk-mcp` は agent が触る窓口の stdio MCP server です。herdr ごとに
 1つ動いているデーモンへ、既存の Unix domain socket で接続します。公開する tool は
 次の4つだけで、file 読み書き・任意 path 指定・subprocess 実行の tool はありません。
 
 | tool | 引数 | 返り値 |
 | --- | --- | --- |
-| `list_peers` | なし | `{"version":1,"self":"%0","pending_to_me":[2],"peers":[...]}`。各peerは`name`/`state`/`location`/`pane`/`cwd`/`queued`/`pending_from_me` |
-| `send_message` | `to`, `body`, `no_reply?` | `{"version":1,"id":0,"path":"sent","to":"%2","name":"claude"}`（`path` は `sent` か `queued`） |
-| `read_message` | `id` | `{"version":1,"id":0,"from":"codex","reply_to":"%0","body":"..."}` |
+| `list_peers` | なし | `{"version":1,"self":"w1:p4","pending_to_me":[2],"peers":[...]}`。各peerは`name`/`state`/`location`/`pane`/`cwd`/`queued`/`pending_from_me` |
+| `send_message` | `to`, `body`, `no_reply?` | `{"version":1,"id":0,"path":"sent","to":"w1:p2","name":"claude"}`（`path` は `sent` か `queued`） |
+| `read_message` | `id` | `{"version":1,"id":0,"from":"codex","reply_to":"w1:p5","body":"..."}` |
 | `ack_message` | `id` | `{"version":1,"id":0,"outcome":"acked"}`（未知IDは `no_pending_message`） |
 
 どの返り値も `version: 1` の JSON です。デーモンの応答がこの形でなければ、adapter は
@@ -157,25 +146,29 @@ CLI から送る経路を閉じないためです。
 3. 作業する。返信が必要なら `send_message` で普通に送り返す。返信専用の tool は
    ありません。
 
-接続先の socket は spawn 時の `TMUX` と `XDG_RUNTIME_DIR`（無ければ `HOME`）から
-デーモンと同じ規則で導出します。tool 引数や `AGENT_TALK_RPC_SOCKET` からは受け取らず、
-tmux の subprocess も起動しません。`TMUX` は `<socket>,<pid>,<session>` のちょうど3
-フィールドで、余分なフィールドがあれば不正として扱います。`TMUX` / `TMUX_PANE` が
-欠けているか書式が不正なら、tool を1つも公開せずに終了します。
+接続先の socket は spawn 時の `HERDR_SOCKET_PATH` と `XDG_RUNTIME_DIR`
+（無ければ `HOME`）からデーモンと同じ規則で導出します。tool 引数や
+`AGENT_TALK_RPC_SOCKET` からは受け取らず、subprocess も起動しません。
+`HERDR_SOCKET_PATH` は絶対 path、`HERDR_PANE_ID` は `w1:p2` 形式
+(segment は数字と大文字英字) です。どちらかが欠けているか書式が不正なら、
+tool を1つも公開せずに終了します。
 
 ```console
 $ agent-talk-mcp
-agent-talk-mcp: TMUX_PANE が設定されていません
+agent-talk-mcp: HERDR_SOCKET_PATH が設定されていません
 ```
 
 未受領のIDは CLI の `who` でも両方向を確認できます。
 
 ```console
 $ agent-talk who
-claude     busy  main:0.0 (%0)  /home/miyabi/projects/sunny-side/agent-talkd
-codex      idle  main:0.1 (%1)  /home/miyabi/projects/sunny-side/agent-talkd
+claude     busy/working herdr main:1.4 (w1:p4)  /home/miyabi/projects/sunny-side/agent-talkd
+codex      idle/idle   herdr main:1.5 (w1:p5)  /home/miyabi/projects/sunny-side/agent-talkd
 pending-to-me: #0
 ```
+
+状態列は `agent-talkd の把握/herdr の観測`、backend 列は tmux 併存期の
+表形式を維持した固定値 `herdr` です。
 
 `pending-to-me` は自分宛で配達完了済みかつ未受領のID、`pending-from-me <pane>` は
 自分が送って未受領のIDです。後者には配達待ちqueueの分も含みます。どちらの行も
@@ -191,11 +184,12 @@ TCP面の到達範囲はoperatorが所有するVPN/LAN境界で定め、process�
 追加しません (2026-08-05のuser指示による裁定)。
 
 既定のHTTP socketは
-`$XDG_RUNTIME_DIR/agent-talkd/<tmux-socket-name>.http.sock`です。
+`$XDG_RUNTIME_DIR/agent-talkd/<name>.http.sock`です。
 `XDG_RUNTIME_DIR`が未設定なら
-`~/.cache/agent-talkd/run/agent-talkd/<tmux-socket-name>.http.sock`を使います。
-`<tmux-socket-name>`はtmux socketのbasenameを取り、英数字・`-`・`_`以外を
-`_`へ置換した値です。既定のCLI用`<tmux-socket-name>.sock`と同じstemを使います。
+`~/.cache/agent-talkd/run/agent-talkd/<name>.http.sock`を使います。
+`<name>`は既定のherdr socketなら`herdr`、named session
+(`~/.config/herdr/sessions/<session>/herdr.sock`) なら`herdr-<session>`です。
+既定のCLI用`<name>.sock`と同じstemを使います。
 `AGENT_TALK_RPC_SOCKET=/path/custom.sock`でRPC socketを上書きした場合も、同じ親directoryの
 `/path/custom.http.sock`へ追随します。
 
@@ -203,15 +197,15 @@ TCP面の到達範囲はoperatorが所有するVPN/LAN境界で定め、process�
 - `GET /api/who`: 現在登録中のagent名、idle/busy状態、pane、session、location、cwdを
   JSONで返します。
 - `GET /api/agents/<pane>/screen`: 登録中のpaneの現在の表示範囲を、plain textの
-  `screen` fieldを持つJSONで返します。`%1`のようなpane IDはURL上では
-  `%251`のようにpercent encodeします。
-- `GET /api/mailboxes`: `@agent_talkd_allowed_sources`で現在許可されているmailbox名を返します。
+  `screen` fieldを持つJSONで返します。`w1:p1`のようなpane IDはURL上では
+  `w1%3Ap1`のようにpercent encodeします。
+- `GET /api/mailboxes`: `AGENT_TALK_ALLOWED_SOURCES`で現在許可されているmailbox名を返します。
 - `GET /api/mailbox/<mailbox>?after=<id>&limit=<n>`: mailbox eventをID順に非consume取得します。
   `after`は排他、`limit`は1〜500で既定100です。JSON event schemaは
   `mailbox-list`と同一です。
 - `POST /api/letters`: 唯一の書き込みroute。`{"source","target","body"}` のJSONを
   受け、CLIの `send --from` と同一の外部mailbox送信経路 (allowlist・resolve・
-  journal-first・配達/requeue) へ流します。sourceは `@agent_talkd_allowed_sources`
+  journal-first・配達/requeue) へ流します。sourceは `AGENT_TALK_ALLOWED_SOURCES`
   (既定 `mobile`) が最終判定し、未許可は403。Content-Typeは `application/json`
   のみ (それ以外415)、本文上限1MiB (超過413)、CORS headerは返しません
   (他siteのbrowserからは投函できません)。成功は `{"version":1,"id","path","to","name"}`。
@@ -225,7 +219,7 @@ TCP面の到達範囲はoperatorが所有するVPN/LAN境界で定め、process�
 screen/mailbox path parameterのencoding不正、screen・mailboxesへのquery、mailboxの
 未知・重複・範囲外queryは400です。decodeできてもpane IDやmailbox tokenの形式が不正、
 またはpaneが未登録・mailboxが未許可なら404を返します。登録確認後にpaneの消滅を確認した
-screen取得は410、tmux captureやbrokerの一時障害は503です。UIのScreenはdocumentが
+screen取得は410、herdr の read や broker の一時障害は503です。UIのScreenはdocumentが
 表示中の間だけ2秒ごとに更新し、手動更新もできます。取得済みscreenがある状態で更新に
 失敗した場合は、内容を薄く残して失敗状態を表示し、再取得を続けます。Lettersは自動poll
 せず、更新操作で最後のevent IDより後を追加取得します。
@@ -234,18 +228,16 @@ UDS上のAPIは、たとえば次のように確認できます。
 
 ```sh
 agent_talk_runtime="${XDG_RUNTIME_DIR:-$HOME/.cache/agent-talkd/run}"
-agent_talk_tmux_name="$(tmux display-message -p '#{socket_path}' \
-  | sed 's|.*/||; s/[^A-Za-z0-9_-]/_/g')"
 curl --unix-socket \
-  "$agent_talk_runtime/agent-talkd/$agent_talk_tmux_name.http.sock" \
+  "$agent_talk_runtime/agent-talkd/herdr.http.sock" \
   http://localhost/api/who
 
 curl --unix-socket \
-  "$agent_talk_runtime/agent-talkd/$agent_talk_tmux_name.http.sock" \
-  http://localhost/api/agents/%251/screen
+  "$agent_talk_runtime/agent-talkd/herdr.http.sock" \
+  http://localhost/api/agents/w1%3Ap1/screen
 
 curl --unix-socket \
-  "$agent_talk_runtime/agent-talkd/$agent_talk_tmux_name.http.sock" \
+  "$agent_talk_runtime/agent-talkd/herdr.http.sock" \
   'http://localhost/api/mailbox/mobile?after=0&limit=10'
 ```
 
@@ -287,7 +279,7 @@ human caller向けです。外部クライアントは許可された `--from` �
 
 `--skill` は宛先のagent種別に応じ、Claudeでは `/deliver `、Codexでは
 `$deliver ` のような固定呼び出しを呼び鈴の先頭へ付けます。依頼本文は従来どおり
-journalだけに保存され、tmuxへの入力には含まれません。`--from` と `--skill` は
+journalだけに保存され、端末への入力には含まれません。`--from` と `--skill` は
 daemonでも検証され、未許可値や記法未設定のagent宛は配達せずエラーにします。
 `--from` は同一ユーザーで動くローカルクライアントが自己申告する表示ラベルです。
 認証済みの送信元情報ではないため、認可や監査の判断には使用しないでください。
@@ -296,23 +288,22 @@ daemonでも検証され、未許可値や記法未設定のagent宛は配達せ
 拒否され、外部mailboxの `reply <id>` 契約は変わりません。未対応の旧daemonへは
 `send-v2` の未知commandとして失敗し、通常送信へ降格しません。
 
-設定は tmux の `@agent_talkd_log_level`（既定 `info`）と
-`@agent_talkd_queue_limit`（pane ごとの通常メッセージ上限、既定 `1000`）
-で指定します。追加の送信設定は次のglobal optionで指定します。
+設定は daemon 起動時の環境変数 `AGENT_TALK_LOG_LEVEL`（既定 `info`）と
+`AGENT_TALK_QUEUE_LIMIT`（pane ごとの通常メッセージ上限、既定 `1000`）
+で指定します。追加の送信設定は次の環境変数で指定します。
 
-- `@agent_talkd_skill_syntax`: agent名と記法の対応。形式は
+- `AGENT_TALK_SKILL_SYNTAX`: agent名と記法の対応。形式は
   `claude=slash,codex=dollar`。この2件は既定値で、設定値は追加・上書きされます。
-- `@agent_talkd_allowed_skills`: 許可するスキル名のカンマ区切り。未設定時は
+- `AGENT_TALK_ALLOWED_SKILLS`: 許可するスキル名のカンマ区切り。未設定時は
   文字種・長さ検証のみです。
-- `@agent_talkd_allowed_sources`: 許可する外部送信元ラベルのカンマ区切り。
+- `AGENT_TALK_ALLOWED_SOURCES`: 許可する外部送信元ラベルのカンマ区切り。
   既定は `mobile` です。`human`、`system`、登録中のagent名は指定できません。
 
 ## pane 終了検知
 
-global `pane-exited[987]` および kill 系 hook を wake-up として使用し、daemon が
-live pane 一覧と照合します。tmux サーバーの終了・再起動はserver PIDを使った2秒間隔の
-health checkで検知し、一過性の実行失敗は1回だけ許容します。監視専用のtmux sessionは
-作成しません。
+daemon が 2 秒間隔の health tick で herdr の snapshot を読み、登録と照合します
+(詳細は下の「herdr の登録は pull」)。herdr 自体の終了はこの health check が
+検知し、一過性の失敗は1回だけ許容します。
 
 ## テスト
 
@@ -325,49 +316,40 @@ npm --prefix client run build
 cargo fmt -- --check
 cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo test --locked
-cargo test --locked --test tmux_integration -- --ignored
+cargo test --locked --test bridge -- --ignored
 cargo build --locked --release
 ```
 
-統合テストは隔離した実 tmux サーバーを作成するため、通常のテスト実行では
-ignore されています。
+`tests/bridge.rs` の E2E は background daemon を実際に spawn するため、
+通常のテスト実行では ignore されています。
 
-## multiplexer backend（tmux / herdr）
+## herdr backend
 
-tmux と herdr の**両方を 1 つの daemon が同時に扱います**。移行期に
-「tmux 側の agent」と「herdr 側の agent」が会話できなくなるのを避けるためです。
-
-daemon は設定された backend ごとに RPC socket を開きます。pane の中に居る
-クライアントは自分の環境変数から socket を導出しますが、どちらの経路も
-**同じ daemon プロセス**に届きます。
+daemon は herdr socket から導出した RPC socket を 1 つ開きます。pane の中に
+居るクライアントは自分の環境変数から同じ socket を導出して接続します。
 
 | 環境変数 | 役割 |
 |---|---|
-| `AGENT_TALK_HERDR_SOCKET` | herdr backend を明示的に有効化する。空文字なら無効。tmux の pane から herdr 側の agent とも会話したい場合はこれを設定する |
-| `AGENT_TALK_TMUX_SOCKET` | tmux backend を明示的に指定する |
-| `AGENT_TALK_HTTP_ADDR` | 設定すると読み取り専用 HTTP 面を TCP でも待ち受ける（例 `127.0.0.1:8787`）。既定は無効 |
+| `AGENT_TALK_HERDR_SOCKET` | herdr socket を明示指定する。空文字なら無効 |
+| `AGENT_TALK_HTTP_ADDR` | 設定すると HTTP 面を TCP でも待ち受ける（例 `127.0.0.1:8787`）。既定は無効 |
 
 herdr の pane の中に居る場合（`HERDR_PANE_ID` / `HERDR_SOCKET_PATH` がある）は
-自動的に herdr backend が有効になります。**socket file が存在するだけでは
+自動的に herdr socket を発見します。**socket file が存在するだけでは
 有効になりません** — 停止済み・無関係な herdr を掴まないためです。
 
-pane id は tmux が `%5`、herdr が `w1:p2` で形式が交わらないため、
-1 つの registry に混ぜても曖昧になりません。宛先に pane id を直接
-指定する場合は両方の形式が使えます。
+pane id は `w1:p2` 形式で、segment には数字と大文字英字が現れます
+(実測: `wX:p4`, `w1:pA`)。宛先に pane id を直接指定できます。
 
 herdr の workspace には人間向けの **label** があり (`workspace.list`)、
-tmux の session 名の対応物として表示 (`who` の location、`:5002` UI) と
-宛先解決の両方に使います。`knowledge/codex` のような **label/agent 形は
-どの backend からでも**引けます。label の無い workspace と旧来の
-`w2/codex` 形は workspace_id で引き続き解決できます。`/`・`:`・空白を
-含む label は宛先構文と衝突するため採用せず、workspace_id 表示へ
-fallback します (rename は次回取得で自動追従)。
+表示 (`who` の location、`:5002` UI) と宛先解決の両方に使います。
+label の無い workspace と旧来の `w2/codex` 形は workspace_id で引き続き
+解決できます。`/`・`:`・空白を含む label は宛先構文と衝突するため採用せず、
+workspace_id 表示へ fallback します (rename は次回取得で自動追従)。
 
-tmux の session と herdr の label が同名になった場合は、**正式名称
-`tmux/<scope>/<name>` / `herdr/<scope>/<name>`** で一意に指定します
-(素の `<scope>/<name>` は曖昧エラーになり、正式名称を案内します)。
-素の `codex` のような bare 名は**自分と同じ backend だけ**を近接規則
-(同 window → 同 session) で探し、backend を暗黙にまたぎません。
+素の `codex` のような bare 名は近接規則 (同 window → 同 session) で探し、
+workspace を暗黙にまたぎません。別 workspace へは `<scope>/<name>` を明示
+します (tmux 併存期の正式名称 `herdr/<scope>/<name>` も互換 alias として
+受理します)。
 
 herdr への配送は、herdr が **idle と積極的に判定した pane にだけ**、
 `agent.prompt` で agent 本人へ submit まで行います（agent が居ない pane には
@@ -379,9 +361,8 @@ herdr が拒否を返すため、素の shell へ呼び鈴が入ることはあ�
 
 ### herdr の登録は pull（hook 不要）
 
-tmux の pane は agent 側の hook（SessionStart 等）が `register` を呼ぶ
-opt-in ですが、herdr の pane は **daemon が 2 秒間隔の health tick で herdr の
-snapshot を読み、agent の載っている pane を自動登録**します。grok CLI のように
+**daemon が 2 秒間隔の health tick で herdr の snapshot を読み、agent の
+載っている pane を自動登録**します。grok CLI のように
 登録 hook を持たない agent も、herdr の pane で起動するだけで数秒以内に
 peer になります。
 
@@ -402,17 +383,15 @@ hook を持たない agent で MCP tool も使う場合、その agent が MCP s
 
 ### 既知の TODO
 
-- **tmux backend は移行のための一時的な足場**です。移行が完了したら削除します
 - herdr の `AttentionRequired`（固着 pane の検知と通知）は未実装
 
 ## 対応環境
 
 - Linux x86_64
 - macOS Apple Silicon
-- tmux 3.4以上（3.4 / 3.6bで検証）
 - herdr 0.7.5（protocol 17）で検証
 
-Windows は tmux / herdr のどちらも前提にできないためサポート対象外です。
+Windows は herdr を前提にできないためサポート対象外です。
 
 ## ライセンス
 

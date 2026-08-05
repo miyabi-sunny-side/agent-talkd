@@ -36,10 +36,13 @@ const COMMANDS: &[&str] = &[
 
 fn isolated() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_agent-talk"));
+    // herdr の pane 内で cargo test を実行しても、テスト対象の process が
+    // 実環境の daemon / herdr へ届かないよう、環境を切り離す。
     command
-        .env_remove("TMUX")
-        .env_remove("TMUX_PANE")
-        .env_remove("AGENT_TALK_TMUX_SOCKET")
+        .env_remove("HERDR_PANE_ID")
+        .env_remove("HERDR_SOCKET_PATH")
+        .env_remove("HERDR_ENV")
+        .env_remove("AGENT_TALK_HERDR_SOCKET")
         .env_remove("AGENT_TALK_RPC_SOCKET")
         .env_remove("XDG_RUNTIME_DIR")
         .stdin(Stdio::null());
@@ -75,16 +78,8 @@ fn global_help_and_no_args_keep_distinct_exit_behavior() {
 }
 
 #[test]
-fn version_is_available_without_tmux_or_daemon() {
-    let output = Command::new(env!("CARGO_BIN_EXE_agent-talk"))
-        .arg("--version")
-        .env_remove("TMUX")
-        .env_remove("TMUX_PANE")
-        .env_remove("AGENT_TALK_TMUX_SOCKET")
-        .env_remove("AGENT_TALK_RPC_SOCKET")
-        .env_remove("XDG_RUNTIME_DIR")
-        .output()
-        .unwrap();
+fn version_is_available_without_herdr_or_daemon() {
+    let output = isolated().arg("--version").output().unwrap();
 
     assert!(output.status.success());
     assert_eq!(

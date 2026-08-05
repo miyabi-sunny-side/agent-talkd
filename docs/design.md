@@ -1,26 +1,26 @@
 # 設計
 
-agent-talkd は、tmux 上の対話エージェントへ作業中の入力を割り込ませずに
+agent-talkd は、herdr 上の対話エージェントへ作業中の入力を割り込ませずに
 メッセージを渡すための小さなブローカーです。
 
 ## プロセス構成
 
-- `agent-talk daemon` は tmux サーバーごとに1プロセス起動し、登録・busy状態・
+- `agent-talk daemon` は herdr ごとに1プロセス起動し、登録・busy状態・
   queueを単一イベントループで所有します。
-- `agent-talk` の各CLIコマンドは、tmux socket名ごとのUnix domain socketを
+- `agent-talk` の各CLIコマンドは、herdr socket名から導出したUnix domain socketを
   通じてdaemonへ1要求を送ります。daemonがなければ競合を避けて自動起動します。
 - `agent-talk-mcp` はagentが触る窓口のstdio MCP serverです。同じUnix domain socketで
   daemonへ接続するだけで、自分では状態を持たず、daemonも起動しません。MCP serverは
-  sessionごとにspawnされて一緒に死ぬため、tmux監視・queue・journal・跨セッション配達を
+  sessionごとにspawnされて一緒に死ぬため、herdr監視・queue・journal・跨pane配達を
   持てません。常駐プロセスはこれらの所有者として残ります。
 - daemonは同じイベントループへ接続する第二のUnix domain socketで、read-onlyな
   HTTP adapterも提供します。registry、screen、許可済みmailboxの要求はeventを主ループへ
-  送り、daemon memoryとlive tmux paneをそこで照合します。registryやmailboxを別の
+  送り、daemon memoryとlive herdr paneをそこで照合します。registryやmailboxを別の
   状態storeへ複製しないため、CLI配送との状態競合を増やしません。
-- `ensure-daemon` は同じtmux socketだけを対象に、実行中daemonの版を確認します。
+- `ensure-daemon` は同じherdr socketだけを対象に、実行中daemonの版を確認します。
   同版なら何もせず、旧版は graceful shutdown を先に試し、旧RPCしかない場合だけ
-  Unix socket peer の UID/PID に限定して停止します。複数tmux serverを探索したり、
-  名前による全体 kill を行ったりしません。
+  Unix socket peer の UID/PID に限定して停止します。名前による全体 kill は
+  行いません。
 - `internal-daemon-status` と `internal-daemon-shutdown` は lifecycle 管理用のRPCです。
   同じUIDのsocket利用者だけが呼べる既存のinternal RPCと同じ境界で、通常の利用者向け
   コマンドではありません。
@@ -29,19 +29,17 @@ agent-talkd は、tmux 上の対話エージェントへ作業中の入力を割
   stagingをatomic renameし、置換後の新binary自身で `ensure-daemon` を実行します。
   GitHubへのHTTPSと同一チャネルのchecksumが供給チェーンの境界であり、checksumは
   破損・部分ダウンロード検出を担います。
-- pane消滅はglobal hookをwake-upとして、tmuxの状態確定を短時間待ってからlive pane
-  一覧と照合します。tmuxサーバーの終了・再起動はserver PIDを使った2秒間隔のhealth
-  checkで検知し、一過性の実行失敗は1回だけ許容します。監視用のtmux sessionやcontrol
-  mode clientは作成しません。hookにはdaemonのRPC socket絶対パスを渡し、tmux serverと
-  CLIの環境変数が異なっても同じdaemonへ接続します。
+- pane消滅は2秒間隔のhealth tickがherdrのsnapshotと登録を照合して検知します
+  (詳細は「状態と配送」のpull規則)。herdr自体の終了もこのhealth checkが検知し、
+  一過性の実行失敗は1回だけ許容します。
 
 ## Status pageとHTTP-over-UDS
 
-HTTP adapterは同一ホスト・同一tmux serverという境界を維持するため、TCP listenerを
-作りません。既定のsocketはruntime directoryの
-`agent-talkd/<tmux-socket-name>.http.sock`で、CLI用
-`agent-talkd/<tmux-socket-name>.sock`とstemを共有します。tmux socketのbasenameは
-英数字・`-`・`_`以外を`_`へ正規化します。`XDG_RUNTIME_DIR`がなければ
+HTTP adapterは同一ホスト・同一herdrという境界を既定とし、
+`AGENT_TALK_HTTP_ADDR`を明示したときだけTCPでも開きます。既定のsocketは
+runtime directoryの`agent-talkd/<name>.http.sock`で、CLI用
+`agent-talkd/<name>.sock`とstemを共有します。`<name>`は既定のherdr socketなら
+`herdr`、named sessionなら`herdr-<session>`です。`XDG_RUNTIME_DIR`がなければ
 `~/.cache/agent-talkd/run`をruntime directoryとします。RPC socketを環境変数で
 上書きした場合も、その実効RPC pathの親directoryとfile stemから
 `<stem>.http.sock`を導出します。二つのsocketを別の信頼境界へ分離しません。
@@ -57,9 +55,9 @@ routeは次の順で分類します。
 
 1. GET以外は、`POST /api/letters` を唯一の例外として `Allow` 付きのJSON 405にする。
 2. `GET /api/hello`は製品名とversion、`GET /api/who`はregistry snapshotをJSONで返す。
-3. `GET /api/agents/<pane>/screen`はstrictにdecode・検証した登録paneだけをtmux adapterへ
-   渡し、現在の表示範囲をJSON内のplain-text文字列で返す。pane形式と登録確認は
-   subprocessより先に行う。
+3. `GET /api/agents/<pane>/screen`はstrictにdecode・検証した登録paneだけを
+   herdrの`pane.read`へ渡し、現在の表示範囲をJSON内のplain-text文字列で返す。
+   pane形式と登録確認はherdr APIより先に行う。
 4. `GET /api/mailboxes`は現在のallowlist、`GET /api/mailbox/<mailbox>`は既存の
    `mailbox-list`と同じ非consume event viewを返す。mailbox tokenとallowlist、
    `after`、`limit`の検査は既存primitiveと共有する。
@@ -81,16 +79,16 @@ routeは次の順で分類します。
 | 400 | path/queryを修正しない限り成功しない | `invalid_path_parameter`, `invalid_query`, `duplicate_query_parameter`, `invalid_after`, `invalid_limit` |
 | 404 | API、登録agent、または許可済みmailboxとして存在しない | `not_found`, `agent_not_found`, `mailbox_not_found` |
 | 410 | 登録確認後にlive paneの消滅を確認した | `pane_unavailable` |
-| 503 | broker、tmux、capture、registry、または静的assetが一時的・実行時に利用できない | `broker_unavailable`, `tmux_unavailable`, `capture_unavailable`, `registry_unavailable`, `static_assets_unavailable` |
+| 503 | broker、herdr、capture、registry、または静的assetが一時的・実行時に利用できない | `broker_unavailable`, `backend_unavailable`, `capture_unavailable`, `registry_unavailable`, `static_assets_unavailable` |
 
 HTTP APIの状態変更routeは `POST /api/letters` ただ1つで、それ以外は読み取り専用の
 ままである。letterの拒否は403 (source未許可)・404 (宛先不在)・413 (本文超過)・
 415 (JSON以外)・400 (その他) を返し、拒否時はjournalにもstateにも変化を残さない。
-screen captureはshellを介さない個別argvの
-`tmux capture-pane`に限定します。screen/mailbox path parameterのencoding不正、screen・
+screen captureはherdrの`pane.read`に限定し、
+subprocessを起動しません。screen/mailbox path parameterのencoding不正、screen・
 mailboxesへのquery、mailboxの未知・重複・範囲外queryは400です。decode後のpane ID・
 mailbox token形式が不正、またはpaneが未登録・mailboxが未許可なら404です。登録確認後に
-paneが消えた場合だけ410とし、tmux一覧・captureまたはbrokerの一時障害は503にして、消滅と
+paneが消えた場合だけ410とし、herdr一覧・readまたはbrokerの一時障害は503にして、消滅と
 観測不能を混同しません。capture payloadは1 MiBを上限とし、screen内容をlogへ記録しません。
 mailbox履歴はreadしてもconsumeせず、journal追記、delivery state遷移、doorbell、checkpointへ
 影響を与えません。
@@ -135,25 +133,21 @@ mailbox選択時に履歴をresetし、手動更新では末尾IDを排他的`af
 
 ## 状態と配送
 
-herdr paneの表示・解決上のsession名は、herdr自身が持つworkspace **label**
-（`workspace.list`、tmux session名の意味的対応物）を使い、labelが無い・
-宛先構文と衝突する場合はworkspace_idへfallbackする。workspace_idは互換alias
-として解決だけに残す。宛先は`[backend/]scope/name`文法で、backend修飾
-（`tmux/…`・`herdr/…`）が同名scopeの衝突を一意化する正式名称、bare名は
-自backend限定の近接解決である。bridgeはlabelをread-onlyで消費し、
-`workspace.rename`を呼ばない。
+paneの表示・解決上のsession名は、herdr自身が持つworkspace **label**
+（`workspace.list`）を使い、labelが無い・宛先構文と衝突する場合は
+workspace_idへfallbackする。workspace_idは互換aliasとして解決だけに残す。
+宛先は`scope/name`文法で、bare名は近接解決である（tmux併存期の正式名称
+`herdr/scope/name`は互換aliasとして受理する）。brokerはlabelをread-onlyで
+消費し、`workspace.rename`を呼ばない。
 
-daemonのメモリを稼働中の唯一の真実とし、`@agent` と `@agent_state` は
-既存hookとの互換性を保つ表示用ミラーです。daemon起動時は`@agent`だけを
-登録復旧のヒントとして読み、stateは必ずidleに倒します。stale busyには
-自己修復の機会がなく配達が固着する一方、実際にbusyなら直後のbusy hookが
-復元するためです。`@agent_state`を状態の真実として読み戻しません。
-
-登録の経路はbackendで異なります。tmuxはhookによるopt-in登録
-（`register`/`unregister`）で、herdrはdaemon側のpullです — health tickごとに
-snapshotを読み、agentの載っているpaneを冪等に登録します。herdrのpane一覧は
-agent列をnativeに持つため、hookを挟むよりdaemonが観測するほうが正確で、
-登録hookを持たないagent（grok CLI等）もそのままpeerになれます。pull側の規則:
+daemonのメモリを稼働中の唯一の真実とします。登録はdaemon側のpullです —
+health tickごとにsnapshotを読み、agentの載っているpaneを冪等に登録します。
+互換の`register` commandはherdrの検出と一致する名前だけを受理し（不一致・
+agent不在・snapshot取得不能は拒否）、daemon起動時はsnapshotの取得に成功する
+まで要求を受け付けません。
+herdrのpane一覧はagent列をnativeに持つため、hookを挟むよりdaemonが観測する
+ほうが正確で、登録hookを持たないagent（grok CLI等）もそのままpeerになれます。
+pull側の規則:
 
 - 同じpaneのagent名が変わったら旧登録を即座に外して引き継ぐ（native identityに
   猶予は不要。旧登録の残骸は誤配先になる）。
@@ -168,17 +162,17 @@ agent列をnativeに持つため、hookを挟むよりdaemonが観測するほ�
 - 新規メッセージの上限判定は、dispatchのqueue行き条件と同じpredicate
   （busy・queue残留・suspect）を共有する。busyだけを見ると、suspectの凍結中に
   queueが上限を素通りして無制限に伸びる。
-- herdr paneへの手動`unregister`は拒否する。pullが次tickで登録し直すため、
+- 手動`unregister`は拒否する。pullが次tickで登録し直すため、
   受理すると解除→再登録の振動になるだけで、意図した効果を持たない。
-- tmux側のstale pane掃除（reconcile）はtmux paneだけを見る。herdrのlifecycleは
-  pullが単独で所有し、二重の裁定者を作らない。
 
 配送入口は1つです。
 
 1. 依頼ヘッダと本文をID付きでjournalへ永続化します。
-2. 宛先がidleなら、`@agent_state`をbusyにして`read_message <id>`と
-   `ack_message`を案内する呼び鈴を入力し、0.3秒後にEnterを送ります。スキル指定時も端末へ
-   入るのは、daemonが検証・生成したスキルトークンと固定の呼び鈴だけです。
+2. 宛先がidleなら、`read_message <id>`と`ack_message`を案内する呼び鈴を
+   herdrの`agent.prompt`でagent本人へsubmitします。herdrが**積極的にidleと
+   判定したpaneにだけ**送り、`working`/`blocked`/`unknown`には一文字も
+   送りません。スキル指定時も端末へ入るのは、daemonが検証・生成した
+   スキルトークンと固定の呼び鈴だけです。
 3. 宛先がbusyなら、配送待ちqueueへ入れてから`queued (busy)`を返します。
    **queueが空でない間は宛先がidleでも新規メッセージを直接配達しません**
    （配達失敗でrequeueされた古いメッセージを新規が追い越すFIFOの破れの防止）。
@@ -202,8 +196,13 @@ agent列をnativeに持つため、hookを挟むよりdaemonが観測するほ�
 
 ## 永続化の不変条件
 
-本文とqueueを保持するjournalはJSON Linesのappend-only形式で、tmux
-socket名ごとに分離します。
+本文とqueueを保持するjournalはJSON Linesのappend-only形式で、herdr
+socket名（`herdr` / `herdr-<session>`）ごとに分離します。tmux併存期の
+journal（tmux socket名で命名）がちょうど1つ残っていて新名の journalが
+無い場合は、daemon起動時にrenameで一回だけ引き継ぎ、未受領messageと
+採番済みIDを失いません。候補が複数・列挙失敗・rename失敗では推測も
+新規開始もせず起動を失敗させます（新しい空journalはIDを再利用して
+しまうため、手動でのrenameを求めます）。
 
 - `sent`または`queued (busy)`を返す前に本文のappendと`fsync`を完了する。
 - journal書き込みに失敗したメッセージを配達済み・queuedとして報告しない。
@@ -219,10 +218,10 @@ socket名ごとに分離します。
   カウンタを+1し、`sequence`で0へ戻すため、これが再起動を跨いだ追記数の復元境界に
   なる。checkpointが成功したときだけカウンタを0にする。
 - checkpoint後もメッセージIDのhigh-water markを保持し、IDを再利用しない。
-- pane IDが再利用されても、起動時に`@agent`の登録名を照合して誤配しない。
+- pane IDが再利用されても、起動時と各tickでherdrのnative identityを照合して誤配しない。
 - 本文は1MiBを上限とし、journalの無制限な単発肥大を防ぐ。
 
-単一イベントループにCLI要求とtmuxイベントを合流させることで、busy判定と
+単一イベントループにCLI要求とhealth tickを合流させることで、busy判定と
 queue投入のlost wake-up、同一メッセージの同時二重配送を構造的に防ぎます。
 
 ## 受領報告と保持
@@ -320,14 +319,14 @@ journal appendで行い、journal replayでも`remove`後に同じ最終状態�
 接続失敗・timeout・壊れた応答では再試行しません（sendの二重配送の防止）。
 
 `send_message`がCLIと同じ`send-v2`ではなく専用の`send-message`を使うのは、成功応答の
-形が違うためです。CLIは人間向けテキスト（`sent -> %2 (claude): #0`）を返し、MCPは
-versioned JSON（`{"version":1,"id":0,"path":"sent","to":"%2","name":"claude"}`）を
+形が違うためです。CLIは人間向けテキスト（`sent -> w1:p2 (claude): #0`）を返し、MCPは
+versioned JSON（`{"version":1,"id":0,"path":"sent","to":"w1:p2","name":"claude"}`）を
 返します。1つのコマンドに2つの応答形を持たせると、どちらを返すかが呼び出し元の申告に
 依存し、agentが人間向けテキストを構造化応答と取り違える余地が残ります。
 
 `skill` / `from` / `pane` はtoolのschemaに存在しません。存在しない引数は誤用も偽装も
-できません。呼び出し元identityはadapterがspawn時の`TMUX_PANE`から導出し、agentは
-触れません。`TMUX_PANE`はrouting metadataであって認証境界ではなく、実際の境界は
+できません。呼び出し元identityはadapterがspawn時の`HERDR_PANE_ID`から導出し、agentは
+触れません。`HERDR_PANE_ID`はrouting metadataであって認証境界ではなく、実際の境界は
 daemon側の同一UID UDSと未登録paneの拒否です。
 
 MCP serverはagentのexec sandboxの外で起動されるため、agent自身のshellより広い権限を
@@ -377,23 +376,23 @@ legacyの`send` / `send-v2`は従来どおり未登録paneからも受理しま�
 
 ### 起動時のcontract
 
-接続先はspawn時の環境から純粋に導出します。`Config::discover`は呼ばず、tmuxの
+接続先はspawn時の環境から純粋に導出します。`Config::discover`は呼ばず、
 subprocessも起動せず、tool引数や`AGENT_TALK_RPC_SOCKET`のような任意の環境変数からも
 接続先を受け取りません。
 
 | 入力 | 扱い |
 | --- | --- |
-| `TMUX` | 必須。`<socket path>,<pid>,<session id>`の**ちょうど3フィールド**を検証する。余分なフィールドはfail closed |
-| `TMUX_PANE` | 必須。`%<digits>`の書式を検証する |
+| `HERDR_SOCKET_PATH` | 必須。絶対pathを検証する |
+| `HERDR_PANE_ID` | 必須。`w<seg>:p<seg>`の書式（segmentは数字と大文字英字）をroutingと同じ文法で検証する |
 | `XDG_RUNTIME_DIR` | 任意。絶対pathならruntime rootに使う |
 | `HOME` | `XDG_RUNTIME_DIR`欠落時のみ必須。`$HOME/.cache/agent-talkd/run`へfallback |
 
 欠落・不正な場合はtoolを1つも公開せずに終了します（fail closed）。曖昧な状態で既定値を
-作ると、実在しないsocketや別のtmux serverのsocketを掴み、誤ったpaneへ配達する余地が
+作ると、実在しないsocketや別のherdrのsocketを掴み、誤ったpaneへ配達する余地が
 生じます。接続後はpeer UIDが自分のeffective UIDと一致することを確認し、daemon側の
 same-UID境界と対称にします。
 
-RPC socket pathはbasenameだけが`TMUX`のsocket名由来で、**rootは`XDG_RUNTIME_DIR`**
+RPC socket pathはbasenameだけが`HERDR_SOCKET_PATH`由来で、**rootは`XDG_RUNTIME_DIR`**
 です。daemonがruntime directoryを使っている環境でMCP側にだけ`XDG_RUNTIME_DIR`が
 渡らないと、MCPだけがHOME fallbackを導出し、実在しないsocketを掴んで必ず失敗します。
 このときinitializeとtools/listは成功し、tool呼び出しだけが
@@ -420,12 +419,12 @@ byte単位で維持し、no-reply時だけ「返信は不要」と明示しま�
 `send --from <label>` は通常のpane配達と同じIDを持つ `direction=out` eventを
 journalへ追加します。返信は配達先paneで `agent-talk reply <id>` を実行し、現在の
 pane IDと登録agent名が元eventと一致する場合だけ `direction=in` eventを追記します。
-返信はtmuxへ打鍵しません。paneを同名agentが再登録した場合は後継paneとして返信を
+返信は端末へ打鍵しません。paneを同名agentが再登録した場合は後継paneとして返信を
 許可する既知の挙動です。
 
 `mailbox-list` は非consumeのversioned JSON APIで、ID順・`--after`排他・limit最大500、
 mailboxごとの最新500件retentionです。保存時刻はepoch秒、出力時にRFC3339へ変換します。
-`TMUX_PANE`なしは外部callerの規約であり、セキュリティ境界は同一UIDのRPC socketです。
+paneなしは外部callerの規約であり、セキュリティ境界は同一UIDのRPC socketです。
 allowlistから外したmailboxのeventは削除せず閲覧だけ拒否します。新しいjournal variantを
 含むファイルは旧binaryへdowngrade非対応です。外部event記録後のjournal障害では、配達
 されなかった `direction=out` event が履歴に残る場合がありますが、pane配達は取り消されます。
@@ -437,10 +436,10 @@ agentごとの記法は自由文字列ではなく `slash` または `dollar` �
 
 ## 既知の境界
 
-人間がTUIへ入力してからbusy hookが発火するまでの短い区間は、tmuxの入力方式を
-変えない限り完全には閉じられません。この区間の配送はbest-effortです。
-通信範囲は同一ホストのtmuxサーバー内に限定し、ネットワーク越しの配送と
-Windowsは対象外です。
+herdrの画面検出には原理的なラグがあり、状態取得と送信の間のraceは
+herdr側にatomicなAPIが無い限り完全には閉じられません。この区間の配送は
+best-effortです。UDS面の通信範囲は同一ホストのherdr内に限定し、TCP面は
+operator所有のVPN/LAN境界の内側だけを想定します。Windowsは対象外です。
 
 旧RPCにはquiesce機能がないため、旧daemonの交代直前に配達記録が進行中だった場合、
  新daemonがjournal上の同じ未読IDを再配達する可能性があります。journalの各記録は

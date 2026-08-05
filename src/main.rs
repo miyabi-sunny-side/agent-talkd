@@ -11,7 +11,6 @@ mod paths;
 mod protocol;
 mod run;
 mod state;
-mod tmux;
 mod update;
 
 use std::{env, process::ExitCode};

@@ -10,7 +10,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result};
 use bytes::Bytes;
 use http_body_util::Full;
 use hyper::{
@@ -30,17 +30,17 @@ use tokio::{
 use tracing::{debug, error, info, warn};
 
 use crate::{
-    backend::{BackendKind, Multiplexer, PaneInfo},
+    backend::{Backend, PaneInfo},
     config::{Config, is_safe_token},
     help,
     herdr::Herdr,
     journal::{Journal, Record},
+    pane_id::is_pane_id,
     protocol::{Request, Response, SendOptions},
     state::{
         AgentState, BrokerState, Dispatch, ExternalMailboxEvent, MailboxDirection, Message, Origin,
         StoredMessage,
     },
-    tmux::Tmux,
 };
 
 const MAX_BODY_BYTES: usize = 1024 * 1024;
@@ -53,8 +53,8 @@ const NAG_AFTER: std::time::Duration = std::time::Duration::from_mins(1);
 const NAG_COOLDOWN: std::time::Duration = std::time::Duration::from_mins(5);
 
 /// MCP adapter 経由の操作は、呼び出し元 pane が登録済み agent であることを要求する。
-/// `TMUX_PANE` は routing metadata でしかないが、**未登録 pane を拒否する既存境界は
-/// 変更しない** (docs/decisions/0001-conversation-broker-scope.md 起動時 contract 5)。
+/// 呼び出し元 pane id は routing metadata でしかないが、**未登録 pane を拒否する
+/// 既存境界は変更しない** (docs/decisions/0001-conversation-broker-scope.md 起動時 contract 5)。
 const UNREGISTERED_CALLER: &str = "この操作は登録済みのagent paneからのみ実行できます (agent-talk register を先に実行してください)";
 
 #[derive(Debug)]
@@ -281,11 +281,11 @@ mod embedded {
 #[allow(clippy::too_many_lines)]
 pub async fn run(config: Config) -> Result<()> {
     init_logging(&config.log, &config.log_level)?;
-    if let Some(parent) = config.rpc_socket().parent() {
+    if let Some(parent) = config.rpc_socket.parent() {
         fs::create_dir_all(parent)?;
         fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
     }
-    let Some(listeners) = bind_rpc_sockets(&config.rpc_sockets).await? else {
+    let Some(listener) = bind_rpc_socket(&config.rpc_socket).await? else {
         // 既に生きた daemon が居る。二重起動しない。
         return Ok(());
     };
@@ -293,23 +293,10 @@ pub async fn run(config: Config) -> Result<()> {
     let http_listener = UnixListener::bind(&config.http_socket)
         .with_context(|| format!("cannot bind {}", config.http_socket.display()))?;
 
-    let tmux = config.tmux_socket.clone().map(Tmux::new);
-    let herdr = config.herdr_socket.clone().map(Herdr::new);
-    let mut mux = Multiplexer::new(tmux, herdr);
-    let baseline = mux.probe().await?;
-    let executable = env::current_exe()?;
-    if let Some(tmux) = mux.tmux() {
-        tmux.install_pane_exit_hook(&executable, config.rpc_socket())
-            .await?;
-        ensure!(
-            Some(tmux.server_pid().await?) == baseline.tmux_pid,
-            "tmux server changed during daemon startup"
-        );
-    }
+    let backend = Backend::new(Herdr::new(config.herdr_socket.clone()));
+    backend.probe().await?;
     let (tx, mut rx) = mpsc::channel::<Event>(64);
-    for listener in listeners {
-        spawn_accept_loop(listener, tx.clone());
-    }
+    spawn_accept_loop(listener, tx.clone());
     spawn_http_accept_loop(http_listener, tx.clone());
     spawn_http_tcp(config.http_tcp.as_deref(), &tx).await;
     let health_tx = tx.clone();
@@ -323,15 +310,16 @@ pub async fn run(config: Config) -> Result<()> {
         }
     });
 
+    adopt_legacy_journal(&config.journal)?;
     let (journal, state) = Journal::open(config.journal.clone())?;
     let mut broker = Broker {
         state,
         journal,
-        mux: mux.clone(),
+        backend: backend.clone(),
         config,
         herdr_misses: std::collections::HashMap::new(),
     };
-    broker.startup().await;
+    broker.startup().await?;
     info!(source = "daemon", "started");
 
     let mut shutdown_requested = false;
@@ -353,16 +341,14 @@ pub async fn run(config: Config) -> Result<()> {
                 }
             }
             Event::Http(event) => broker.handle_http_event(event).await,
-            // 設定された backend が **すべて** 落ちたときだけ停止する。
-            // 片方だけ落ちても、もう片方に居る agent の会話は続く。
-            Event::ServerCheck => match mux.still_serving(&baseline).await {
-                Ok(true) => {
+            // herdr が応答しなくなったときだけ停止する。
+            Event::ServerCheck => match backend.still_serving().await {
+                Ok(()) => {
                     failed_health_checks = 0;
                     broker.sync_herdr_registry().await;
                     broker.drain_queued().await;
                     broker.nag_unacked().await;
                 }
-                Ok(false) => break,
                 Err(error) => {
                     failed_health_checks += 1;
                     if failed_health_checks >= 2 {
@@ -377,45 +363,80 @@ pub async fn run(config: Config) -> Result<()> {
     if shutdown_requested {
         info!(source = "lifecycle", "stopping after shutdown request");
     } else {
-        info!(
-            source = "health",
-            "stopping after all multiplexers went away"
-        );
+        info!(source = "health", "stopping after herdr went away");
     }
-    if let Some(tmux) = mux.tmux() {
-        tmux.remove_pane_exit_hook().await;
-    }
-    for path in &broker.config.rpc_sockets {
-        let _ = fs::remove_file(path);
-    }
+    let _ = fs::remove_file(&broker.config.rpc_socket);
     let _ = fs::remove_file(&broker.config.http_socket);
     Ok(())
 }
 
-/// 両 backend 分の RPC socket をすべて開く。
+/// 旧 (tmux 命名) journal の一回きりの引き継ぎ。
 ///
-/// tmux の pane に居るクライアントと herdr の pane に居るクライアントは
-/// 別の path を導出するが、どちらもこの 1 プロセスへ届く。
-/// これが backend をまたいだ会話の土台になる。
+/// tmux 併存期は journal 名を tmux socket 名から導出していたため、herdr 単独に
+/// なった daemon が別名の空 journal を開くと、未受領 message と採番済み ID を
+/// 見失い **ID を再利用してしまう**。herdr 名の journal がまだ無く、旧 journal が
+/// ちょうど 1 つ残っている場合に限り、rename で引き継ぐ。
 ///
-/// 既に生きた daemon が居るときは `None` を返す (二重起動しない)。
-async fn bind_rpc_sockets(paths: &[PathBuf]) -> Result<Option<Vec<UnixListener>>> {
-    // **先に全 path を調べる。** 1 つでも生きた daemon が居るなら 1 つも bind
-    // しない。途中まで bind してから中断すると、drop された listener の
-    // pathname だけが残り、その socket へ繋ぐクライアントが永久に待たされる。
-    for path in paths {
-        if path.exists() && UnixStream::connect(path).await.is_ok() {
-            return Ok(None);
+/// 候補が複数・列挙失敗・rename 失敗では **daemon の起動を失敗させる** —
+/// 推測して間違った journal を掴むのも、新しい空 journal で ID を再利用するのも、
+/// どちらも durability 契約の破れであり、黙って続行してよい状態ではない。
+fn adopt_legacy_journal(journal: &Path) -> Result<()> {
+    if journal.exists() {
+        return Ok(());
+    }
+    let Some(dir) = journal.parent() else {
+        return Ok(());
+    };
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        // directory 自体が無い = 初回起動。引き継ぐものが無い。
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("state directory を列挙できません: {}", dir.display()));
+        }
+    };
+    let legacy: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.extension() == Some(OsStr::new("journal")) && path != journal)
+        .collect();
+    match legacy.as_slice() {
+        [] => Ok(()),
+        [single] => {
+            fs::rename(single, journal).with_context(|| {
+                format!(
+                    "旧 journal を引き継げません: {} -> {}",
+                    single.display(),
+                    journal.display()
+                )
+            })?;
+            info!(from = %single.display(), to = %journal.display(),
+                source = "journal", "adopted legacy journal");
+            Ok(())
+        }
+        _ => {
+            anyhow::bail!(
+                "旧 journal の候補が複数あります ({})。引き継ぐものを {} へ手動で rename してください",
+                legacy
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                journal.display()
+            )
         }
     }
-    let mut listeners = Vec::with_capacity(paths.len());
-    for path in paths {
-        remove_stale_socket(path)?;
-        listeners.push(
-            UnixListener::bind(path).with_context(|| format!("cannot bind {}", path.display()))?,
-        );
+}
+
+/// RPC socket を開く。既に生きた daemon が居るときは `None` を返す (二重起動しない)。
+async fn bind_rpc_socket(path: &Path) -> Result<Option<UnixListener>> {
+    if path.exists() && UnixStream::connect(path).await.is_ok() {
+        return Ok(None);
     }
-    Ok(Some(listeners))
+    remove_stale_socket(path)?;
+    Ok(Some(UnixListener::bind(path).with_context(|| {
+        format!("cannot bind {}", path.display())
+    })?))
 }
 
 fn remove_stale_socket(path: &Path) -> Result<()> {
@@ -598,7 +619,7 @@ async fn request_web_screen(tx: &mpsc::Sender<Event>, pane: String) -> HttpRespo
 /// 無認証 TCP 面に出るため、browser からの cross-site simple request を弾く:
 /// Content-Type は application/json のみ受理 (form/text-plain は 415)、CORS header は
 /// 一切返さない (preflight が通らないので他 site の fetch は送れない)。
-/// source の許可は daemon 側の allowlist (`@agent_talkd_allowed_sources`、既定 deny)
+/// source の許可は daemon 側の allowlist (`AGENT_TALK_ALLOWED_SOURCES`、既定 deny)
 /// が最終判定する — UI の申告は信用しない。
 async fn request_web_letter(
     request: HttpRequest<Incoming>,
@@ -810,9 +831,7 @@ fn usable_agent_name(name: &str) -> bool {
 }
 
 fn valid_pane_id(pane: &str) -> bool {
-    // 両 backend の pane id 形式 (`%5` / `w1:p2`) を strict parser 1つで判定する。
-    // tmux 形式だけを受けると herdr agent の Screen が実機で 404 になる。
-    BackendKind::of(pane).is_some()
+    is_pane_id(pane)
 }
 
 fn parse_mailbox_query(
@@ -956,7 +975,7 @@ async fn serve_client(stream: UnixStream, tx: mpsc::Sender<Event>) -> Result<()>
 struct Broker {
     state: BrokerState,
     journal: Journal,
-    mux: Multiplexer,
+    backend: Backend,
     config: Config,
     /// herdr pull 同期の欠落 counter (pane → 連続欠落回数、memory のみ)。
     /// 成功 snapshot で識別が確認できるたびに 0 へ戻る。
@@ -996,7 +1015,7 @@ impl Broker {
     }
 
     async fn web_agents(&self) -> Result<Vec<WebAgent>> {
-        let panes = self.mux.panes().await?;
+        let panes = self.backend.panes().await?;
         let mut agents = Vec::new();
         for pane in panes {
             if let Some(agent) = self.state.agents.get(&pane.pane_id) {
@@ -1007,7 +1026,7 @@ impl Broker {
                     session: pane.session.clone(),
                     location: format!("{}:{}.{}", pane.session, pane.window_index, pane.pane_index),
                     cwd: pane.cwd,
-                    backend: pane.backend.as_str(),
+                    backend: "herdr",
                 });
             }
         }
@@ -1059,22 +1078,21 @@ impl Broker {
         if !self.state.agents.contains_key(pane) {
             return Err(WebError::new(StatusCode::NOT_FOUND, "agent_not_found"));
         }
-        let panes = self
-            .mux
-            .panes()
-            .await
-            .map_err(|_| WebError::new(StatusCode::SERVICE_UNAVAILABLE, "tmux_unavailable"))?;
+        let panes =
+            self.backend.panes().await.map_err(|_| {
+                WebError::new(StatusCode::SERVICE_UNAVAILABLE, "backend_unavailable")
+            })?;
         if !panes.iter().any(|candidate| candidate.pane_id == pane) {
             return Err(WebError::new(StatusCode::GONE, "pane_unavailable"));
         }
-        if let Ok(screen) = self.mux.capture_pane(pane).await {
+        if let Ok(screen) = self.backend.capture_pane(pane).await {
             Ok(WebScreen {
                 pane_id: pane.to_owned(),
                 screen,
             })
         } else {
             let pane_still_exists = self
-                .mux
+                .backend
                 .panes()
                 .await
                 .ok()
@@ -1103,15 +1121,9 @@ impl Broker {
     async fn handle(&mut self, request: Request) -> Response {
         let result = match canonical_command(&request.command) {
             "register" => self.register(request).await,
-            "unregister" => self.unregister(request).await,
-            "busy" => {
-                self.change_state(request.pane, AgentState::Busy, "hook")
-                    .await
-            }
-            "idle" => {
-                self.change_state(request.pane, AgentState::Idle, "hook")
-                    .await
-            }
+            "unregister" => Ok(Self::unregister(&request)),
+            "busy" => self.change_state(request.pane, AgentState::Busy, "hook"),
+            "idle" => self.change_state(request.pane, AgentState::Idle, "hook"),
             "turn-end" => self.turn_end(request.pane).await,
             "who" => self.who(&request).await,
             "resolve" => self.resolve_command(request).await,
@@ -1146,7 +1158,8 @@ impl Broker {
                     "version": env!("CARGO_PKG_VERSION"),
                     "pid": std::process::id(),
                     "ready": true,
-                    "backends": self.config.backend_names(),
+                    // tmux 併存期の status 互換のため list のまま返す。
+                    "backends": ["herdr"],
                 })
             ))),
             "internal-daemon-shutdown" | "gc" | "watch" => Ok(Response::ok("")),
@@ -1157,7 +1170,7 @@ impl Broker {
                 Ok(Response::ok(""))
             }
             "internal-reconcile" => {
-                self.reconcile(false).await;
+                self.sync_herdr_registry().await;
                 Ok(Response::ok(""))
             }
             _ => Ok(Response::error("unknown command")),
@@ -1174,6 +1187,10 @@ impl Broker {
         }
     }
 
+    /// 登録の正は herdr の native identity (pull 同期)。`register` は互換 command
+    /// として残すが、**herdr の検出と一致する名前しか受理しない** — 一致しない
+    /// 登録を許すと、次の tick で pull が是正するまでの間、実際の占有者と違う
+    /// 名前が宛先として解決・配達されてしまう。
     async fn register(&mut self, request: Request) -> Result<Response> {
         let Some(pane) = request.pane else {
             return Ok(Response::ok(""));
@@ -1186,58 +1203,57 @@ impl Broker {
                 "name は英数字と - _ のみ: '{name}'"
             )));
         }
-        let displaced = self.state.messages_for_target(&pane);
-        if !self
-            .notify_failures(displaced, "宛先エージェントが入れ替わった", Some(&pane))
-            .await
-        {
-            return Ok(Response::error(
-                "前の宛先への配達失敗通知を永続化できないため登録を中止しました",
-            ));
+        // snapshot が取れない間は受理も拒否もできない (fail closed)。
+        let panes = self.backend.panes().await?;
+        let native = panes
+            .iter()
+            .find(|candidate| candidate.pane_id == pane)
+            .and_then(|candidate| candidate.agent.as_deref());
+        if native != Some(name.as_str()) {
+            return Ok(Response::error(format!(
+                "pane {pane} の herdr 検出 ({}) と一致しないため登録できません",
+                native.unwrap_or("agent なし")
+            )));
         }
-        self.mux.set_option(&pane, "@agent", Some(name)).await?;
-        self.mux
-            .set_option(&pane, "@agent_state", Some("idle"))
-            .await?;
-        self.journal.append(&Record::Register {
-            pane: pane.clone(),
-            name: name.clone(),
-            state: AgentState::Idle,
-        })?;
-        self.state.register(pane.clone(), name.clone());
-        info!(%pane, %name, source = "register", "registered");
-        Ok(Response::ok(""))
-    }
-
-    async fn unregister(&mut self, request: Request) -> Result<Response> {
-        if let Some(pane) = request.pane.as_deref()
-            && matches!(BackendKind::of(pane), Some(BackendKind::Herdr))
-        {
-            // herdr の登録は native 検出の pull 同期が管理する。手動 unregister を
-            // 受けても次の tick で再登録されて混乱するだけなので、明示的に断る。
-            return Ok(Response::error(
-                "herdr pane の登録は herdr の検出が管理します (外すには agent を停止してください)",
-            ));
-        }
-        let Some(pane) = request.pane else {
-            return Ok(Response::ok(""));
-        };
-        if self.remove_agent(&pane, "宛先エージェントが退出した").await {
-            if let Err(error) = self.mux.set_option(&pane, "@agent", None).await {
-                warn!(%pane, %error, source = "unregister", "agent mirror removal failed");
+        match self.state.agents.get(&pane) {
+            Some(agent) if agent.name == *name => {
+                // pull 同期が登録済み。冪等成功にし、識別の確認として suspect を解く。
+                self.herdr_misses.remove(&pane);
+                if let Some(agent) = self.state.agents.get_mut(&pane) {
+                    agent.suspect = false;
+                }
             }
-            if let Err(error) = self.mux.set_option(&pane, "@agent_state", None).await {
-                warn!(%pane, %error, source = "unregister", "state mirror removal failed");
+            Some(_) => {
+                // 交代: pull 同期の takeover と同じ経路 (回収が durable になってから登録)。
+                if !self
+                    .remove_agent(&pane, "宛先エージェントが入れ替わった")
+                    .await
+                    || !self.register_observed(&pane, name, "register")
+                {
+                    return Ok(Response::error("登録を永続化できないため中止しました"));
+                }
             }
-        } else {
-            return Ok(Response::error(
-                "配達失敗通知を永続化できないため登録解除を中止しました",
-            ));
+            None => {
+                if !self.register_observed(&pane, name, "register") {
+                    return Ok(Response::error("登録を永続化できないため中止しました"));
+                }
+            }
         }
         Ok(Response::ok(""))
     }
 
-    async fn change_state(
+    fn unregister(request: &Request) -> Response {
+        if request.pane.is_none() {
+            return Response::ok("");
+        }
+        // herdr の登録は native 検出の pull 同期が管理する。手動 unregister を
+        // 受けても次の tick で再登録されて混乱するだけなので、明示的に断る。
+        Response::error(
+            "herdr pane の登録は herdr の検出が管理します (外すには agent を停止してください)",
+        )
+    }
+
+    fn change_state(
         &mut self,
         pane: Option<String>,
         state: AgentState,
@@ -1246,13 +1262,6 @@ impl Broker {
         let Some(pane) = pane else {
             return Ok(Response::ok(""));
         };
-        if let Err(error) = self
-            .mux
-            .set_option(&pane, "@agent_state", Some(state.as_str()))
-            .await
-        {
-            warn!(%pane, %error, source, "pane state mirror failed");
-        }
         self.journal.append(&Record::State {
             pane: pane.clone(),
             state,
@@ -1266,13 +1275,6 @@ impl Broker {
         let Some(pane) = pane else {
             return Ok(Response::ok(""));
         };
-        if let Err(error) = self
-            .mux
-            .set_option(&pane, "@agent_state", Some("idle"))
-            .await
-        {
-            warn!(%pane, %error, source = "turn-end", "pane state mirror failed");
-        }
         self.journal.append(&Record::State {
             pane: pane.clone(),
             state: AgentState::Idle,
@@ -1340,7 +1342,7 @@ impl Broker {
             ));
         };
         let bell = stored.message.bell.clone();
-        if self.mux.deliver(pane, &bell).await.is_ok() {
+        if self.backend.deliver(pane, &bell).await.is_ok() {
             if let Err(error) = self.journal.append(&Record::Complete {
                 pane: pane.to_owned(),
                 id,
@@ -1390,9 +1392,8 @@ impl Broker {
         true
     }
 
-    /// herdr backend の登録を native identity から pull 同期する (2秒 tick)。
+    /// 登録を herdr の native identity から pull 同期する (2秒 tick)。
     ///
-    /// tmux の登録は hook による opt-in + startup mirror 復旧のままだが、herdr は
     /// herdr 自身が agent を検出する側なので、hook を持たない agent (grok 等) も
     /// 現れた数秒後には peer になる。lifecycle は次の3規則:
     /// - **出現** (未登録 pane に identity): 即 pull 登録。idempotent。
@@ -1403,12 +1404,14 @@ impl Broker {
     ///   caller を遮断)、**成功 snapshot 2連続**で evict。同一 identity が戻れば解除。
     ///   snapshot の RPC 失敗は判定を一切進めない (不完全な証拠で消さない)。
     async fn sync_herdr_registry(&mut self) {
-        let Some(snapshot) = self.mux.herdr_snapshot().await else {
+        // 定期 tick は取得失敗で判定を進めない (不完全な証拠で消さない)。
+        let Ok(panes) = self.backend.panes().await else {
             return;
         };
-        let Ok(panes) = snapshot else {
-            return;
-        };
+        self.apply_herdr_snapshot(panes).await;
+    }
+
+    async fn apply_herdr_snapshot(&mut self, panes: Vec<PaneInfo>) {
         // 宛先文法に載らない名前は identity 無しとして扱う (登録もしないし、
         // 既存登録の pane がその名前に変われば欠落と同じ suspect → evict を辿る)。
         let detected: std::collections::HashMap<String, Option<String>> = panes
@@ -1447,17 +1450,14 @@ impl Broker {
                 }
             }
         }
-        // 欠落 (登録済み herdr pane が identity 付きで見えない)。
+        // 欠落 (登録済み pane が identity 付きで見えない)。旧 journal から
+        // 復元された herdr 文法に載らない登録 (撤去済み tmux の `%N` 等) も
+        // ここに落ち、同じ suspect → evict で退役する。
         let missing: Vec<String> = self
             .state
             .agents
             .keys()
-            .filter(|pane| {
-                matches!(
-                    crate::backend::BackendKind::of(pane),
-                    Some(BackendKind::Herdr)
-                ) && detected.get(*pane).is_none_or(Option::is_none)
-            })
+            .filter(|pane| detected.get(*pane).is_none_or(Option::is_none))
             .cloned()
             .collect();
         // まず欠落した全 pane を suspect にしてから evict する。同 tick で
@@ -1488,8 +1488,6 @@ impl Broker {
     /// turn-end の一瞬は herdr の画面検出がまだ working を返すことがあり、
     /// その1回の失敗で再契機が無いと message が滞留する。idle の正の証拠が
     /// 次に得られた時点 (最大 tick 間隔 + API 時間) で同じ ID を再配達する。
-    /// backend は限定しない — 新規 send が queue を追い越さない規則 (dispatch)
-    /// と組むため、tmux 側の失敗残留もこの経路が掃く。
     async fn drain_queued(&mut self) {
         let candidates: Vec<String> = self
             .state
@@ -1508,22 +1506,20 @@ impl Broker {
     }
 
     async fn who(&self, request: &Request) -> Result<Response> {
-        let panes = self.mux.panes().await?;
+        let panes = self.backend.panes().await?;
         let mut output = String::new();
-        // backend 列は移行期にどちらの multiplexer に居る相手なのかを示す。
-        // herdr backend では multiplexer 自身が持つ状態も併記する
+        // herdr 自身が持つ状態を併記する
         // (agent-talkd の hook 由来の状態より信頼できる場面がある)。
+        // backend 列は tmux 併存期の名残だが、表を読む既存クライアントを
+        // 壊さないため列自体は残す (値は常に herdr)。
         for pane in &panes {
             if let Some(agent) = self.state.agents.get(&pane.pane_id) {
-                let observed = pane
-                    .status
-                    .map_or_else(String::new, |status| format!("/{}", status.as_str()));
                 let _ = writeln!(
                     output,
                     "{:<10} {:<11} {:<5} {}:{}.{} ({})  {}",
                     agent.name,
-                    format!("{}{observed}", agent.state.as_str()),
-                    pane.backend.as_str(),
+                    format!("{}/{}", agent.state.as_str(), pane.status.as_str()),
+                    "herdr",
                     pane.session,
                     pane.window_index,
                     pane.pane_index,
@@ -1587,7 +1583,7 @@ impl Broker {
                 .is_some_and(|allowed| !allowed.contains(skill))
             {
                 return Ok(Response::error(format!(
-                    "skill '{skill}' は @agent_talkd_allowed_skills で許可されていません"
+                    "skill '{skill}' は AGENT_TALK_ALLOWED_SKILLS で許可されていません"
                 )));
             }
         }
@@ -1599,7 +1595,7 @@ impl Broker {
             }
             if !self.config.allowed_sources.contains(source) {
                 return Ok(Response::error(format!(
-                    "送信元 '{source}' は @agent_talkd_allowed_sources で許可されていません"
+                    "送信元 '{source}' は AGENT_TALK_ALLOWED_SOURCES で許可されていません"
                 )));
             }
             if matches!(source, "human" | "system")
@@ -1617,7 +1613,7 @@ impl Broker {
         let skill_prefix = if let Some(skill) = intent.skill() {
             let Some(syntax) = self.config.skill_syntax.get(&expected) else {
                 return Ok(Response::error(format!(
-                    "agent '{expected}' のskill記法が @agent_talkd_skill_syntax にありません"
+                    "agent '{expected}' のskill記法が AGENT_TALK_SKILL_SYNTAX にありません"
                 )));
             };
             format!("{}{skill} ", syntax.prefix())
@@ -1652,7 +1648,7 @@ impl Broker {
             )));
         }
 
-        let panes = self.mux.panes().await?;
+        let panes = self.backend.panes().await?;
         let from_info = request
             .pane
             .as_deref()
@@ -1671,9 +1667,6 @@ impl Broker {
             BriefMode::Normal
         };
         let brief = build_brief(addr, &from_agent, from_info, reply_info, &body, brief_mode);
-        if let Some((from_pane, _)) = registered_sender.as_ref() {
-            self.mux.mark_talk_sent(from_pane).await;
-        }
         // 送信時点の identity を捕捉する。後からレジストリを引き直さない。
         let origin = registered_sender.map_or_else(
             || Origin::new("human", from_agent.clone()),
@@ -1792,7 +1785,7 @@ impl Broker {
                     )));
                 };
                 let bell = stored.message.bell.clone();
-                if self.mux.deliver(&pane, &bell).await.is_ok() {
+                if self.backend.deliver(&pane, &bell).await.is_ok() {
                     self.journal.append(&Record::Complete {
                         pane: pane.clone(),
                         id,
@@ -1802,7 +1795,7 @@ impl Broker {
                     Ok(report.accepted(SendPath::Sent, id, &pane, addr, &expected))
                 } else {
                     let target_is_live = self
-                        .mux
+                        .backend
                         .panes()
                         .await
                         .is_ok_and(|panes| panes.iter().any(|item| item.pane_id == pane));
@@ -1946,7 +1939,7 @@ impl Broker {
 
     /// 登録 agent 一覧と両方向の未受領 ID。MCP adapter の `list_peers` が使う。
     async fn peers_json(&self, request: &Request) -> Result<Response> {
-        let panes = self.mux.panes().await?;
+        let panes = self.backend.panes().await?;
         let caller = request.pane.as_deref();
         let pending_to_me = caller.map(|pane| self.state.pending_to_me(pane));
         let pending_from_me = caller.map(|pane| self.state.pending_from_me(pane));
@@ -1989,7 +1982,7 @@ impl Broker {
         };
         let Some(pane) = request.pane.as_deref() else {
             return Ok(Response::error(
-                "reply は登録済みのtmux pane内で実行してください",
+                "reply は登録済みのagent pane内で実行してください",
             ));
         };
         let Some(original) = self.state.external_event(original_id).cloned() else {
@@ -2042,7 +2035,7 @@ impl Broker {
     fn mailbox_list(&self, request: &Request) -> Result<Response> {
         if request.pane.is_some() {
             return Ok(Response::error(
-                "mailbox-list は外部caller (TMUX_PANEなし) 専用です",
+                "mailbox-list は外部caller (pane外) 専用です",
             ));
         }
         let Some(mailbox) = request.args.first() else {
@@ -2115,35 +2108,31 @@ impl Broker {
         addr: &str,
         self_pane: Option<&str>,
     ) -> std::result::Result<(String, String), Response> {
-        let panes = self.mux.panes().await.map_err(|error| {
+        let panes = self.backend.panes().await.map_err(|error| {
             Response::error(format!(
-                "tmux サーバーに接続できません (sandbox 内なら承認付きで再実行): {error}"
+                "herdr に接続できません (sandbox 内なら承認付きで再実行): {error}"
             ))
         })?;
-        // pane id の直接指定。tmux (`%5`) と herdr (`w1:p2`) の両方を受ける。
-        if crate::backend::BackendKind::of(addr).is_some() {
+        // pane id の直接指定 (`w1:p2`)。
+        if is_pane_id(addr) {
             return self
                 .state
                 .agents
                 .get(addr)
                 .map(|agent| (addr.to_owned(), agent.name.clone()))
-                .ok_or_else(|| {
-                    Response::error(format!("pane {addr} は @agent 登録されていません"))
-                });
+                .ok_or_else(|| Response::error(format!("pane {addr} は登録されていません")));
         }
-        // 正式名称 `tmux/<scope>/<name>` / `herdr/<scope>/<name>`。tmux の session と
-        // herdr の workspace label が同名でも一意に指せる (user 指定の正式形)。
-        let (backend, rest) = match addr.split_once('/') {
+        // `herdr/<scope>/<name>` は tmux 併存期の正式名称の互換 alias。
+        let rest = match addr.split_once('/') {
             Some((prefix, rest)) if rest.contains('/') => match prefix {
-                "tmux" => (Some(BackendKind::Tmux), rest),
-                "herdr" => (Some(BackendKind::Herdr), rest),
+                "herdr" => rest,
                 other => {
                     return Err(Response::error(format!(
-                        "backend '{other}' は不明です (tmux/<scope>/<name> か herdr/<scope>/<name>)"
+                        "backend '{other}' は不明です (<scope>/<name> で指定してください)"
                     )));
                 }
             },
-            _ => (None, addr),
+            _ => addr,
         };
         let (scope, name) = rest
             .split_once('/')
@@ -2159,12 +2148,9 @@ impl Broker {
                     .map(|agent| (pane, agent))
             })
             .collect();
-        if let Some(backend) = backend {
-            candidates.retain(|(pane, _)| pane.backend == backend);
-        }
         if let Some(scope) = scope {
-            // 主名 (tmux session / herdr label)、herdr の workspace_id alias
-            // (`w2/codex` の後方互換)、cwd の basename のどれでも引ける。
+            // 主名 (workspace label)、workspace_id alias (`w2/codex` の後方互換)、
+            // cwd の basename のどれでも引ける。
             candidates.retain(|(pane, _)| {
                 pane.session == scope
                     || pane.scope_alias.as_deref() == Some(scope)
@@ -2173,9 +2159,6 @@ impl Broker {
         } else if let Some(self_pane) = self_pane
             && let Some(origin) = panes.iter().find(|pane| pane.pane_id == self_pane)
         {
-            // bare 名は**自 backend 限定** — herdr label と tmux session の同名を
-            // 暗黙に跨いで誤配しない。他 backend は scope か正式名称で明示する。
-            candidates.retain(|(pane, _)| pane.backend == origin.backend);
             let same_window: Vec<_> = candidates
                 .iter()
                 .copied()
@@ -2201,7 +2184,7 @@ impl Broker {
             }
             _ => {
                 let mut stderr = format!(
-                    "agent-talk: 宛先 '{addr}' の候補が複数あります。<scope>/<name> か、backend を跨ぐ同名なら tmux/<scope>/<name> ・ herdr/<scope>/<name> で指定してください:\n"
+                    "agent-talk: 宛先 '{addr}' の候補が複数あります。<scope>/<name> で指定してください:\n"
                 );
                 for (pane, agent) in candidates {
                     stderr.push_str(&pretty(agent.name.as_str(), agent.state, pane));
@@ -2252,7 +2235,7 @@ impl Broker {
         reason: &str,
         excluded_pane: Option<&str>,
     ) -> bool {
-        let panes = self.mux.panes().await.unwrap_or_default();
+        let panes = self.backend.panes().await.unwrap_or_default();
         // 送信元 pane ごとに1通へ集約する。10通未受領でも呼び鈴は送信元あたり1回
         // (BTreeMap の values は ID 昇順なので、group 内も ID 昇順が保たれる)。
         let mut groups: BTreeMap<String, Vec<Message>> = BTreeMap::new();
@@ -2271,8 +2254,7 @@ impl Broker {
                 .agents
                 .get(&sender)
                 .is_some_and(|agent| agent.suspect);
-            let sender_target = BackendKind::of(&sender)
-                .is_some()
+            let sender_target = is_pane_id(&sender)
                 .then(|| {
                     self.state
                         .agents
@@ -2281,9 +2263,9 @@ impl Broker {
                 })
                 .flatten()
                 .filter(|expected| {
-                    // 生存判定は backend 別 (`pane_backs_registration`)。tmux は
-                    // 表示ミラーの drift で失敗通知を silent に退役させない。
-                    // herdr は占有者が入れ替わった pane へ旧名宛て通知を送らない。
+                    // 生存判定は native identity の一致まで要求する
+                    // (`pane_backs_registration`) — 占有者が入れ替わった pane へ
+                    // 旧名宛て通知を送らない。
                     Some(sender.as_str()) != excluded_pane
                         && (sender_suspect
                             || panes.iter().any(|pane| {
@@ -2427,7 +2409,7 @@ impl Broker {
                 continue;
             }
             self.state.set_state(&pane, AgentState::Busy);
-            let delivered = self.mux.deliver(&pane, &bell).await.is_ok();
+            let delivered = self.backend.deliver(&pane, &bell).await.is_ok();
             if !delivered {
                 self.state.set_state(&pane, AgentState::Idle);
                 if let Err(error) = self.journal.append(&Record::State {
@@ -2478,7 +2460,7 @@ impl Broker {
             return;
         };
         let bell = stored.message.bell.clone();
-        if self.mux.deliver(sender, &bell).await.is_ok() {
+        if self.backend.deliver(sender, &bell).await.is_ok() {
             if let Err(error) = self.journal.append(&Record::Complete {
                 pane: sender.to_owned(),
                 id,
@@ -2499,75 +2481,19 @@ impl Broker {
         }
     }
 
-    async fn reconcile(&mut self, startup: bool) {
-        // 不完全な一覧を「pane 不在」と読むと、落ちている backend 側の生存登録を
-        // 全滅させる。evict は全 backend が答えたときにだけ判定する。
-        let Ok(panes) = self.mux.panes_from_all_backends().await else {
-            return;
-        };
-        // tmux の evict 条件は **pane の消滅だけ**。daemon memory が唯一の真実であり、
-        // `@agent` は表示用ミラーにすぎない (docs/design.md「状態と配送」)。
-        // ミラーの欠落・不一致を根拠に生存 pane の登録を消すと、drift のたびに
-        // その pane は理由の表示なく MCP 全拒否になる。
-        // herdr は native identity の一致まで要求する (`pane_backs_registration`)。
-        // herdr pane の生殺与奪は sync_herdr_registry (suspect + 2連続欠落) が
-        // 所有する。ここで即 evict すると debounce を迂回してしまう。
-        let stale: Vec<_> = self
-            .state
-            .agents
-            .iter()
-            .filter(|(pane_id, agent)| {
-                matches!(BackendKind::of(pane_id), Some(BackendKind::Tmux))
-                    && !panes.iter().any(|pane| {
-                        pane.pane_id == **pane_id && pane_backs_registration(pane, &agent.name)
-                    })
-            })
-            .map(|(pane, _)| pane.clone())
-            .collect();
-        for pane in stale {
-            self.remove_agent(&pane, "宛先が不在の").await;
-        }
-        // 生存 pane のミラーが drift していたら、memory を正として修復する。
-        // 修復失敗は表示の問題でしかないので warn に留める。
-        // 対象は tmux だけ — herdr の agent 欄はミラーではなく native identity。
-        for pane in &panes {
-            if pane.backend != BackendKind::Tmux {
-                continue;
-            }
-            if let Some(agent) = self.state.agents.get(&pane.pane_id)
-                && pane.agent.as_deref() != Some(agent.name.as_str())
-            {
-                let name = agent.name.clone();
-                if let Err(error) = self
-                    .mux
-                    .set_option(&pane.pane_id, "@agent", Some(&name))
-                    .await
-                {
-                    warn!(pane = %pane.pane_id, %error, source = "reconcile", "mirror repair failed");
-                }
-            }
-        }
-        if !startup {
-            return;
-        }
-        for pane in &panes {
-            if self.state.agents.contains_key(&pane.pane_id) {
-                continue;
-            }
-            let Some(name) = pane.agent.clone() else {
-                continue;
-            };
-            self.register_observed(&pane.pane_id, &name, "startup-mirror");
-        }
-    }
-
-    /// 起動時の registry 復旧。mirror 復旧 (reconcile) の後、要求の受付前に
-    /// herdr snapshot と必ず1回同期する — journal の identity が古いまま最初の
-    /// health tick まで addressable だと、旧名宛の呼び鈴を pane の新しい
-    /// 占有者へ送ってしまう (最大2秒の誤配窓)。
-    async fn startup(&mut self) {
-        self.reconcile(true).await;
-        self.sync_herdr_registry().await;
+    /// 起動時の registry 復旧。要求の受付前に herdr snapshot と必ず1回同期する —
+    /// journal の identity が古いまま addressable になると、旧名宛の呼び鈴を
+    /// pane の新しい占有者へ送ってしまう。定期 tick と違い、ここでの snapshot
+    /// 取得失敗は握り潰さず **起動を失敗させる** (誤配窓を開けたまま ready に
+    /// ならない)。
+    async fn startup(&mut self) -> Result<()> {
+        let panes = self
+            .backend
+            .panes()
+            .await
+            .context("起動時の herdr snapshot を取得できません")?;
+        self.apply_herdr_snapshot(panes).await;
+        Ok(())
     }
 }
 
@@ -2584,7 +2510,7 @@ fn request_target(
     };
     let Some(pane) = request.pane.clone() else {
         return Err(Response::error(format!(
-            "{command} は登録済みのtmux pane内で実行してください"
+            "{command} は登録済みのagent pane内で実行してください"
         )));
     };
     Ok((id, pane))
@@ -2678,18 +2604,13 @@ enum BriefMode {
     External(u64),
 }
 
-/// pane がその登録の生存根拠になるか (backend 別)。
+/// pane がその登録の生存根拠になるか。
 ///
-/// tmux の `PaneInfo.agent` は daemon 自身が書く表示ミラー (`@agent`) なので、
-/// 欠落・不一致は drift にすぎず pane の存在だけで生存とみなす (ミラーは修復する)。
-/// herdr の `PaneInfo.agent` は herdr が返す **native identity** で、pane ID は
+/// `PaneInfo.agent` は herdr が返す **native identity** で、pane ID は
 /// 位置依存のため占有者が入れ替わりうる。identity の一致まで要求しないと、
 /// 旧名宛ての通知を新しい占有者へ送り続けることになる。
 fn pane_backs_registration(pane: &PaneInfo, registered_name: &str) -> bool {
-    match pane.backend {
-        BackendKind::Tmux => true,
-        BackendKind::Herdr => pane.agent.as_deref() == Some(registered_name),
-    }
+    pane.agent.as_deref() == Some(registered_name)
 }
 
 /// 先受け版号時代の旧 wire 名を canonical 名へ正規化する互換 alias。
@@ -2802,46 +2723,44 @@ mod tests {
 
     use super::{
         Broker, HttpRoute, Journal, MAX_BODY_BYTES, MailboxPageError, Request, SendIntent,
-        SendOptions, WebAgent, capture_failure, classify_http, decode_path_segment,
-        parse_mailbox_page, parse_mailbox_query, peer_uid_allowed, rfc3339, static_response,
+        SendOptions, WebAgent, adopt_legacy_journal, capture_failure, classify_http,
+        decode_path_segment, parse_mailbox_page, parse_mailbox_query, peer_uid_allowed, rfc3339,
+        static_response,
     };
     use crate::{
-        backend::{Multiplexer, PaneInfo},
+        backend::Backend,
         config::Config,
-        herdr::Herdr,
+        herdr::{AgentStatus, HerdrPane},
         state::AgentState,
-        tmux::Tmux,
     };
 
-    fn pane_info(pane_id: &str, agent: Option<&str>) -> PaneInfo {
-        PaneInfo {
-            session: "test".into(),
-            scope_alias: None,
-            window_id: "@0".into(),
+    fn pane_info(pane_id: &str, agent: Option<&str>) -> HerdrPane {
+        let workspace = pane_id.split(':').next().unwrap_or("w1");
+        HerdrPane {
             pane_id: pane_id.into(),
+            terminal_id: format!("term_{pane_id}"),
+            workspace_id: workspace.into(),
+            workspace_label: Some("test".into()),
+            tab_id: format!("{workspace}:t1"),
             cwd: "/tmp".into(),
-            window_index: "0".into(),
-            pane_index: "0".into(),
             agent: agent.map(str::to_owned),
-            backend: crate::backend::BackendKind::Tmux,
-            status: None,
+            status: AgentStatus::Idle,
         }
     }
 
-    /// tmux subprocess を起動しない in-process broker。
+    /// herdr socket を持たない in-process broker。
     /// journal の durability 契約を failpoint で検証するために必要。
-    fn broker(dir: &TempDir, panes: Vec<PaneInfo>) -> Broker {
+    fn broker(dir: &TempDir, panes: Vec<HerdrPane>) -> Broker {
         let journal_path = dir.path().join("queue.journal");
         let (journal, state) = Journal::open(journal_path.clone()).unwrap();
         Broker {
             state,
             journal,
             herdr_misses: std::collections::HashMap::new(),
-            mux: Multiplexer::new(Some(Tmux::scripted(panes)), None),
+            backend: Backend::scripted(panes),
             config: Config {
-                tmux_socket: Some(String::new()),
-                herdr_socket: None,
-                rpc_sockets: vec![PathBuf::new()],
+                herdr_socket: PathBuf::new(),
+                rpc_socket: PathBuf::new(),
                 http_socket: PathBuf::new(),
                 http_tcp: None,
                 journal: journal_path,
@@ -2863,6 +2782,120 @@ mod tests {
             pane: pane.map(str::to_owned),
             send_options: None,
         }
+    }
+
+    /// tmux 併存期の journal (tmux socket 名で命名) を herdr 名の journal へ
+    /// 一回きり引き継ぐ。未受領 message と採番済み ID を見失って ID を
+    /// 再利用しないための移行経路。
+    #[tokio::test]
+    async fn a_single_legacy_journal_is_adopted_with_its_ids_and_registrations() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy_path = dir.path().join("default.journal");
+        let (last_id, agents) = {
+            let journal_path = legacy_path.clone();
+            let (journal, state) = Journal::open(journal_path.clone()).unwrap();
+            let mut legacy = Broker {
+                state,
+                journal,
+                herdr_misses: std::collections::HashMap::new(),
+                backend: Backend::scripted(vec![
+                    pane_info("w1:p1", Some("codex")),
+                    pane_info("w1:p2", Some("claude")),
+                ]),
+                config: Config {
+                    herdr_socket: PathBuf::new(),
+                    rpc_socket: PathBuf::new(),
+                    http_socket: PathBuf::new(),
+                    http_tcp: None,
+                    journal: journal_path,
+                    log: PathBuf::new(),
+                    queue_limit: 1000,
+                    log_level: "info".into(),
+                    skill_syntax: BTreeMap::new(),
+                    allowed_skills: None,
+                    allowed_sources: std::collections::BTreeSet::new(),
+                },
+            };
+            legacy.sync_herdr_registry().await;
+            let sent = json(
+                &legacy
+                    .handle(send_request("w1:p1", "claude", "carried"))
+                    .await,
+            );
+            (sent["id"].as_u64().unwrap(), legacy.state.agents.len())
+        };
+
+        // herdr 名の journal を開く前に、旧 journal がちょうど1つなら引き継ぐ。
+        let herdr_path = dir.path().join("herdr.journal");
+        adopt_legacy_journal(&herdr_path).unwrap();
+        assert!(!legacy_path.exists(), "旧 journal は rename で引き継がれる");
+        let (_, mut state) = Journal::open(herdr_path.clone()).unwrap();
+        assert_eq!(state.agents.len(), agents, "登録が引き継がれる");
+        assert!(
+            state.message(last_id).is_some(),
+            "未受領 message が引き継がれる"
+        );
+        assert!(
+            state.allocate_id() > last_id,
+            "採番が続きから振られ、ID を再利用しない"
+        );
+
+        // 既に herdr 名の journal がある場合は何もしない (冪等)。
+        std::fs::write(dir.path().join("other.journal"), "junk\n").unwrap();
+        adopt_legacy_journal(&herdr_path).unwrap();
+        assert!(herdr_path.exists());
+
+        // 候補が複数のときは推測も新規開始もせず、起動を失敗させる
+        // (新しい空 journal は ID を再利用してしまう)。
+        let fresh = dir.path().join("fresh.journal");
+        std::fs::write(dir.path().join("second.journal"), "junk\n").unwrap();
+        let error = adopt_legacy_journal(&fresh).unwrap_err();
+        assert!(error.to_string().contains("候補が複数"), "{error}");
+        assert!(!fresh.exists(), "失敗時に新しい journal を作らない");
+
+        // 候補ゼロ (初回起動) は新規開始でよい。
+        let empty = tempfile::tempdir().unwrap();
+        adopt_legacy_journal(&empty.path().join("herdr.journal")).unwrap();
+    }
+
+    /// register は herdr の native identity と一致する名前しか受理しない。
+    #[tokio::test]
+    async fn register_refuses_a_name_that_contradicts_the_native_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut broker = broker(&dir, vec![pane_info("w1:p1", Some("codex"))]);
+        broker.sync_herdr_registry().await;
+
+        let refused = broker
+            .handle(request("register", Some("w1:p1"), &["gemini"]))
+            .await;
+        assert_eq!(refused.code, 1, "{refused:?}");
+        assert!(refused.stderr.contains("一致しない"), "{}", refused.stderr);
+        assert_eq!(
+            broker.state.agents["w1:p1"].name, "codex",
+            "native identity と違う名前で登録が上書きされてはならない"
+        );
+
+        // agent の居ない pane・未知の pane も拒否する。
+        let empty = broker
+            .handle(request("register", Some("w1:p9"), &["codex"]))
+            .await;
+        assert_eq!(empty.code, 1, "{empty:?}");
+
+        // 一致する register は冪等成功 (hook 互換)。
+        let ok = broker
+            .handle(request("register", Some("w1:p1"), &["codex"]))
+            .await;
+        assert_eq!(ok.code, 0, "{}", ok.stderr);
+        assert_eq!(broker.state.agents["w1:p1"].name, "codex");
+    }
+
+    /// 起動時は snapshot が取れない限り ready にならない (誤配窓を開けない)。
+    #[tokio::test]
+    async fn startup_refuses_to_serve_without_a_herdr_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut broker = broker(&dir, vec![]);
+        broker.backend = Backend::new(crate::herdr::Herdr::new("/nonexistent/herdr.sock".into()));
+        assert!(broker.startup().await.is_err());
     }
 
     fn send_request(pane: &str, to: &str, body: &str) -> Request {
@@ -2888,11 +2921,11 @@ mod tests {
         let mut broker = broker(
             dir,
             vec![
-                pane_info("%1", Some("codex")),
-                pane_info("%2", Some("claude")),
+                pane_info("w1:p1", Some("codex")),
+                pane_info("w1:p2", Some("claude")),
             ],
         );
-        for (pane, name) in [("%1", "codex"), ("%2", "claude")] {
+        for (pane, name) in [("w1:p1", "codex"), ("w1:p2", "claude")] {
             let response = broker
                 .handle(request("register", Some(pane), &[name]))
                 .await;
@@ -2906,7 +2939,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut broker = registered_pair(&dir).await;
         // %1 -> %2 に1通送り、未受領のまま残しておく。
-        let sent = broker.handle(send_request("%1", "claude", "body")).await;
+        let sent = broker.handle(send_request("w1:p1", "claude", "body")).await;
         assert_eq!(sent.code, 0, "{}", sent.stderr);
         let id = json(&sent)["id"].as_u64().unwrap();
 
@@ -2917,7 +2950,7 @@ mod tests {
             ("ack-message", vec![id.to_string().as_str()]),
             ("list-peers", vec![]),
         ] {
-            let mut denied = request(command, Some("%9"), &args);
+            let mut denied = request(command, Some("w1:p9"), &args);
             denied.stdin = "body".into();
             denied.send_options = Some(SendOptions::default());
             let response = broker.handle(denied).await;
@@ -2933,7 +2966,7 @@ mod tests {
 
         // 不在 ID への ack も、登録確認の前に成功を返さない。
         let unknown = broker
-            .handle(request("ack-message", Some("%9"), &["4242"]))
+            .handle(request("ack-message", Some("w1:p9"), &["4242"]))
             .await;
         assert_eq!(unknown.code, 1);
         assert!(unknown.stderr.contains("登録済みのagent pane"));
@@ -2960,13 +2993,17 @@ mod tests {
     async fn send_message_rpc_returns_versioned_json_for_both_paths() {
         let dir = tempfile::tempdir().unwrap();
         let mut broker = registered_pair(&dir).await;
-        let sent = json(&broker.handle(send_request("%1", "claude", "body")).await);
+        let sent = json(&broker.handle(send_request("w1:p1", "claude", "body")).await);
         assert_eq!(sent["version"], 1);
         assert_eq!(sent["path"], "sent");
-        assert_eq!(sent["to"], "%2");
+        assert_eq!(sent["to"], "w1:p2");
         assert_eq!(sent["name"], "claude");
 
-        let queued = json(&broker.handle(send_request("%1", "claude", "second")).await);
+        let queued = json(
+            &broker
+                .handle(send_request("w1:p1", "claude", "second"))
+                .await,
+        );
         assert_eq!(queued["version"], 1);
         assert_eq!(queued["path"], "queued");
         assert!(queued["id"].as_u64().unwrap() > sent["id"].as_u64().unwrap());
@@ -2976,25 +3013,30 @@ mod tests {
     async fn read_v1_reports_the_identity_captured_at_send_time() {
         let dir = tempfile::tempdir().unwrap();
         let mut broker = registered_pair(&dir).await;
-        let id = json(&broker.handle(send_request("%1", "claude", "body")).await)["id"]
+        let id = json(&broker.handle(send_request("w1:p1", "claude", "body")).await)["id"]
             .as_u64()
             .unwrap();
 
         let read = json(
             &broker
-                .handle(request("read-message", Some("%2"), &[&id.to_string()]))
+                .handle(request("read-message", Some("w1:p2"), &[&id.to_string()]))
                 .await,
         );
         assert_eq!(read["from"], "codex");
-        assert_eq!(read["reply_to"], "%1");
+        assert_eq!(read["reply_to"], "w1:p1");
 
-        // %1 が別 agent に置き換わっても from は変わらず、reply_to は消える。
-        broker
-            .handle(request("register", Some("%1"), &["gemini"]))
-            .await;
+        // w1:p1 が別 agent に置き換わっても from は変わらず、reply_to は消える。
+        set_herdr_panes(
+            &broker,
+            vec![
+                pane_info("w1:p1", Some("gemini")),
+                pane_info("w1:p2", Some("claude")),
+            ],
+        );
+        broker.sync_herdr_registry().await;
         let after = json(
             &broker
-                .handle(request("read-message", Some("%2"), &[&id.to_string()]))
+                .handle(request("read-message", Some("w1:p2"), &[&id.to_string()]))
                 .await,
         );
         assert_eq!(after["from"], "codex", "現在のレジストリを引き直さない");
@@ -3006,31 +3048,31 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let id = {
             let mut broker = registered_pair(&dir).await;
-            json(&broker.handle(send_request("%1", "claude", "body")).await)["id"]
+            json(&broker.handle(send_request("w1:p1", "claude", "body")).await)["id"]
                 .as_u64()
                 .unwrap()
         };
         let mut restarted = broker(
             &dir,
             vec![
-                pane_info("%1", Some("codex")),
-                pane_info("%2", Some("claude")),
+                pane_info("w1:p1", Some("codex")),
+                pane_info("w1:p2", Some("claude")),
             ],
         );
         let read = json(
             &restarted
-                .handle(request("read-message", Some("%2"), &[&id.to_string()]))
+                .handle(request("read-message", Some("w1:p2"), &[&id.to_string()]))
                 .await,
         );
         assert_eq!(read["from"], "codex");
-        assert_eq!(read["reply_to"], "%1");
+        assert_eq!(read["reply_to"], "w1:p1");
     }
 
     #[tokio::test]
     async fn an_ack_whose_journal_append_fails_stays_pending_and_can_be_retried() {
         let dir = tempfile::tempdir().unwrap();
         let mut broker = registered_pair(&dir).await;
-        let id = json(&broker.handle(send_request("%1", "claude", "body")).await)["id"]
+        let id = json(&broker.handle(send_request("w1:p1", "claude", "body")).await)["id"]
             .as_u64()
             .unwrap();
         let journal_len = std::fs::metadata(&broker.config.journal).unwrap().len();
@@ -3038,14 +3080,14 @@ mod tests {
         // (a) append 失敗は error 応答になる。
         broker.journal.fail_next_appends(1);
         let failed = broker
-            .handle(request("ack-message", Some("%2"), &[&id.to_string()]))
+            .handle(request("ack-message", Some("w1:p2"), &[&id.to_string()]))
             .await;
         assert_eq!(failed.code, 1, "{failed:?}");
         assert!(failed.stderr.contains("injected journal append failure"));
 
         // (b) message は Pending のまま可視。journal も1バイトも伸びていない。
         assert!(!broker.state.message(id).unwrap().acked);
-        assert_eq!(broker.state.pending_to_me("%2"), vec![id]);
+        assert_eq!(broker.state.pending_to_me("w1:p2"), vec![id]);
         assert_eq!(
             std::fs::metadata(&broker.config.journal).unwrap().len(),
             journal_len
@@ -3053,7 +3095,7 @@ mod tests {
 
         // (c) 再 read が成功する。
         let reread = broker
-            .handle(request("read-message", Some("%2"), &[&id.to_string()]))
+            .handle(request("read-message", Some("w1:p2"), &[&id.to_string()]))
             .await;
         assert_eq!(reread.code, 0, "{}", reread.stderr);
         assert!(json(&reread)["body"].as_str().unwrap().contains("body"));
@@ -3061,17 +3103,17 @@ mod tests {
         // (d) 後から ack すると成功する。
         let acked = json(
             &broker
-                .handle(request("ack-message", Some("%2"), &[&id.to_string()]))
+                .handle(request("ack-message", Some("w1:p2"), &[&id.to_string()]))
                 .await,
         );
         assert_eq!(acked["outcome"], "acked");
         assert!(broker.state.message(id).unwrap().acked);
-        assert!(broker.state.pending_to_me("%2").is_empty());
+        assert!(broker.state.pending_to_me("w1:p2").is_empty());
     }
 
     /// `%1` に届いた、`original` に対する未受領通知の数。
     fn notices_for(broker: &Broker, original: u64) -> usize {
-        notices_addressed_to(broker, "%1", original)
+        notices_addressed_to(broker, "w1:p1", original)
     }
 
     fn notices_addressed_to(broker: &Broker, pane: &str, original: u64) -> usize {
@@ -3087,13 +3129,10 @@ mod tests {
     /// `%2` が未受領メッセージを1通抱えたまま消える状況を作る。
     async fn pending_then_target_vanishes(dir: &TempDir) -> (Broker, u64) {
         let mut broker = registered_pair(dir).await;
-        let original = json(&broker.handle(send_request("%1", "claude", "body")).await)["id"]
+        let original = json(&broker.handle(send_request("w1:p1", "claude", "body")).await)["id"]
             .as_u64()
             .unwrap();
-        broker.mux = Multiplexer::new(
-            Some(Tmux::scripted(vec![pane_info("%1", Some("codex"))])),
-            None,
-        );
+        set_herdr_panes(&broker, vec![pane_info("w1:p1", Some("codex"))]);
         (broker, original)
     }
 
@@ -3104,11 +3143,11 @@ mod tests {
 
         broker.journal.fail_next_appends(1);
         assert!(
-            !broker.remove_agent("%2", "宛先が退出した").await,
+            !broker.remove_agent("w1:p2", "宛先が退出した").await,
             "通知を永続化できない間は remove しない"
         );
         assert!(
-            broker.state.agents.contains_key("%2"),
+            broker.state.agents.contains_key("w1:p2"),
             "早すぎる Remove が起きてはならない"
         );
         assert!(
@@ -3117,15 +3156,16 @@ mod tests {
         );
         assert_eq!(notices_for(&broker, original), 0, "通知はまだ作られない");
 
-        // 通常の retry 経路 (reconcile) がちょうど1通だけ作る。
-        broker.reconcile(false).await;
+        // 通常の retry 経路 (pull 同期の欠落 evict) がちょうど1通だけ作る。
+        broker.sync_herdr_registry().await;
+        broker.sync_herdr_registry().await;
         assert_eq!(notices_for(&broker, original), 1);
         assert!(broker.state.message(original).unwrap().acked);
-        assert!(!broker.state.agents.contains_key("%2"));
+        assert!(!broker.state.agents.contains_key("w1:p2"));
 
-        // 何度 reconcile しても増えない。
+        // 何度同期しても増えない。
         for _ in 0..3 {
-            broker.reconcile(false).await;
+            broker.sync_herdr_registry().await;
         }
         assert_eq!(notices_for(&broker, original), 1);
     }
@@ -3137,7 +3177,7 @@ mod tests {
 
         // Enqueue{retires} だけ通し、配達系の append をすべて失敗させる。
         broker.journal.fail_appends_after(1);
-        broker.remove_agent("%2", "宛先が退出した").await;
+        broker.remove_agent("w1:p2", "宛先が退出した").await;
         broker.journal.clear_failpoints();
 
         assert_eq!(notices_for(&broker, original), 1);
@@ -3146,15 +3186,15 @@ mod tests {
             "通知が durable になった時点で original は退役している"
         );
         // 配達に失敗した通知は queue に残り、送信者の次の turn-end で鳴る。
-        assert!(broker.state.agents["%1"].queue.len() == 1);
+        assert!(broker.state.agents["w1:p1"].queue.len() == 1);
 
         for _ in 0..3 {
-            broker.reconcile(false).await;
+            broker.sync_herdr_registry().await;
         }
         assert_eq!(
             notices_for(&broker, original),
             1,
-            "reconcile が2通目を作ってはならない"
+            "pull 同期が2通目を作ってはならない"
         );
     }
 
@@ -3165,11 +3205,11 @@ mod tests {
             let (mut broker, original) = pending_then_target_vanishes(&dir).await;
             // 通知が durable になった直後にプロセスが落ちる状況を模す。
             broker.journal.fail_appends_after(1);
-            broker.remove_agent("%2", "宛先が退出した").await;
+            broker.remove_agent("w1:p2", "宛先が退出した").await;
             original
         };
         // 再起動: replay 後も original は退役済み、通知はちょうど1通。
-        let mut restarted = broker(&dir, vec![pane_info("%1", Some("codex"))]);
+        let mut restarted = broker(&dir, vec![pane_info("w1:p1", Some("codex"))]);
         assert!(
             restarted
                 .state
@@ -3178,17 +3218,18 @@ mod tests {
             "replay 後も original は Pending に戻らない"
         );
         assert_eq!(notices_for(&restarted, original), 1);
-        restarted.reconcile(false).await;
+        restarted.sync_herdr_registry().await;
+        restarted.sync_herdr_registry().await;
         assert_eq!(
             notices_for(&restarted, original),
             1,
-            "再起動後の reconcile も2通目を作らない"
+            "再起動後の pull 同期も2通目を作らない"
         );
     }
 
-    /// scripted tmux が配達した (pane, bell) の記録。
+    /// scripted herdr が配達した (pane, bell) の記録。
     fn bells(broker: &Broker) -> Vec<(String, String)> {
-        broker.mux.tmux().unwrap().delivered.lock().unwrap().clone()
+        broker.backend.herdr().delivered.lock().unwrap().clone()
     }
 
     #[tokio::test]
@@ -3197,12 +3238,12 @@ mod tests {
         let mut broker = broker(
             &dir,
             vec![
-                pane_info("%1", Some("codex")),
-                pane_info("%2", Some("claude")),
-                pane_info("%3", Some("cursor")),
+                pane_info("w1:p1", Some("codex")),
+                pane_info("w1:p2", Some("claude")),
+                pane_info("w1:p3", Some("cursor")),
             ],
         );
-        for (pane, name) in [("%1", "codex"), ("%2", "claude"), ("%3", "cursor")] {
+        for (pane, name) in [("w1:p1", "codex"), ("w1:p2", "claude"), ("w1:p3", "cursor")] {
             let response = broker
                 .handle(request("register", Some(pane), &[name]))
                 .await;
@@ -3211,27 +3252,31 @@ mod tests {
         let mut from_codex = Vec::new();
         for body in ["first", "second", "third"] {
             from_codex.push(
-                json(&broker.handle(send_request("%1", "claude", body)).await)["id"]
+                json(&broker.handle(send_request("w1:p1", "claude", body)).await)["id"]
                     .as_u64()
                     .unwrap(),
             );
         }
-        let from_cursor = json(&broker.handle(send_request("%3", "claude", "fourth")).await)["id"]
+        let from_cursor = json(
+            &broker
+                .handle(send_request("w1:p3", "claude", "fourth"))
+                .await,
+        )["id"]
             .as_u64()
             .unwrap();
 
         // %2 が4通 (未受領) を抱えたまま消える。
-        broker.mux = Multiplexer::new(
-            Some(Tmux::scripted(vec![
-                pane_info("%1", Some("codex")),
-                pane_info("%3", Some("cursor")),
-            ])),
-            None,
+        set_herdr_panes(
+            &broker,
+            vec![
+                pane_info("w1:p1", Some("codex")),
+                pane_info("w1:p3", Some("cursor")),
+            ],
         );
         let before = bells(&broker).len();
         assert!(
             broker
-                .remove_agent("%2", "宛先エージェントが退出した")
+                .remove_agent("w1:p2", "宛先エージェントが退出した")
                 .await
         );
 
@@ -3240,7 +3285,7 @@ mod tests {
             .state
             .messages
             .values()
-            .filter(|stored| stored.target_pane == "%1")
+            .filter(|stored| stored.target_pane == "w1:p1")
             .collect();
         assert_eq!(to_codex.len(), 1, "codex への通知は1通に集約される");
         let brief = &to_codex[0].message.brief;
@@ -3260,7 +3305,7 @@ mod tests {
             .state
             .messages
             .values()
-            .filter(|stored| stored.target_pane == "%3")
+            .filter(|stored| stored.target_pane == "w1:p3")
             .collect();
         assert_eq!(to_cursor.len(), 1, "cursor への通知は独立に1通");
         assert!(to_cursor[0].message.brief.contains("## 元の依頼 #"));
@@ -3269,7 +3314,7 @@ mod tests {
         assert_eq!(new_bells.len(), 2, "send-keys は送信元 pane ごとに1回だけ");
         let codex_bell = &new_bells
             .iter()
-            .find(|(pane, _)| pane == "%1")
+            .find(|(pane, _)| pane == "w1:p1")
             .expect("codex bell")
             .1;
         assert!(
@@ -3299,26 +3344,23 @@ mod tests {
                 let mut ids = Vec::new();
                 for body in ["first", "second"] {
                     ids.push(
-                        json(&broker.handle(send_request("%1", "claude", body)).await)["id"]
+                        json(&broker.handle(send_request("w1:p1", "claude", body)).await)["id"]
                             .as_u64()
                             .unwrap(),
                     );
                 }
                 ids
             };
-            broker.mux = Multiplexer::new(
-                Some(Tmux::scripted(vec![pane_info("%1", Some("codex"))])),
-                None,
-            );
+            set_herdr_panes(&broker, vec![pane_info("w1:p1", Some("codex"))]);
             assert!(
                 broker
-                    .remove_agent("%2", "宛先エージェントが退出した")
+                    .remove_agent("w1:p2", "宛先エージェントが退出した")
                     .await
             );
             ids
         };
         // 再起動 (replay): also_retires の分も含めて Pending へ戻らない。
-        let restarted = broker(&dir, vec![pane_info("%1", Some("codex"))]);
+        let restarted = broker(&dir, vec![pane_info("w1:p1", Some("codex"))]);
         for id in ids {
             assert!(
                 restarted
@@ -3332,7 +3374,7 @@ mod tests {
             .state
             .messages
             .values()
-            .filter(|stored| stored.target_pane == "%1" && !stored.acked)
+            .filter(|stored| stored.target_pane == "w1:p1" && !stored.acked)
             .count();
         assert_eq!(notices, 1, "通知は restart 後も1通のまま");
     }
@@ -3341,15 +3383,15 @@ mod tests {
     async fn a_read_but_unacked_message_draws_an_ack_reminder_after_a_minute() {
         let dir = tempfile::tempdir().unwrap();
         let mut broker = registered_pair(&dir).await;
-        let id = json(&broker.handle(send_request("%1", "claude", "body")).await)["id"]
+        let id = json(&broker.handle(send_request("w1:p1", "claude", "body")).await)["id"]
             .as_u64()
             .unwrap();
         // 配達済み → %2 が読んだが ack せず turn を終えた。
         let read = broker
-            .handle(request("read-message", Some("%2"), &[&id.to_string()]))
+            .handle(request("read-message", Some("w1:p2"), &[&id.to_string()]))
             .await;
         assert_eq!(read.code, 0, "{}", read.stderr);
-        broker.turn_end(Some("%2".into())).await.unwrap();
+        broker.turn_end(Some("w1:p2".into())).await.unwrap();
 
         let before = bells(&broker).len();
         broker.nag_unacked().await;
@@ -3360,7 +3402,7 @@ mod tests {
         let after: Vec<_> = bells(&broker)[before..].to_vec();
         assert_eq!(after.len(), 1, "催促はちょうど1回");
         let (pane, bell) = &after[0];
-        assert_eq!(pane, "%2", "催促は受信者へ送る");
+        assert_eq!(pane, "w1:p2", "催促は受信者へ送る");
         assert!(
             bell.contains("受領催促") && bell.contains(&format!("#{id}")),
             "{bell}"
@@ -3370,14 +3412,14 @@ mod tests {
             "読了済みには ack を促す: {bell}"
         );
         assert!(
-            broker.state.is_busy("%2"),
+            broker.state.is_busy("w1:p2"),
             "催促も通常配達と同じく Busy を先に立てる"
         );
 
         // busy の間も、idle へ戻って cooldown 中も、追い討ちしない。
         tokio::time::advance(std::time::Duration::from_secs(61)).await;
         broker.nag_unacked().await;
-        broker.turn_end(Some("%2".into())).await.unwrap();
+        broker.turn_end(Some("w1:p2".into())).await.unwrap();
         broker.nag_unacked().await;
         assert_eq!(
             bells(&broker).len(),
@@ -3391,9 +3433,9 @@ mod tests {
         assert_eq!(bells(&broker).len(), before + 2);
 
         // ack すれば止まる。
-        broker.turn_end(Some("%2".into())).await.unwrap();
+        broker.turn_end(Some("w1:p2".into())).await.unwrap();
         let acked = broker
-            .handle(request("ack-message", Some("%2"), &[&id.to_string()]))
+            .handle(request("ack-message", Some("w1:p2"), &[&id.to_string()]))
             .await;
         assert_eq!(acked.code, 0, "{}", acked.stderr);
         tokio::time::advance(std::time::Duration::from_mins(10)).await;
@@ -3405,7 +3447,7 @@ mod tests {
     async fn an_unread_message_is_nagged_to_read_and_a_busy_target_is_left_alone() {
         let dir = tempfile::tempdir().unwrap();
         let mut broker = registered_pair(&dir).await;
-        let id = json(&broker.handle(send_request("%1", "claude", "body")).await)["id"]
+        let id = json(&broker.handle(send_request("w1:p1", "claude", "body")).await)["id"]
             .as_u64()
             .unwrap();
 
@@ -3416,7 +3458,7 @@ mod tests {
         assert_eq!(bells(&broker).len(), before, "busy 中は催促しない");
 
         // idle に戻ると未読向けの文言で催促される。
-        broker.turn_end(Some("%2".into())).await.unwrap();
+        broker.turn_end(Some("w1:p2".into())).await.unwrap();
         broker.nag_unacked().await;
         let after: Vec<_> = bells(&broker)[before..].to_vec();
         assert_eq!(after.len(), 1);
@@ -3469,121 +3511,92 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cross_backend_scopes_resolve_by_label_alias_and_formal_name() {
+    async fn scopes_resolve_by_label_alias_cwd_and_compat_prefix() {
         let dir = tempfile::tempdir().unwrap();
-        // tmux session "settings" と herdr label "settings" が同名で共存し、
-        // herdr には label "knowledge" (workspace_id w2) も居る、という実在の配置。
-        let tmux_codex = PaneInfo {
-            session: "settings".into(),
-            ..pane_info("%1", Some("codex"))
-        };
-        let tmux_claude = PaneInfo {
-            session: "settings".into(),
-            ..pane_info("%2", Some("claude"))
-        };
-        let herdr_codex = PaneInfo {
-            session: "settings".into(),
-            scope_alias: Some("w1".into()),
-            window_id: "w1:t1".into(),
-            backend: crate::backend::BackendKind::Herdr,
+        // label "settings" (w1) に codex と claude、label "knowledge" (w2) に
+        // claude が居る、という実在に近い配置。
+        let settings_codex = HerdrPane {
+            workspace_label: Some("settings".into()),
             ..pane_info("w1:p1", Some("codex"))
         };
-        let herdr_claude = PaneInfo {
-            session: "knowledge".into(),
-            scope_alias: Some("w2".into()),
-            window_id: "w2:t1".into(),
+        let settings_claude = HerdrPane {
+            workspace_label: Some("settings".into()),
+            ..pane_info("w1:p2", Some("claude"))
+        };
+        let knowledge_claude = HerdrPane {
+            workspace_label: Some("knowledge".into()),
             cwd: "/home/miyabi/.local/share/arona-knowledge".into(),
-            backend: crate::backend::BackendKind::Herdr,
             ..pane_info("w2:p1", Some("claude"))
         };
         let mut broker = broker(
             &dir,
-            vec![tmux_codex, tmux_claude, herdr_codex, herdr_claude],
+            vec![settings_codex, settings_claude, knowledge_claude],
         );
-        for (pane, name) in [
-            ("%1", "codex"),
-            ("%2", "claude"),
-            ("w1:p1", "codex"),
-            ("w2:p1", "claude"),
-        ] {
-            let response = broker
-                .handle(request("register", Some(pane), &[name]))
-                .await;
-            assert_eq!(response.code, 0, "{}", response.stderr);
-        }
+        broker.sync_herdr_registry().await;
 
-        // label で backend を跨いで引ける (user 目的の本丸)。
+        // workspace label で引ける。
         let resolved = broker
-            .resolve("knowledge/claude", Some("%1"))
+            .resolve("knowledge/claude", Some("w1:p1"))
             .await
             .unwrap();
         assert_eq!(resolved.0, "w2:p1");
         // workspace_id alias の後方互換。
-        let resolved = broker.resolve("w2/claude", Some("%1")).await.unwrap();
+        let resolved = broker.resolve("w2/claude", Some("w1:p1")).await.unwrap();
         assert_eq!(resolved.0, "w2:p1");
         // cwd basename でも従来どおり。
         let resolved = broker
-            .resolve("arona-knowledge/claude", Some("%1"))
+            .resolve("arona-knowledge/claude", Some("w1:p1"))
             .await
             .unwrap();
         assert_eq!(resolved.0, "w2:p1");
-
-        // backend を跨いだ同名 scope は曖昧 fail + 正式名称の案内。
-        let error = broker
-            .resolve("settings/codex", Some("%2"))
-            .await
-            .unwrap_err();
-        assert!(
-            error.stderr.contains("tmux/<scope>/<name>"),
-            "{}",
-            error.stderr
-        );
-        // 正式名称なら一意。
+        // tmux 併存期の正式名称 `herdr/<scope>/<name>` は互換 alias として通る。
         let resolved = broker
-            .resolve("tmux/settings/codex", Some("%2"))
+            .resolve("herdr/knowledge/claude", Some("w1:p1"))
             .await
             .unwrap();
-        assert_eq!(resolved.0, "%1");
-        let resolved = broker
-            .resolve("herdr/settings/codex", Some("%2"))
-            .await
-            .unwrap();
-        assert_eq!(resolved.0, "w1:p1");
-        // 不明な backend は明示エラー。
+        assert_eq!(resolved.0, "w2:p1");
+        // 不明な backend prefix は明示エラー。
         let error = broker
-            .resolve("wayland/settings/codex", Some("%2"))
+            .resolve("wayland/settings/codex", Some("w1:p2"))
             .await
             .unwrap_err();
         assert!(error.stderr.contains("不明"), "{}", error.stderr);
 
-        // bare 名は自 backend 限定: tmux の %2 から "codex" は herdr の
-        // settings (w1:p1) を拾わず、同 session の %1 に一意化する。
-        let resolved = broker.resolve("codex", Some("%2")).await.unwrap();
-        assert_eq!(resolved.0, "%1");
-        // herdr 側からの bare 名も tmux を拾わない (同 session 候補なし = 不在)。
-        let error = broker.resolve("claude", Some("w1:p1")).await.unwrap_err();
+        // bare 名は同 window → 同 session の近接で解決する。
+        let resolved = broker.resolve("claude", Some("w1:p1")).await.unwrap();
+        assert_eq!(resolved.0, "w1:p2");
+        // scope 外の bare 名は不在エラー (暗黙に workspace を跨がない)。
+        let error = broker.resolve("codex", Some("w2:p1")).await.unwrap_err();
         assert!(error.stderr.contains("見つかりません"), "{}", error.stderr);
-    }
 
-    fn herdr_agent_pane(pane_id: &str, agent: Option<&str>) -> crate::herdr::HerdrPane {
-        crate::herdr::HerdrPane {
-            pane_id: pane_id.into(),
-            terminal_id: format!("term_{pane_id}"),
-            workspace_id: "w1".into(),
-            workspace_label: Some("settings".into()),
-            tab_id: "w1:t1".into(),
-            cwd: "/tmp".into(),
-            agent: agent.map(str::to_owned),
-            status: crate::herdr::AgentStatus::Idle,
-        }
+        // 同 window に候補が複数並ぶ bare 名は曖昧エラーで scope 指定を案内する。
+        set_herdr_panes(
+            &broker,
+            vec![
+                HerdrPane {
+                    workspace_label: Some("settings".into()),
+                    ..pane_info("w1:p1", Some("codex"))
+                },
+                HerdrPane {
+                    workspace_label: Some("settings".into()),
+                    ..pane_info("w1:p2", Some("claude"))
+                },
+                HerdrPane {
+                    workspace_label: Some("settings".into()),
+                    ..pane_info("w1:p3", Some("claude"))
+                },
+            ],
+        );
+        broker.sync_herdr_registry().await;
+        let error = broker.resolve("claude", Some("w1:p1")).await.unwrap_err();
+        assert!(error.stderr.contains("<scope>/<name>"), "{}", error.stderr);
     }
 
     /// scripted herdr の一覧を差し替える (tick の合間の変化を模す)。
-    fn set_herdr_panes(broker_ref: &Broker, panes: Vec<crate::herdr::HerdrPane>) {
+    fn set_herdr_panes(broker_ref: &Broker, panes: Vec<HerdrPane>) {
         *broker_ref
-            .mux
+            .backend
             .herdr()
-            .unwrap()
             .scripted
             .as_ref()
             .unwrap()
@@ -3594,13 +3607,9 @@ mod tests {
     #[tokio::test]
     async fn herdr_agents_are_pulled_in_without_hooks() {
         let dir = tempfile::tempdir().unwrap();
-        let mut broker = broker(&dir, vec![pane_info("%9", Some("cursor"))]);
-        broker.mux = Multiplexer::new(
-            Some(Tmux::scripted(vec![pane_info("%9", Some("cursor"))])),
-            Some(Herdr::scripted(vec![
-                herdr_agent_pane("w1:p7", Some("grok")),
-                herdr_agent_pane("w1:p8", None),
-            ])),
+        let mut broker = broker(
+            &dir,
+            vec![pane_info("w1:p7", Some("grok")), pane_info("w1:p8", None)],
         );
         broker.sync_herdr_registry().await;
         assert!(
@@ -3611,10 +3620,6 @@ mod tests {
         assert!(
             !broker.state.agents.contains_key("w1:p8"),
             "identity の無い pane は登録しない"
-        );
-        assert!(
-            !broker.state.agents.contains_key("%9"),
-            "tmux の @agent mirror からは稼働中に登録しない"
         );
         // idempotent: 何度回しても journal に Register が増えない。
         let journal_path = broker.config.journal.clone();
@@ -3635,20 +3640,27 @@ mod tests {
     async fn a_flapping_herdr_detection_suspects_then_evicts() {
         let dir = tempfile::tempdir().unwrap();
         let mut broker = registered_pair(&dir).await;
-        broker.mux = Multiplexer::new(
-            Some(Tmux::scripted(vec![pane_info("%1", Some("codex"))])),
-            Some(Herdr::scripted(vec![herdr_agent_pane(
-                "w1:p7",
-                Some("grok"),
-            )])),
+        set_herdr_panes(
+            &broker,
+            vec![
+                pane_info("w1:p1", Some("codex")),
+                pane_info("w1:p7", Some("grok")),
+            ],
         );
         broker.sync_herdr_registry().await;
         // %1 から grok 宛てに送る (scripted herdr は配達 socket を持たないので queue 行き)。
-        let sent = json(&broker.handle(send_request("%1", "w1:p7", "for grok")).await);
+        let sent = json(
+            &broker
+                .handle(send_request("w1:p1", "w1:p7", "for grok"))
+                .await,
+        );
         let pending_id = sent["id"].as_u64().unwrap();
 
         // 欠落1回目: suspect — 登録は残るが、配達も message RPC も止まる。
-        set_herdr_panes(&broker, vec![herdr_agent_pane("w1:p7", None)]);
+        set_herdr_panes(
+            &broker,
+            vec![pane_info("w1:p1", Some("codex")), pane_info("w1:p7", None)],
+        );
         broker.sync_herdr_registry().await;
         assert!(
             broker.state.agents.contains_key("w1:p7"),
@@ -3668,13 +3680,22 @@ mod tests {
         assert_eq!(bells(&broker).len(), before, "suspect 中は配達しない");
 
         // 同一 identity が戻れば解除、mail は無傷。
-        set_herdr_panes(&broker, vec![herdr_agent_pane("w1:p7", Some("grok"))]);
+        set_herdr_panes(
+            &broker,
+            vec![
+                pane_info("w1:p1", Some("codex")),
+                pane_info("w1:p7", Some("grok")),
+            ],
+        );
         broker.sync_herdr_registry().await;
         assert!(!broker.state.agents["w1:p7"].suspect);
         assert!(!broker.state.message(pending_id).unwrap().acked);
 
         // 2連続の欠落で evict + 集約回収。
-        set_herdr_panes(&broker, vec![herdr_agent_pane("w1:p7", None)]);
+        set_herdr_panes(
+            &broker,
+            vec![pane_info("w1:p1", Some("codex")), pane_info("w1:p7", None)],
+        );
         broker.sync_herdr_registry().await;
         broker.sync_herdr_registry().await;
         assert!(!broker.state.agents.contains_key("w1:p7"));
@@ -3689,19 +3710,29 @@ mod tests {
     async fn an_identity_swap_takes_over_immediately() {
         let dir = tempfile::tempdir().unwrap();
         let mut broker = registered_pair(&dir).await;
-        broker.mux = Multiplexer::new(
-            Some(Tmux::scripted(vec![pane_info("%1", Some("codex"))])),
-            Some(Herdr::scripted(vec![herdr_agent_pane(
-                "w1:p7",
-                Some("grok"),
-            )])),
+        set_herdr_panes(
+            &broker,
+            vec![
+                pane_info("w1:p1", Some("codex")),
+                pane_info("w1:p7", Some("grok")),
+            ],
         );
         broker.sync_herdr_registry().await;
-        let sent = json(&broker.handle(send_request("%1", "w1:p7", "for grok")).await);
+        let sent = json(
+            &broker
+                .handle(send_request("w1:p1", "w1:p7", "for grok"))
+                .await,
+        );
         let pending_id = sent["id"].as_u64().unwrap();
 
         // 別 identity は強い証拠: debounce せず旧登録を回収して新 identity を登録。
-        set_herdr_panes(&broker, vec![herdr_agent_pane("w1:p7", Some("gemini"))]);
+        set_herdr_panes(
+            &broker,
+            vec![
+                pane_info("w1:p1", Some("codex")),
+                pane_info("w1:p7", Some("gemini")),
+            ],
+        );
         broker.sync_herdr_registry().await;
         assert_eq!(broker.state.agents["w1:p7"].name, "gemini");
         assert!(!broker.state.agents["w1:p7"].suspect);
@@ -3716,19 +3747,16 @@ mod tests {
     async fn snapshot_errors_freeze_the_pull_verdict() {
         let dir = tempfile::tempdir().unwrap();
         let mut broker = registered_pair(&dir).await;
-        broker.mux = Multiplexer::new(
-            Some(Tmux::scripted(vec![pane_info("%1", Some("codex"))])),
-            Some(Herdr::scripted(vec![herdr_agent_pane(
-                "w1:p7",
-                Some("grok"),
-            )])),
+        set_herdr_panes(
+            &broker,
+            vec![
+                pane_info("w1:p1", Some("codex")),
+                pane_info("w1:p7", Some("grok")),
+            ],
         );
         broker.sync_herdr_registry().await;
         // snapshot が取れない間は、何度 tick が回っても判定を進めない。
-        broker.mux = Multiplexer::new(
-            Some(Tmux::scripted(vec![pane_info("%1", Some("codex"))])),
-            Some(Herdr::new("/nonexistent/herdr.sock".into())),
-        );
+        broker.backend = Backend::new(crate::herdr::Herdr::new("/nonexistent/herdr.sock".into()));
         for _ in 0..3 {
             broker.sync_herdr_registry().await;
         }
@@ -3740,14 +3768,7 @@ mod tests {
     async fn startup_syncs_a_swapped_herdr_identity_before_serving() {
         let dir = tempfile::tempdir().unwrap();
         {
-            let mut broker = broker(&dir, vec![]);
-            broker.mux = Multiplexer::new(
-                Some(Tmux::scripted(vec![])),
-                Some(Herdr::scripted(vec![herdr_agent_pane(
-                    "w1:p7",
-                    Some("grok"),
-                )])),
-            );
+            let mut broker = broker(&dir, vec![pane_info("w1:p7", Some("grok"))]);
             broker.sync_herdr_registry().await;
             assert_eq!(broker.state.agents["w1:p7"].name, "grok");
         }
@@ -3757,14 +3778,8 @@ mod tests {
             broker.state.agents["w1:p7"].name, "grok",
             "journal 復元は旧 identity"
         );
-        broker.mux = Multiplexer::new(
-            Some(Tmux::scripted(vec![])),
-            Some(Herdr::scripted(vec![herdr_agent_pane(
-                "w1:p7",
-                Some("gemini"),
-            )])),
-        );
-        broker.startup().await;
+        set_herdr_panes(&broker, vec![pane_info("w1:p7", Some("gemini"))]);
+        broker.startup().await.unwrap();
         assert_eq!(
             broker.state.agents["w1:p7"].name, "gemini",
             "受付開始前に snapshot と同期し、最初の tick までの誤配窓を作らない"
@@ -3776,19 +3791,24 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut broker = registered_pair(&dir).await;
         broker.config.queue_limit = 1;
-        broker.mux = Multiplexer::new(
-            Some(Tmux::scripted(vec![pane_info("%1", Some("codex"))])),
-            Some(Herdr::scripted(vec![herdr_agent_pane(
-                "w1:p7",
-                Some("grok"),
-            )])),
+        set_herdr_panes(
+            &broker,
+            vec![
+                pane_info("w1:p1", Some("codex")),
+                pane_info("w1:p7", Some("grok")),
+            ],
         );
         broker.sync_herdr_registry().await;
-        set_herdr_panes(&broker, vec![herdr_agent_pane("w1:p7", None)]);
+        set_herdr_panes(
+            &broker,
+            vec![pane_info("w1:p1", Some("codex")), pane_info("w1:p7", None)],
+        );
         broker.sync_herdr_registry().await;
         assert!(broker.state.agents["w1:p7"].suspect);
 
-        let first = broker.handle(send_request("%1", "w1:p7", "queued")).await;
+        let first = broker
+            .handle(send_request("w1:p1", "w1:p7", "queued"))
+            .await;
         assert_eq!(first.code, 0, "{}", first.stderr);
         let journal_path = broker.config.journal.clone();
         let lines = move || {
@@ -3798,7 +3818,7 @@ mod tests {
                 .count()
         };
         let before = lines();
-        let second = broker.handle(send_request("%1", "w1:p7", "over")).await;
+        let second = broker.handle(send_request("w1:p1", "w1:p7", "over")).await;
         assert!(
             second.stderr.contains("キュー保持上限"),
             "suspect 宛でも上限は効く: {}",
@@ -3812,12 +3832,13 @@ mod tests {
     async fn a_herdr_sender_receives_the_failure_notice() {
         let dir = tempfile::tempdir().unwrap();
         let mut broker = registered_pair(&dir).await;
-        broker.mux = Multiplexer::new(
-            Some(Tmux::scripted(vec![pane_info("%1", Some("codex"))])),
-            Some(Herdr::scripted(vec![
-                herdr_agent_pane("w1:p6", Some("grok")),
-                herdr_agent_pane("w1:p7", Some("gemini")),
-            ])),
+        set_herdr_panes(
+            &broker,
+            vec![
+                pane_info("w1:p1", Some("codex")),
+                pane_info("w1:p6", Some("grok")),
+                pane_info("w1:p7", Some("gemini")),
+            ],
         );
         broker.sync_herdr_registry().await;
         let sent = json(
@@ -3829,10 +3850,7 @@ mod tests {
 
         set_herdr_panes(
             &broker,
-            vec![
-                herdr_agent_pane("w1:p6", Some("grok")),
-                herdr_agent_pane("w1:p7", None),
-            ],
+            vec![pane_info("w1:p6", Some("grok")), pane_info("w1:p7", None)],
         );
         broker.sync_herdr_registry().await;
         broker.sync_herdr_registry().await;
@@ -3848,12 +3866,13 @@ mod tests {
     async fn a_suspect_sender_keeps_its_failure_notice_queued_until_recovery() {
         let dir = tempfile::tempdir().unwrap();
         let mut broker = registered_pair(&dir).await;
-        broker.mux = Multiplexer::new(
-            Some(Tmux::scripted(vec![pane_info("%1", Some("codex"))])),
-            Some(Herdr::scripted(vec![
-                herdr_agent_pane("w1:p6", Some("grok")),
-                herdr_agent_pane("w1:p7", Some("gemini")),
-            ])),
+        set_herdr_panes(
+            &broker,
+            vec![
+                pane_info("w1:p1", Some("codex")),
+                pane_info("w1:p6", Some("grok")),
+                pane_info("w1:p7", Some("gemini")),
+            ],
         );
         broker.sync_herdr_registry().await;
         let sent = json(
@@ -3866,10 +3885,7 @@ mod tests {
         // 宛先が先に1回欠落し、次の tick で送信元も一瞬映らないまま宛先が evict。
         set_herdr_panes(
             &broker,
-            vec![
-                herdr_agent_pane("w1:p6", Some("grok")),
-                herdr_agent_pane("w1:p7", None),
-            ],
+            vec![pane_info("w1:p6", Some("grok")), pane_info("w1:p7", None)],
         );
         broker.sync_herdr_registry().await;
         set_herdr_panes(&broker, vec![]);
@@ -3888,7 +3904,7 @@ mod tests {
         );
 
         // 復帰すれば隔離が解けて drain 対象に戻る。通知は queue に残ったまま。
-        set_herdr_panes(&broker, vec![herdr_agent_pane("w1:p6", Some("grok"))]);
+        set_herdr_panes(&broker, vec![pane_info("w1:p6", Some("grok"))]);
         broker.sync_herdr_registry().await;
         assert!(!broker.state.agents["w1:p6"].suspect);
         assert_eq!(broker.state.queue_len("w1:p6"), 1);
@@ -3898,20 +3914,24 @@ mod tests {
     async fn a_takeover_that_cannot_be_journaled_leaves_the_old_identity_suspect() {
         let dir = tempfile::tempdir().unwrap();
         let mut broker = registered_pair(&dir).await;
-        broker.mux = Multiplexer::new(
-            Some(Tmux::scripted(vec![pane_info("%1", Some("codex"))])),
-            Some(Herdr::scripted(vec![herdr_agent_pane(
-                "w1:p7",
-                Some("grok"),
-            )])),
+        set_herdr_panes(
+            &broker,
+            vec![
+                pane_info("w1:p1", Some("codex")),
+                pane_info("w1:p7", Some("grok")),
+            ],
         );
         broker.sync_herdr_registry().await;
-        let sent = json(&broker.handle(send_request("%1", "w1:p7", "for grok")).await);
+        let sent = json(
+            &broker
+                .handle(send_request("w1:p1", "w1:p7", "for grok"))
+                .await,
+        );
         let pending_id = sent["id"].as_u64().unwrap();
 
         // 旧 pending の回収を永続化できない間は、交代を一切進めない。
         broker.journal.fail_next_appends(10);
-        set_herdr_panes(&broker, vec![herdr_agent_pane("w1:p7", Some("gemini"))]);
+        set_herdr_panes(&broker, vec![pane_info("w1:p7", Some("gemini"))]);
         broker.sync_herdr_registry().await;
         assert_eq!(
             broker.state.agents["w1:p7"].name, "grok",
@@ -3933,18 +3953,18 @@ mod tests {
     async fn a_takeover_register_failure_defers_the_new_identity_to_the_next_sync() {
         let dir = tempfile::tempdir().unwrap();
         let mut broker = registered_pair(&dir).await;
-        broker.mux = Multiplexer::new(
-            Some(Tmux::scripted(vec![pane_info("%1", Some("codex"))])),
-            Some(Herdr::scripted(vec![herdr_agent_pane(
-                "w1:p7",
-                Some("grok"),
-            )])),
+        set_herdr_panes(
+            &broker,
+            vec![
+                pane_info("w1:p1", Some("codex")),
+                pane_info("w1:p7", Some("grok")),
+            ],
         );
         broker.sync_herdr_registry().await;
 
         // Remove (1回目の append) は通り、直後の Register だけが落ちる。
         broker.journal.fail_appends_after(1);
-        set_herdr_panes(&broker, vec![herdr_agent_pane("w1:p7", Some("gemini"))]);
+        set_herdr_panes(&broker, vec![pane_info("w1:p7", Some("gemini"))]);
         broker.sync_herdr_registry().await;
         assert!(
             !broker.state.agents.contains_key("w1:p7"),
@@ -3963,13 +3983,7 @@ mod tests {
     async fn an_unaddressable_native_name_is_never_registered() {
         let dir = tempfile::tempdir().unwrap();
         let mut broker = broker(&dir, vec![]);
-        broker.mux = Multiplexer::new(
-            Some(Tmux::scripted(vec![])),
-            Some(Herdr::scripted(vec![herdr_agent_pane(
-                "w1:p7",
-                Some("bad/name"),
-            )])),
-        );
+        set_herdr_panes(&broker, vec![pane_info("w1:p7", Some("bad/name"))]);
         broker.sync_herdr_registry().await;
         assert!(
             !broker.state.agents.contains_key("w1:p7"),
@@ -3981,13 +3995,7 @@ mod tests {
     async fn herdr_registrations_refuse_manual_unregister() {
         let dir = tempfile::tempdir().unwrap();
         let mut broker = broker(&dir, vec![]);
-        broker.mux = Multiplexer::new(
-            Some(Tmux::scripted(vec![])),
-            Some(Herdr::scripted(vec![herdr_agent_pane(
-                "w1:p7",
-                Some("grok"),
-            )])),
-        );
+        set_herdr_panes(&broker, vec![pane_info("w1:p7", Some("grok"))]);
         broker.sync_herdr_registry().await;
         let refused = broker
             .handle(request("unregister", Some("w1:p7"), &[]))
@@ -4002,18 +4010,30 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut broker = registered_pair(&dir).await;
         // send1 で %2 は Busy になり、send2 は queue に入る。
-        let first = json(&broker.handle(send_request("%1", "claude", "first")).await);
+        let first = json(
+            &broker
+                .handle(send_request("w1:p1", "claude", "first"))
+                .await,
+        );
         assert_eq!(first["path"], "sent");
-        let second = json(&broker.handle(send_request("%1", "claude", "second")).await);
+        let second = json(
+            &broker
+                .handle(send_request("w1:p1", "claude", "second"))
+                .await,
+        );
         assert_eq!(second["path"], "queued");
         let second_id = second["id"].as_u64().unwrap();
 
         // 配達失敗後に Idle へ戻った状態 (queue が残ったまま idle) を作る。
         broker.state.ack(first["id"].as_u64().unwrap());
-        broker.state.set_state("%2", AgentState::Idle);
+        broker.state.set_state("w1:p2", AgentState::Idle);
 
         // Idle でも queue が残っている間、新規 send は直接配達で追い越さない。
-        let third = json(&broker.handle(send_request("%1", "claude", "third")).await);
+        let third = json(
+            &broker
+                .handle(send_request("w1:p1", "claude", "third"))
+                .await,
+        );
         assert_eq!(
             third["path"], "queued",
             "queue が残る pane への新規 send が FIFO を追い越してはならない"
@@ -4030,169 +4050,18 @@ mod tests {
             "先頭 (send2) が先に配達される: {:?}",
             after[0]
         );
-        assert!(broker.state.is_busy("%2"), "配達後は Busy に戻る");
-        assert!(broker.state.is_queued("%2", third_id));
+        assert!(broker.state.is_busy("w1:p2"), "配達後は Busy に戻る");
+        assert!(broker.state.is_queued("w1:p2", third_id));
 
         // 受信側の turn-end で send3 が続き、順序が送信順と一致する。
-        broker.turn_end(Some("%2".into())).await.unwrap();
+        broker.turn_end(Some("w1:p2".into())).await.unwrap();
         let drained: Vec<_> = bells(&broker)[before..].to_vec();
         assert_eq!(drained.len(), 2);
         assert!(
             drained[1].1.contains(&format!("read_message {third_id}")),
             "{drained:?}"
         );
-        assert_eq!(broker.state.queue_len("%2"), 0, "queue は空になる");
-    }
-
-    #[tokio::test]
-    async fn a_live_pane_survives_mirror_drift_and_gets_its_mirror_repaired() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut broker = registered_pair(&dir).await;
-        // %2 は生存しているが `@agent` mirror が消えている (drift)。
-        broker.mux = Multiplexer::new(
-            Some(Tmux::scripted(vec![
-                pane_info("%1", Some("codex")),
-                pane_info("%2", None),
-            ])),
-            None,
-        );
-        broker.reconcile(false).await;
-        assert!(
-            broker.state.agents.contains_key("%2"),
-            "mirror 欠落だけで生存 pane を evict してはならない"
-        );
-        let repairs: Vec<_> = broker
-            .mux
-            .tmux()
-            .unwrap()
-            .options
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|(pane, key, _)| pane == "%2" && key == "@agent")
-            .map(|(_, _, value)| value.clone())
-            .collect();
-        assert_eq!(
-            repairs,
-            [Some("claude".to_owned())],
-            "memory を正として mirror を修復する"
-        );
-
-        // mirror が別名へ drift しても、registry (唯一の真実) が勝つ。
-        broker.mux = Multiplexer::new(
-            Some(Tmux::scripted(vec![
-                pane_info("%1", Some("codex")),
-                pane_info("%2", Some("cursor")),
-            ])),
-            None,
-        );
-        broker.reconcile(false).await;
-        assert!(broker.state.agents.contains_key("%2"));
-        assert_eq!(broker.state.agents["%2"].name, "claude");
-
-        // pane そのものが消えたときは従来どおり evict する。
-        broker.mux = Multiplexer::new(
-            Some(Tmux::scripted(vec![pane_info("%1", Some("codex"))])),
-            None,
-        );
-        broker.reconcile(false).await;
-        assert!(!broker.state.agents.contains_key("%2"));
-    }
-
-    fn herdr_pane_info(pane_id: &str, agent: Option<&str>) -> PaneInfo {
-        PaneInfo {
-            backend: crate::backend::BackendKind::Herdr,
-            ..pane_info(pane_id, agent)
-        }
-    }
-
-    #[tokio::test]
-    async fn reconcile_owns_tmux_lifecycle_and_leaves_herdr_to_the_pull_sync() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut broker = broker(
-            &dir,
-            vec![
-                pane_info("%1", Some("codex")),
-                herdr_pane_info("w2:p1", Some("claude")),
-            ],
-        );
-        for (pane, name) in [("%1", "codex"), ("w2:p1", "claude")] {
-            let response = broker
-                .handle(request("register", Some(pane), &[name]))
-                .await;
-            assert_eq!(response.code, 0, "{}", response.stderr);
-        }
-        // tmux: mirror drift では消えない (従来どおり)。pane 消滅で evict。
-        broker.mux = Multiplexer::new(
-            Some(Tmux::scripted(vec![
-                pane_info("%1", None),
-                herdr_pane_info("w2:p1", None),
-            ])),
-            None,
-        );
-        broker.reconcile(false).await;
-        assert!(broker.state.agents.contains_key("%1"));
-        // herdr: reconcile は識別不一致でも触らない (sync の debounce が所有)。
-        assert!(
-            broker.state.agents.contains_key("w2:p1"),
-            "reconcile が herdr を即 evict すると debounce を迂回する"
-        );
-        broker.mux = Multiplexer::new(
-            Some(Tmux::scripted(vec![herdr_pane_info("w2:p1", None)])),
-            None,
-        );
-        broker.reconcile(false).await;
-        assert!(
-            !broker.state.agents.contains_key("%1"),
-            "tmux は pane 消滅で evict"
-        );
-        assert!(broker.state.agents.contains_key("w2:p1"));
-    }
-
-    #[tokio::test]
-    async fn failure_notices_survive_sender_mirror_drift() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut broker = registered_pair(&dir).await;
-        let original = json(&broker.handle(send_request("%1", "claude", "body")).await)["id"]
-            .as_u64()
-            .unwrap();
-        // 送信者 %1 は生存しているが mirror が欠落。宛先 %2 は消滅。
-        broker.mux = Multiplexer::new(Some(Tmux::scripted(vec![pane_info("%1", None)])), None);
-        assert!(
-            broker
-                .remove_agent("%2", "宛先エージェントが退出した")
-                .await
-        );
-        assert_eq!(
-            notices_for(&broker, original),
-            1,
-            "mirror drift した送信者にも失敗通知が届く (silent 退役の禁止)"
-        );
-        assert!(broker.state.message(original).unwrap().acked);
-    }
-
-    #[tokio::test]
-    async fn reconcile_defers_eviction_while_a_backend_is_unreachable() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut broker = registered_pair(&dir).await;
-        // herdr が応答しない間は、tmux 一覧に居ない %2 も evict しない
-        // (不完全な一覧を「不在」と読まない)。
-        broker.mux = Multiplexer::new(
-            Some(Tmux::scripted(vec![pane_info("%1", Some("codex"))])),
-            Some(Herdr::new("/nonexistent/herdr.sock".into())),
-        );
-        broker.reconcile(false).await;
-        assert!(
-            broker.state.agents.contains_key("%2"),
-            "backend 部分失敗中の evict は見送る"
-        );
-        // 全 backend が答えたら通常どおり evict する。
-        broker.mux = Multiplexer::new(
-            Some(Tmux::scripted(vec![pane_info("%1", Some("codex"))])),
-            None,
-        );
-        broker.reconcile(false).await;
-        assert!(!broker.state.agents.contains_key("%2"));
+        assert_eq!(broker.state.queue_len("w1:p2"), 0, "queue は空になる");
     }
 
     #[tokio::test]
@@ -4200,7 +4069,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut broker = registered_pair(&dir).await;
         // 旧 adapter が送る *-v1 名は canonical と同じ operation へ正規化される。
-        let mut legacy_send = request("send-message-v1", Some("%1"), &["claude"]);
+        let mut legacy_send = request("send-message-v1", Some("w1:p1"), &["claude"]);
         legacy_send.stdin = "legacy body".into();
         legacy_send.send_options = Some(SendOptions::default());
         let sent = json(&broker.handle(legacy_send).await);
@@ -4209,17 +4078,17 @@ mod tests {
 
         let read = json(
             &broker
-                .handle(request("read-v1", Some("%2"), &[&id.to_string()]))
+                .handle(request("read-v1", Some("w1:p2"), &[&id.to_string()]))
                 .await,
         );
         assert!(read["body"].as_str().unwrap().contains("legacy body"));
 
-        let peers = json(&broker.handle(request("peers-v1", Some("%2"), &[])).await);
+        let peers = json(&broker.handle(request("peers-v1", Some("w1:p2"), &[])).await);
         assert_eq!(peers["pending_to_me"][0], id);
 
         let acked = json(
             &broker
-                .handle(request("ack-v1", Some("%2"), &[&id.to_string()]))
+                .handle(request("ack-v1", Some("w1:p2"), &[&id.to_string()]))
                 .await,
         );
         assert_eq!(acked["outcome"], "acked");
@@ -4243,18 +4112,15 @@ mod tests {
         let mut ids = Vec::new();
         for _ in 0..2 {
             ids.push(
-                json(&broker.handle(send_request("%1", "claude", &big)).await)["id"]
+                json(&broker.handle(send_request("w1:p1", "claude", &big)).await)["id"]
                     .as_u64()
                     .unwrap(),
             );
         }
-        broker.mux = Multiplexer::new(
-            Some(Tmux::scripted(vec![pane_info("%1", Some("codex"))])),
-            None,
-        );
+        set_herdr_panes(&broker, vec![pane_info("w1:p1", Some("codex"))]);
         assert!(
             broker
-                .remove_agent("%2", "宛先エージェントが退出した")
+                .remove_agent("w1:p2", "宛先エージェントが退出した")
                 .await
         );
 
@@ -4262,7 +4128,7 @@ mod tests {
             .state
             .messages
             .values()
-            .find(|stored| stored.target_pane == "%1" && !stored.acked)
+            .find(|stored| stored.target_pane == "w1:p1" && !stored.acked)
             .expect("collapsed notice");
         let brief = &notice.message.brief;
         assert!(
@@ -4288,11 +4154,11 @@ mod tests {
     fn http_routes_are_read_only_and_api_misses_do_not_fall_back() {
         assert_eq!(classify_http(&Method::GET, "/api/hello"), HttpRoute::Hello);
         assert_eq!(classify_http(&Method::GET, "/api/who"), HttpRoute::Who);
+        // 撤去済みの tmux 形式 (`%N`) は screen route に載らない。
         assert_eq!(
             classify_http(&Method::GET, "/api/agents/%251/screen"),
-            HttpRoute::Screen("%1".into())
+            HttpRoute::NotFound
         );
-        // herdr の pane id も screen route に乗る (実管理画面の herdr 表示)。
         assert_eq!(
             classify_http(&Method::GET, "/api/agents/w2%3Ap4/screen"),
             HttpRoute::Screen("w2:p4".into())
@@ -4417,11 +4283,11 @@ mod tests {
         let encoded = serde_json::to_string(&WebAgent {
             name: "co\"dex".into(),
             state: AgentState::Idle,
-            pane_id: "%1".into(),
+            pane_id: "w1:p1".into(),
             session: "work".into(),
             location: "work:0.1".into(),
             cwd: "/tmp/project with \"quotes\"".into(),
-            backend: "tmux",
+            backend: "herdr",
         })
         .unwrap();
         assert!(encoded.contains(r#""cwd":"/tmp/project with \"quotes\"""#));

@@ -137,6 +137,9 @@ pub enum Dispatch {
 }
 
 impl BrokerState {
+    /// 上書き登録 (test 専用)。production の登録は pull 同期由来の
+    /// `restore_agent` だけが行う。
+    #[cfg(test)]
     pub fn register(&mut self, pane: String, name: String) {
         self.agents.insert(
             pane,
@@ -283,7 +286,8 @@ impl BrokerState {
     /// (新しい住人へ誤配送しないため)。
     pub fn reply_target(&self, message: &Message) -> Option<String> {
         let captured = message.sender_name.as_deref()?;
-        if !message.sender.starts_with('%') {
+        // 送信者が pane (agent) のときだけ返信先になる。human / system は宛先にならない。
+        if !crate::pane_id::is_pane_id(&message.sender) {
             return None;
         }
         let agent = self.agents.get(&message.sender)?;
@@ -549,12 +553,12 @@ mod tests {
     #[test]
     fn sender_identity_is_captured_at_send_time_and_never_re_resolved() {
         let mut state = BrokerState::default();
-        state.register("%1".into(), "claude".into());
-        state.register("%2".into(), "codex".into());
+        state.register("w1:p1".into(), "claude".into());
+        state.register("w1:p2".into(), "codex".into());
         let Dispatch::Deliver(id) = state
             .dispatch(
-                "%1",
-                Origin::new("%2", "codex"),
+                "w1:p1",
+                Origin::new("w1:p2", "codex"),
                 "body".into(),
                 "claude",
                 bell,
@@ -565,10 +569,10 @@ mod tests {
         };
         let captured = state.message(id).unwrap().message.clone();
         assert_eq!(captured.sender_label(), "codex");
-        assert_eq!(state.reply_target(&captured), Some("%2".into()));
+        assert_eq!(state.reply_target(&captured), Some("w1:p2".into()));
 
         // 送信者が改名 (= pane ID 再利用) しても、捕捉した名前は変わらない。
-        state.register("%2".into(), "gemini".into());
+        state.register("w1:p2".into(), "gemini".into());
         assert_eq!(
             state.message(id).unwrap().message.sender_label(),
             "codex",
@@ -581,9 +585,9 @@ mod tests {
         );
 
         // 送信者が退出した場合も返信先を出さない。
-        state.register("%2".into(), "codex".into());
-        assert_eq!(state.reply_target(&captured), Some("%2".into()));
-        state.remove("%2");
+        state.register("w1:p2".into(), "codex".into());
+        assert_eq!(state.reply_target(&captured), Some("w1:p2".into()));
+        state.remove("w1:p2");
         assert_eq!(state.reply_target(&captured), None);
     }
 

@@ -9,9 +9,7 @@
   let message = $state("");
   let view = $state<"registry" | "screen" | "letters">("registry");
   let selectedAgent = $state<Agent | null>(null);
-  // 同一 backend + 同一 session の兄弟 agent (claude ⇄ codex の行き来)。
-  // session 名だけで判定すると tmux session と herdr label の同名衝突で
-  // 別 backend へ飛ぶため、backend も一致させる。
+  // 同一 session (workspace label) の兄弟 agent (claude ⇄ codex の行き来)。
   const siblings = $derived(
     selectedAgent === null
       ? []
@@ -69,7 +67,7 @@
       onclick={backToRegistry}
       aria-label="agent registry を表示"
     >
-      <span class="eyebrow">TMUX / LOCAL BROKER</span>
+      <span class="eyebrow">HERDR / LOCAL BROKER</span>
       <span class="title">agent <i>talk</i></span>
     </button>
     <nav aria-label="表示切り替え">
@@ -193,6 +191,6 @@
   {/if}
 
   <footer class="site-footer">
-    <span>OBSERVE + LETTERS</span><span>tmux + herdr</span>
+    <span>OBSERVE + LETTERS</span><span>herdr</span>
   </footer>
 </main>

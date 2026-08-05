@@ -6,9 +6,10 @@
 //! - tool は `list_peers` / `send_message` / `read_message` / `ack_message` の4つだけ。
 //!   file / path / subprocess / 任意 socket の能力は tool にも実装にも持ち込まない
 //!   (0001 premise 5: MCP server は agent の exec sandbox の外で動く)。
-//! - 接続先は「forward された `TMUX` と `XDG_RUNTIME_DIR`（欠落時は HOME fallback）から
-//!   daemon と同一規則で導出した UDS ただ1つ」。`Config::discover` は呼ばず、
-//!   subprocess も起動せず、`AGENT_TALK_RPC_SOCKET` も production では受け取らない。
+//! - 接続先は「forward された `HERDR_SOCKET_PATH` と `XDG_RUNTIME_DIR`（欠落時は
+//!   HOME fallback）から daemon と同一規則で導出した UDS ただ1つ」。
+//!   `Config::discover` は呼ばず、subprocess も起動せず、
+//!   `AGENT_TALK_RPC_SOCKET` も production では受け取らない。
 //! - 入力が欠落・不正なら **fail closed**（tool を1つも公開せず終了）。
 
 use std::{
@@ -24,8 +25,8 @@ use tokio::{
 };
 
 use crate::{
-    pane_id::BackendKind,
-    paths::{herdr_rpc_socket_path, rpc_socket_path},
+    pane_id::is_pane_id,
+    paths::herdr_rpc_socket_path,
     protocol::{Request, Response, SendOptions},
 };
 
@@ -34,7 +35,7 @@ pub const DEFAULT_PROTOCOL_VERSION: &str = "2025-06-18";
 
 /// initialize で返す操作契約。判断そのものを縛る大きな文にはしない (0001)。
 pub const INSTRUCTIONS: &str = "\
-agent-talk は同じ tmux server で動く agent 同士の連絡係です。
+agent-talk は同じマシンの herdr で動く agent 同士の連絡係です。
 
 - 関連する作業をしている agent へ相談・共有してよい
 - 不確かな横断事項では自分の判断で使う
@@ -47,16 +48,15 @@ const MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
 /// 起動時 contract を満たした結果。呼び出し元 identity と接続先はここで固定される。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Context {
-    /// spawn 時の `TMUX_PANE` から導出した routing metadata。agent は触れない。
+    /// spawn 時の `HERDR_PANE_ID` から導出した routing metadata。agent は触れない。
     pub pane: String,
     pub socket: PathBuf,
 }
 
-/// multiplexer 環境 / runtime root を検証して接続先を純粋導出する。
+/// herdr 環境 / runtime root を検証して接続先を純粋導出する。
 ///
-/// herdr の pane に居るなら herdr 由来、tmux なら tmux 由来の socket を選ぶ。
-/// daemon は両方の path で listen しているので、どちらから来ても同じ broker に
-/// 届く (`docs/decisions/0001-conversation-broker-scope.md` の接続先 positive 定義)。
+/// daemon と同じ規則で `HERDR_SOCKET_PATH` から RPC socket path を導出する
+/// (`docs/decisions/0001-conversation-broker-scope.md` の接続先 positive 定義)。
 ///
 /// 曖昧な状態では起動しない。勝手な既定値は作らない。
 pub fn resolve_context<F>(get: F) -> Result<Context, String>
@@ -64,33 +64,19 @@ where
     F: Fn(&str) -> Option<OsString>,
 {
     let root = runtime_root(&get)?;
-    // herdr を先に見る。herdr の pane の中で tmux を起動している場合、
-    // agent が実際に居るのは内側の tmux なので TMUX 側が正しい。
-    if let Some(tmux) = get("TMUX") {
-        let tmux_socket = tmux_socket_of(&tmux)?;
-        let pane = pane_id_of(
-            get("TMUX_PANE")
-                .ok_or("TMUX_PANE が設定されていません")?
-                .as_os_str(),
-        )?;
-        return Ok(Context {
-            pane,
-            socket: rpc_socket_path(&root, &tmux_socket),
-        });
-    }
-    if let Some(socket) = get("HERDR_SOCKET_PATH") {
-        let herdr_socket = herdr_socket_of(&socket)?;
-        let pane = herdr_pane_id_of(
-            get("HERDR_PANE_ID")
-                .ok_or("HERDR_PANE_ID が設定されていません")?
-                .as_os_str(),
-        )?;
-        return Ok(Context {
-            pane,
-            socket: herdr_rpc_socket_path(&root, &herdr_socket),
-        });
-    }
-    Err("TMUX も HERDR_SOCKET_PATH も設定されていません".to_owned())
+    let Some(socket) = get("HERDR_SOCKET_PATH") else {
+        return Err("HERDR_SOCKET_PATH が設定されていません".to_owned());
+    };
+    let herdr_socket = herdr_socket_of(&socket)?;
+    let pane = herdr_pane_id_of(
+        get("HERDR_PANE_ID")
+            .ok_or("HERDR_PANE_ID が設定されていません")?
+            .as_os_str(),
+    )?;
+    Ok(Context {
+        pane,
+        socket: herdr_rpc_socket_path(&root, &herdr_socket),
+    })
 }
 
 /// `HERDR_SOCKET_PATH` は絶対 path。書式違反は fail closed。
@@ -104,53 +90,16 @@ fn herdr_socket_of(value: &OsStr) -> Result<PathBuf, String> {
     Ok(PathBuf::from(value))
 }
 
-/// `HERDR_PANE_ID` の文法は routing と同じ `BackendKind::of` に委ねる。
-/// herdr と判定できない値 (tmux 形式を含む) は fail closed。
+/// `HERDR_PANE_ID` の文法は routing と同じ `is_pane_id` に委ねる。
+/// herdr の pane id と判定できない値は fail closed。
 fn herdr_pane_id_of(value: &OsStr) -> Result<String, String> {
     let value = value
         .to_str()
         .ok_or("HERDR_PANE_ID の値が UTF-8 ではありません".to_owned())?;
-    if BackendKind::of(value) == Some(BackendKind::Herdr) {
+    if is_pane_id(value) {
         Ok(value.to_owned())
     } else {
         Err(format!("HERDR_PANE_ID が不正です: '{value}'"))
-    }
-}
-
-/// `TMUX` は `<socket path>,<server pid>,<session id>`。書式違反は fail closed。
-fn tmux_socket_of(value: &OsStr) -> Result<String, String> {
-    let value = value
-        .to_str()
-        .ok_or("TMUX の値が UTF-8 ではありません".to_owned())?;
-    let fields: Vec<_> = value.split(',').collect();
-    // 文法はちょうど3つ。余分なフィールドは想定外の入力なので fail closed にする。
-    if fields.len() != 3 {
-        return Err(format!("TMUX の書式が不正です: '{value}'"));
-    }
-    let socket = fields[0];
-    if !absolute_path(socket) || Path::new(socket).file_name().is_none() {
-        return Err(format!("TMUX の socket path が不正です: '{socket}'"));
-    }
-    for field in &fields[1..3] {
-        if field.is_empty() || !field.bytes().all(|byte| byte.is_ascii_digit()) {
-            return Err(format!("TMUX の書式が不正です: '{value}'"));
-        }
-    }
-    Ok(socket.to_owned())
-}
-
-/// `TMUX_PANE` は `%<digits>`。
-fn pane_id_of(value: &OsStr) -> Result<String, String> {
-    let value = value
-        .to_str()
-        .ok_or("TMUX_PANE の値が UTF-8 ではありません".to_owned())?;
-    let valid = value.strip_prefix('%').is_some_and(|digits| {
-        !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
-    });
-    if valid {
-        Ok(value.to_owned())
-    } else {
-        Err(format!("TMUX_PANE が不正です: '{value}'"))
     }
 }
 
@@ -195,7 +144,7 @@ pub fn tools() -> Value {
     json!([
         {
             "name": "list_peers",
-            "description": "同じ tmux server で待受中の agent 一覧と、両方向の未受領メッセージ ID を返す。",
+            "description": "待受中の agent 一覧と、両方向の未受領メッセージ ID を返す。",
             "inputSchema": {
                 "type": "object",
                 "properties": {},
@@ -390,7 +339,7 @@ fn request(context: &Context, command: &str, args: Vec<String>) -> Request {
         command: command.to_owned(),
         args,
         stdin: String::new(),
-        // 呼び出し元 identity は adapter が spawn 時の TMUX_PANE から導出する。
+        // 呼び出し元 identity は adapter が spawn 時の HERDR_PANE_ID から導出する。
         // daemon 側はこの pane が登録済み agent であることを要求する。
         pane: Some(context.pane.clone()),
         send_options: None,
@@ -542,30 +491,33 @@ mod tests {
     #[test]
     fn xdg_runtime_dir_selects_the_runtime_socket() {
         let context = resolve_context(env(&[
-            ("TMUX", "/tmp/tmux-1000/default,4242,0"),
-            ("TMUX_PANE", "%38"),
+            ("HERDR_SOCKET_PATH", "/home/miyabi/.config/herdr/herdr.sock"),
+            ("HERDR_PANE_ID", "wX:p4"),
             ("XDG_RUNTIME_DIR", "/run/user/1000"),
             ("HOME", "/home/miyabi"),
         ]))
         .unwrap();
-        assert_eq!(context.pane, "%38");
+        assert_eq!(context.pane, "wX:p4");
         assert_eq!(
             context.socket,
-            PathBuf::from("/run/user/1000/agent-talkd/default.sock")
+            PathBuf::from("/run/user/1000/agent-talkd/herdr.sock")
         );
     }
 
     #[test]
     fn a_missing_xdg_runtime_dir_falls_back_to_home() {
         let context = resolve_context(env(&[
-            ("TMUX", "/tmp/tmux-1000/work,4242,0"),
-            ("TMUX_PANE", "%1"),
+            (
+                "HERDR_SOCKET_PATH",
+                "/home/miyabi/.config/herdr/sessions/work/herdr.sock",
+            ),
+            ("HERDR_PANE_ID", "w1:p1"),
             ("HOME", "/home/miyabi"),
         ]))
         .unwrap();
         assert_eq!(
             context.socket,
-            PathBuf::from("/home/miyabi/.cache/agent-talkd/run/agent-talkd/work.sock")
+            PathBuf::from("/home/miyabi/.cache/agent-talkd/run/agent-talkd/herdr-work.sock")
         );
     }
 
@@ -573,8 +525,8 @@ mod tests {
     fn an_invalid_xdg_runtime_dir_fails_closed_without_falling_back() {
         for runtime in ["relative/dir", "", "~/run"] {
             let error = resolve_context(env(&[
-                ("TMUX", "/tmp/tmux-1000/default,1,0"),
-                ("TMUX_PANE", "%1"),
+                ("HERDR_SOCKET_PATH", "/home/miyabi/.config/herdr/herdr.sock"),
+                ("HERDR_PANE_ID", "w1:p1"),
                 ("XDG_RUNTIME_DIR", runtime),
                 ("HOME", "/home/miyabi"),
             ]))
@@ -586,15 +538,15 @@ mod tests {
     #[test]
     fn no_runtime_root_at_all_fails_closed() {
         let error = resolve_context(env(&[
-            ("TMUX", "/tmp/tmux-1000/default,1,0"),
-            ("TMUX_PANE", "%1"),
+            ("HERDR_SOCKET_PATH", "/home/miyabi/.config/herdr/herdr.sock"),
+            ("HERDR_PANE_ID", "w1:p1"),
         ]))
         .unwrap_err();
         assert!(error.contains("HOME"), "{error}");
 
         let relative_home = resolve_context(env(&[
-            ("TMUX", "/tmp/tmux-1000/default,1,0"),
-            ("TMUX_PANE", "%1"),
+            ("HERDR_SOCKET_PATH", "/home/miyabi/.config/herdr/herdr.sock"),
+            ("HERDR_PANE_ID", "w1:p1"),
             ("HOME", "home/miyabi"),
         ]))
         .unwrap_err();
@@ -602,45 +554,23 @@ mod tests {
     }
 
     #[test]
-    fn missing_or_malformed_tmux_inputs_fail_closed() {
+    fn missing_or_malformed_herdr_inputs_fail_closed() {
         let base = [
-            ("TMUX", "/tmp/tmux-1000/default,1,0"),
-            ("TMUX_PANE", "%1"),
+            ("HERDR_SOCKET_PATH", "/run/user/1000/herdr/herdr.sock"),
+            ("HERDR_PANE_ID", "w1:p1"),
             ("XDG_RUNTIME_DIR", "/run/user/1000"),
         ];
         assert!(resolve_context(env(&base)).is_ok());
 
-        for tmux in [
-            "",
-            ",,",
-            "/tmp/tmux-1000/default",
-            "/tmp/tmux-1000/default,1",
-            "relative/socket,1,0",
-            "/,1,0",
-            ",1,0",
-            "/tmp/tmux-1000/default,x,0",
-            "/tmp/tmux-1000/default,1,",
-            // 余分なフィールドは想定外の入力。
-            "/tmp/tmux-1000/default,1,0,junk",
-            "/tmp/tmux-1000/default,1,0,",
-            "/tmp/tmux-1000/default,1,0,2,3",
-        ] {
+        for socket in ["", "relative/herdr.sock", "/", "~/herdr.sock"] {
             let mut pairs = base.to_vec();
-            pairs[0].1 = tmux;
+            pairs[0].1 = socket;
             assert!(
                 resolve_context(env(&pairs)).is_err(),
-                "TMUX='{tmux}' must fail closed"
+                "HERDR_SOCKET_PATH='{socket}' must fail closed"
             );
         }
-        for pane in ["", "%", "1", "%1a", "$1", "%-1", "% 1"] {
-            let mut pairs = base.to_vec();
-            pairs[1].1 = pane;
-            assert!(
-                resolve_context(env(&pairs)).is_err(),
-                "TMUX_PANE='{pane}' must fail closed"
-            );
-        }
-        for missing in ["TMUX", "TMUX_PANE"] {
+        for missing in ["HERDR_SOCKET_PATH", "HERDR_PANE_ID"] {
             let pairs: Vec<_> = base
                 .iter()
                 .copied()
@@ -665,7 +595,7 @@ mod tests {
             let context = resolve_context(env(&pairs)).unwrap();
             assert_eq!(context.pane, pane);
         }
-        // tmux 形式・小文字・名前・不正形は fail closed。
+        // 撤去済み tmux 形式・小文字・名前・不正形は fail closed。
         for pane in ["%5", "wx:p1", "w1:pz", "review:security", "", "w1:t1"] {
             let mut pairs = base.to_vec();
             pairs[1].1 = pane;
@@ -676,18 +606,19 @@ mod tests {
 
     #[test]
     fn the_connection_target_never_comes_from_an_arbitrary_variable() {
-        // production 経路は AGENT_TALK_RPC_SOCKET を読まない (0001 forbidden effects)。
+        // production 経路は AGENT_TALK_RPC_SOCKET も AGENT_TALK_HERDR_SOCKET も
+        // 読まない (0001 forbidden effects)。
         let context = resolve_context(env(&[
-            ("TMUX", "/tmp/tmux-1000/default,1,0"),
-            ("TMUX_PANE", "%1"),
+            ("HERDR_SOCKET_PATH", "/run/user/1000/herdr/herdr.sock"),
+            ("HERDR_PANE_ID", "w1:p1"),
             ("XDG_RUNTIME_DIR", "/run/user/1000"),
             ("AGENT_TALK_RPC_SOCKET", "/tmp/attacker.sock"),
-            ("AGENT_TALK_TMUX_SOCKET", "/tmp/attacker-tmux"),
+            ("AGENT_TALK_HERDR_SOCKET", "/tmp/attacker-herdr.sock"),
         ]))
         .unwrap();
         assert_eq!(
             context.socket,
-            PathBuf::from("/run/user/1000/agent-talkd/default.sock")
+            PathBuf::from("/run/user/1000/agent-talkd/herdr.sock")
         );
     }
 
@@ -740,8 +671,8 @@ mod tests {
     #[tokio::test]
     async fn notifications_get_no_response_and_unknown_methods_are_rejected() {
         let context = Context {
-            pane: "%1".into(),
-            socket: PathBuf::from("/nonexistent/agent-talkd/default.sock"),
+            pane: "w1:p1".into(),
+            socket: PathBuf::from("/nonexistent/agent-talkd/herdr.sock"),
         };
         assert!(
             handle_message(
@@ -765,8 +696,8 @@ mod tests {
     #[tokio::test]
     async fn initialize_echoes_the_client_version_and_returns_the_ack_instruction() {
         let context = Context {
-            pane: "%1".into(),
-            socket: PathBuf::from("/nonexistent/agent-talkd/default.sock"),
+            pane: "w1:p1".into(),
+            socket: PathBuf::from("/nonexistent/agent-talkd/herdr.sock"),
         };
         let response = handle_message(
             &context,
@@ -794,8 +725,8 @@ mod tests {
     #[tokio::test]
     async fn an_unreachable_daemon_is_a_tool_error_not_a_spawn() {
         let context = Context {
-            pane: "%1".into(),
-            socket: PathBuf::from("/nonexistent/agent-talkd/default.sock"),
+            pane: "w1:p1".into(),
+            socket: PathBuf::from("/nonexistent/agent-talkd/herdr.sock"),
         };
         let response = handle_message(
             &context,
@@ -815,8 +746,8 @@ mod tests {
     #[tokio::test]
     async fn tool_arguments_are_validated_before_any_connection() {
         let context = Context {
-            pane: "%1".into(),
-            socket: PathBuf::from("/nonexistent/agent-talkd/default.sock"),
+            pane: "w1:p1".into(),
+            socket: PathBuf::from("/nonexistent/agent-talkd/herdr.sock"),
         };
         for params in [
             r#"{"name":"send_message","arguments":{"body":"x"}}"#,

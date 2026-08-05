@@ -24,7 +24,7 @@ pub fn has_agent(who: &str, name: &str) -> bool {
     agent_row(who, name).is_some()
 }
 
-/// agent 行の backend 列 (`tmux` / `herdr`)。
+/// agent 行の backend 列 (常に `herdr`。tmux 併存期の表形式を維持している)。
 pub fn agent_backend<'a>(who: &'a str, name: &str) -> Option<&'a str> {
     agent_row(who, name)?.split_whitespace().nth(2)
 }

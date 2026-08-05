@@ -3,7 +3,7 @@
 //! herdr は newline-delimited JSON を local socket で話す (protocol 17)。
 //! 1 リクエスト 1 接続で、`{"id","method","params"}` を送り 1 行の応答を読む。
 //!
-//! tmux backend との決定的な違いは **配送に状態ガードがあること**。
+//! 配送には **状態ガード** を必ず挟む。
 //! herdr の入力系 API 自体には steer ガードが無く、working / blocked な
 //! pane にも文字を撃ち込める。承認ダイアログへ Enter を撃ち込む事故を避けるため、
 //! herdr が **積極的に `idle` と判定した pane にだけ**送る (README の
@@ -74,8 +74,8 @@ pub struct HerdrPane {
     pub pane_id: String,
     pub terminal_id: String,
     pub workspace_id: String,
-    /// workspace の人間向け名 (`workspace.list` の label)。tmux の session 名の
-    /// 意味的対応物。未設定・宛先構文と衝突する文字を含む場合は `None`。
+    /// workspace の人間向け名 (`workspace.list` の label)。表示と scope 解決の
+    /// 主名になる。未設定・宛先構文と衝突する文字を含む場合は `None`。
     pub workspace_label: Option<String>,
     pub tab_id: String,
     pub cwd: String,
@@ -90,6 +90,10 @@ pub struct Herdr {
     /// clone 間で共有されるので、テストが tick の合間に中身を差し替えられる。
     #[cfg(test)]
     pub(crate) scripted: Option<std::sync::Arc<std::sync::Mutex<Vec<HerdrPane>>>>,
+    /// scripted モードで `deliver` された (pane, text) の記録 (test 専用)。
+    /// clone 間で共有されるので、broker へ渡した後からでも観測できる。
+    #[cfg(test)]
+    pub(crate) delivered: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
 }
 
 impl Herdr {
@@ -98,6 +102,8 @@ impl Herdr {
             socket,
             #[cfg(test)]
             scripted: None,
+            #[cfg(test)]
+            delivered: std::sync::Arc::default(),
         }
     }
 
@@ -107,11 +113,16 @@ impl Herdr {
         Self {
             socket: PathBuf::new(),
             scripted: Some(std::sync::Arc::new(std::sync::Mutex::new(panes))),
+            delivered: std::sync::Arc::default(),
         }
     }
 
     /// protocol 番号を返す。daemon の health check に使う。
     pub async fn protocol(&self) -> Result<u64> {
+        #[cfg(test)]
+        if self.scripted.is_some() {
+            return Ok(17);
+        }
         let result = self.call("ping", json!({})).await?;
         result
             .get("protocol")
@@ -174,6 +185,25 @@ impl Herdr {
     /// タイプされる事故も構造的に起きない (Err は呼び出し側の requeue 経路に乗る)。
     /// `wait` は付けない — 単一 event loop を agent の完了待ちで塞がない。
     pub async fn deliver(&self, pane_id: &str, text: &str) -> Result<Delivery> {
+        #[cfg(test)]
+        if let Some(scripted) = &self.scripted {
+            // 実実装と同じ規則: pane 不在は Err、idle 以外は Skipped。
+            let status = scripted
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|pane| pane.pane_id == pane_id)
+                .map(|pane| pane.status)
+                .with_context(|| format!("herdr pane {pane_id} の状態を取得できません"))?;
+            if !status.accepts_delivery() {
+                return Ok(Delivery::Skipped(status));
+            }
+            self.delivered
+                .lock()
+                .unwrap()
+                .push((pane_id.to_owned(), text.to_owned()));
+            return Ok(Delivery::Sent);
+        }
         let status = self.status_of(pane_id).await?;
         if !status.accepts_delivery() {
             return Ok(Delivery::Skipped(status));
@@ -184,6 +214,18 @@ impl Herdr {
     }
 
     pub async fn read(&self, pane_id: &str) -> Result<String> {
+        #[cfg(test)]
+        if let Some(scripted) = &self.scripted {
+            if scripted
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|pane| pane.pane_id == pane_id)
+            {
+                return Ok(format!("scripted screen of {pane_id}"));
+            }
+            bail!("herdr pane {pane_id} は存在しません");
+        }
         let result = self
             .call(
                 "pane.read",

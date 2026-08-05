@@ -33,7 +33,7 @@ function event(
     body,
     skill: null,
     target_name: "claude",
-    target_pane: "%1",
+    target_pane: "w1:p1",
     reply_to: null,
   };
 }

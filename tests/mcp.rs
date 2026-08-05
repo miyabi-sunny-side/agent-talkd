@@ -1,6 +1,6 @@
 //! `agent-talk-mcp` の process 境界テスト。
 //!
-//! 実 tmux を必要としない検証をここに置く: 起動時 contract の fail closed、
+//! 実 herdr を必要としない検証をここに置く: 起動時 contract の fail closed、
 //! 導出した UDS への実接続、tool surface の固定 (docs/decisions/0001-*.md)。
 
 use std::{
@@ -15,27 +15,19 @@ use std::{
 use serde_json::{Value, json};
 
 /// production 経路は `AGENT_TALK_RPC_SOCKET` を読まないため、socket は
-/// `XDG_RUNTIME_DIR` + `TMUX` から導出される。テストもその規則だけに従う。
-fn derived_socket(runtime: &Path, tmux_socket: &str) -> PathBuf {
-    runtime.join("agent-talkd").join(format!(
-        "{}.sock",
-        Path::new(tmux_socket)
-            .file_name()
-            .unwrap()
-            .to_str()
-            .unwrap()
-    ))
+/// `XDG_RUNTIME_DIR` + `HERDR_SOCKET_PATH` から導出される。テストもその規則だけに従う。
+fn derived_socket(runtime: &Path) -> PathBuf {
+    runtime.join("agent-talkd").join("herdr.sock")
 }
 
 fn mcp(env: &[(&str, &str)]) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_agent-talk-mcp"));
     command
-        .env_remove("TMUX")
-        .env_remove("TMUX_PANE")
+        .env_remove("HERDR_SOCKET_PATH")
+        .env_remove("HERDR_PANE_ID")
         .env_remove("XDG_RUNTIME_DIR")
         .env_remove("HOME")
-        .env_remove("AGENT_TALK_RPC_SOCKET")
-        .env_remove("AGENT_TALK_TMUX_SOCKET");
+        .env_remove("AGENT_TALK_RPC_SOCKET");
     for (key, value) in env {
         command.env(key, value);
     }
@@ -132,13 +124,13 @@ fn fake_daemon(socket: &Path) -> mpsc::Receiver<Value> {
     scripted_daemon(socket, |request| {
         match request["command"].as_str().unwrap() {
             "list-peers" => ok_response(
-                "{\"version\":1,\"self\":\"%1\",\"pending_to_me\":[3],\"peers\":[{\"name\":\"codex\",\"state\":\"idle\",\"location\":\"work:0.0\",\"pane\":\"%2\",\"cwd\":\"/tmp\",\"queued\":0,\"pending_from_me\":[9]}]}\n",
+                "{\"version\":1,\"self\":\"w1:p1\",\"pending_to_me\":[3],\"peers\":[{\"name\":\"codex\",\"state\":\"idle\",\"location\":\"work:0.0\",\"pane\":\"w1:p2\",\"cwd\":\"/tmp\",\"queued\":0,\"pending_from_me\":[9]}]}\n",
             ),
             "send-message" => ok_response(
-                "{\"version\":1,\"id\":9,\"path\":\"sent\",\"to\":\"%2\",\"name\":\"codex\"}\n",
+                "{\"version\":1,\"id\":9,\"path\":\"sent\",\"to\":\"w1:p2\",\"name\":\"codex\"}\n",
             ),
             "read-message" => ok_response(
-                "{\"version\":1,\"id\":3,\"from\":\"codex\",\"reply_to\":\"%2\",\"body\":\"# agent-talk 依頼書\\n本文\"}\n",
+                "{\"version\":1,\"id\":3,\"from\":\"codex\",\"reply_to\":\"w1:p2\",\"body\":\"# agent-talk 依頼書\\n本文\"}\n",
             ),
             "ack-message" => ok_response("{\"version\":1,\"id\":3,\"outcome\":\"acked\"}\n"),
             _ => unknown_command(),
@@ -151,15 +143,15 @@ fn fake_daemon(socket: &Path) -> mpsc::Receiver<Value> {
 fn legacy_daemon(socket: &Path) -> mpsc::Receiver<Value> {
     scripted_daemon(socket, |request| {
         match request["command"].as_str().unwrap() {
-            "peers-v1" => {
-                ok_response("{\"version\":1,\"self\":\"%1\",\"pending_to_me\":[],\"peers\":[]}\n")
-            }
+            "peers-v1" => ok_response(
+                "{\"version\":1,\"self\":\"w1:p1\",\"pending_to_me\":[],\"peers\":[]}\n",
+            ),
             "read-v1" => ok_response(
                 "{\"version\":1,\"id\":3,\"from\":\"codex\",\"reply_to\":null,\"body\":\"本文\"}\n",
             ),
             "ack-v1" => ok_response("{\"version\":1,\"id\":3,\"outcome\":\"acked\"}\n"),
             "send-message-v1" if request["send_options"].is_object() => ok_response(
-                "{\"version\":1,\"id\":9,\"path\":\"sent\",\"to\":\"%2\",\"name\":\"codex\"}\n",
+                "{\"version\":1,\"id\":9,\"path\":\"sent\",\"to\":\"w1:p2\",\"name\":\"codex\"}\n",
             ),
             _ => unknown_command(),
         }
@@ -183,7 +175,7 @@ fn degraded_daemon(socket: &Path) {
     let _requests = scripted_daemon(socket, |request| {
         let stdout = match request["command"].as_str().unwrap() {
             // 旧テキスト形式 (versioned JSON への移行前の形)
-            "send-message" => "sent -> %2 (codex): #9\n",
+            "send-message" => "sent -> w1:p2 (codex): #9\n",
             // version フィールドが無い
             "read-message" => "{\"id\":3,\"from\":\"codex\"}\n",
             // object ではない
@@ -199,13 +191,12 @@ fn degraded_daemon(socket: &Path) {
 fn a_success_response_outside_the_contract_never_degrades_into_a_tool_success() {
     let root = tempfile::tempdir().unwrap();
     let runtime = root.path().join("run");
-    let tmux_socket = root.path().join("tmux/degraded");
-    let tmux_socket = tmux_socket.to_str().unwrap();
-    degraded_daemon(&derived_socket(&runtime, tmux_socket));
+    let herdr_socket = root.path().join("herdr.sock");
+    degraded_daemon(&derived_socket(&runtime));
 
     let mut session = Session::start(&[
-        ("TMUX", &format!("{tmux_socket},1,0")),
-        ("TMUX_PANE", "%1"),
+        ("HERDR_SOCKET_PATH", herdr_socket.to_str().unwrap()),
+        ("HERDR_PANE_ID", "w1:p1"),
         ("XDG_RUNTIME_DIR", runtime.to_str().unwrap()),
     ]);
     for (index, (name, arguments)) in [
@@ -241,7 +232,7 @@ fn a_success_response_outside_the_contract_never_degrades_into_a_tool_success() 
 
 #[test]
 fn version_flag_answers_without_any_environment_contract() {
-    // daemon との世代ずれの機械検出用。TMUX も XDG も無い環境で成立すること。
+    // daemon との世代ずれの機械検出用。HERDR_* も XDG も無い環境で成立すること。
     let output = mcp(&[]).arg("--version").output().unwrap();
     assert!(output.status.success(), "{output:?}");
     assert_eq!(
@@ -271,55 +262,52 @@ fn missing_or_malformed_startup_inputs_fail_closed_without_serving_tools() {
     let runtime = root.path().join("run");
     let runtime = runtime.to_str().unwrap();
     let cases: Vec<Vec<(&str, &str)>> = vec![
-        // TMUX 未 forward
-        vec![("TMUX_PANE", "%1"), ("XDG_RUNTIME_DIR", runtime)],
-        // TMUX_PANE 未 forward
+        // HERDR_SOCKET_PATH 未 forward
+        vec![("HERDR_PANE_ID", "w1:p1"), ("XDG_RUNTIME_DIR", runtime)],
+        // HERDR_PANE_ID 未 forward
         vec![
-            ("TMUX", "/tmp/tmux-1000/default,1,0"),
+            ("HERDR_SOCKET_PATH", "/run/herdr/herdr.sock"),
             ("XDG_RUNTIME_DIR", runtime),
         ],
-        // TMUX が空 / 書式違反
+        // HERDR_SOCKET_PATH が空 / 書式違反 (相対 path)
         vec![
-            ("TMUX", ""),
-            ("TMUX_PANE", "%1"),
-            ("XDG_RUNTIME_DIR", runtime),
-        ],
-        vec![
-            ("TMUX", "/tmp/tmux-1000/default"),
-            ("TMUX_PANE", "%1"),
+            ("HERDR_SOCKET_PATH", ""),
+            ("HERDR_PANE_ID", "w1:p1"),
             ("XDG_RUNTIME_DIR", runtime),
         ],
         vec![
-            ("TMUX", "relative,1,0"),
-            ("TMUX_PANE", "%1"),
+            ("HERDR_SOCKET_PATH", "relative/herdr.sock"),
+            ("HERDR_PANE_ID", "w1:p1"),
             ("XDG_RUNTIME_DIR", runtime),
         ],
-        // TMUX_PANE が空 / 書式違反
+        // HERDR_PANE_ID が空 / 書式違反 (撤去済み tmux 形式を含む)
         vec![
-            ("TMUX", "/tmp/tmux-1000/default,1,0"),
-            ("TMUX_PANE", ""),
+            ("HERDR_SOCKET_PATH", "/run/herdr/herdr.sock"),
+            ("HERDR_PANE_ID", ""),
             ("XDG_RUNTIME_DIR", runtime),
         ],
         vec![
-            ("TMUX", "/tmp/tmux-1000/default,1,0"),
-            ("TMUX_PANE", "pane-1"),
+            ("HERDR_SOCKET_PATH", "/run/herdr/herdr.sock"),
+            ("HERDR_PANE_ID", "%1"),
             ("XDG_RUNTIME_DIR", runtime),
         ],
-        // TMUX に余分なフィールドがある (文法はちょうど3つ)
         vec![
-            ("TMUX", "/tmp/tmux-1000/default,1,0,junk"),
-            ("TMUX_PANE", "%1"),
+            ("HERDR_SOCKET_PATH", "/run/herdr/herdr.sock"),
+            ("HERDR_PANE_ID", "pane-1"),
             ("XDG_RUNTIME_DIR", runtime),
         ],
         // XDG_RUNTIME_DIR が不正 (相対 path) — HOME があっても fallback しない
         vec![
-            ("TMUX", "/tmp/tmux-1000/default,1,0"),
-            ("TMUX_PANE", "%1"),
+            ("HERDR_SOCKET_PATH", "/run/herdr/herdr.sock"),
+            ("HERDR_PANE_ID", "w1:p1"),
             ("XDG_RUNTIME_DIR", "relative/run"),
             ("HOME", "/home/tester"),
         ],
         // XDG_RUNTIME_DIR も HOME も無い
-        vec![("TMUX", "/tmp/tmux-1000/default,1,0"), ("TMUX_PANE", "%1")],
+        vec![
+            ("HERDR_SOCKET_PATH", "/run/herdr/herdr.sock"),
+            ("HERDR_PANE_ID", "w1:p1"),
+        ],
     ];
     for case in cases {
         let output = mcp(&case)
@@ -347,13 +335,12 @@ fn home_fallback_reaches_the_same_socket_layout_as_the_daemon() {
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("home");
     let runtime = home.join(".cache/agent-talkd/run");
-    let tmux_socket = root.path().join("tmux/fallback");
-    let tmux_socket = tmux_socket.to_str().unwrap();
-    let requests = fake_daemon(&derived_socket(&runtime, tmux_socket));
+    let herdr_socket = root.path().join("herdr.sock");
+    let requests = fake_daemon(&derived_socket(&runtime));
 
     let mut session = Session::start(&[
-        ("TMUX", &format!("{tmux_socket},1,0")),
-        ("TMUX_PANE", "%7"),
+        ("HERDR_SOCKET_PATH", herdr_socket.to_str().unwrap()),
+        ("HERDR_PANE_ID", "w1:p7"),
         ("HOME", home.to_str().unwrap()),
     ]);
     let response = session.call(&json!({
@@ -363,7 +350,7 @@ fn home_fallback_reaches_the_same_socket_layout_as_the_daemon() {
     assert_eq!(response["result"]["isError"], false, "{response}");
     let request = requests.recv().unwrap();
     assert_eq!(request["command"], "list-peers");
-    assert_eq!(request["pane"], "%7");
+    assert_eq!(request["pane"], "w1:p7");
 }
 
 #[test]
@@ -371,13 +358,12 @@ fn home_fallback_reaches_the_same_socket_layout_as_the_daemon() {
 fn the_four_tools_round_trip_over_the_derived_unix_socket() {
     let root = tempfile::tempdir().unwrap();
     let runtime = root.path().join("run");
-    let tmux_socket = root.path().join("tmux/round-trip");
-    let tmux_socket = tmux_socket.to_str().unwrap();
-    let requests = fake_daemon(&derived_socket(&runtime, tmux_socket));
+    let herdr_socket = root.path().join("herdr.sock");
+    let requests = fake_daemon(&derived_socket(&runtime));
 
     let mut session = Session::start(&[
-        ("TMUX", &format!("{tmux_socket},4242,0")),
-        ("TMUX_PANE", "%1"),
+        ("HERDR_SOCKET_PATH", herdr_socket.to_str().unwrap()),
+        ("HERDR_PANE_ID", "w1:p1"),
         ("XDG_RUNTIME_DIR", runtime.to_str().unwrap()),
         ("HOME", "/nonexistent-home"),
     ]);
@@ -433,7 +419,7 @@ fn the_four_tools_round_trip_over_the_derived_unix_socket() {
         "params": {"name": "read_message", "arguments": {"id": 3}}
     }));
     assert_eq!(read["result"]["structuredContent"]["from"], "codex");
-    assert_eq!(read["result"]["structuredContent"]["reply_to"], "%2");
+    assert_eq!(read["result"]["structuredContent"]["reply_to"], "w1:p2");
 
     let acked = session.call(&json!({
         "jsonrpc": "2.0", "id": 6, "method": "tools/call",
@@ -443,9 +429,9 @@ fn the_four_tools_round_trip_over_the_derived_unix_socket() {
 
     let observed: Vec<Value> = (0..4).map(|_| requests.recv().unwrap()).collect();
     assert_eq!(observed[0]["command"], "list-peers");
-    // 呼び出し元 identity は adapter が spawn 時の TMUX_PANE から導出する。
+    // 呼び出し元 identity は adapter が spawn 時の HERDR_PANE_ID から導出する。
     for request in &observed {
-        assert_eq!(request["pane"], "%1");
+        assert_eq!(request["pane"], "w1:p1");
     }
     assert_eq!(observed[1]["command"], "send-message");
     assert_eq!(observed[1]["args"], json!(["codex"]));
@@ -462,13 +448,12 @@ fn the_four_tools_round_trip_over_the_derived_unix_socket() {
 fn a_new_adapter_falls_back_to_legacy_names_only_on_unknown_command() {
     let root = tempfile::tempdir().unwrap();
     let runtime = root.path().join("run");
-    let tmux_socket = root.path().join("tmux/legacy");
-    let tmux_socket = tmux_socket.to_str().unwrap();
-    let requests = legacy_daemon(&derived_socket(&runtime, tmux_socket));
+    let herdr_socket = root.path().join("herdr.sock");
+    let requests = legacy_daemon(&derived_socket(&runtime));
 
     let mut session = Session::start(&[
-        ("TMUX", &format!("{tmux_socket},1,0")),
-        ("TMUX_PANE", "%1"),
+        ("HERDR_SOCKET_PATH", herdr_socket.to_str().unwrap()),
+        ("HERDR_PANE_ID", "w1:p1"),
         ("XDG_RUNTIME_DIR", runtime.to_str().unwrap()),
     ]);
     // 旧 daemon 相手でも 4 tool すべて成功する (canonical → unknown → 旧名で成立)。
@@ -531,13 +516,12 @@ fn a_new_adapter_falls_back_to_legacy_names_only_on_unknown_command() {
 fn an_error_other_than_unknown_command_is_never_retried() {
     let root = tempfile::tempdir().unwrap();
     let runtime = root.path().join("run");
-    let tmux_socket = root.path().join("tmux/rejecting");
-    let tmux_socket = tmux_socket.to_str().unwrap();
-    let requests = rejecting_daemon(&derived_socket(&runtime, tmux_socket));
+    let herdr_socket = root.path().join("herdr.sock");
+    let requests = rejecting_daemon(&derived_socket(&runtime));
 
     let mut session = Session::start(&[
-        ("TMUX", &format!("{tmux_socket},1,0")),
-        ("TMUX_PANE", "%1"),
+        ("HERDR_SOCKET_PATH", herdr_socket.to_str().unwrap()),
+        ("HERDR_PANE_ID", "w1:p1"),
         ("XDG_RUNTIME_DIR", runtime.to_str().unwrap()),
     ]);
     // unknown command 以外のエラーで旧名 fallback すると send が二重配送になり得る。
@@ -558,13 +542,12 @@ fn an_error_other_than_unknown_command_is_never_retried() {
 fn daemon_errors_surface_as_tool_errors_and_unknown_methods_are_rejected() {
     let root = tempfile::tempdir().unwrap();
     let runtime = root.path().join("run");
-    let tmux_socket = root.path().join("tmux/errors");
-    let tmux_socket = tmux_socket.to_str().unwrap();
-    let _requests = fake_daemon(&derived_socket(&runtime, tmux_socket));
+    let herdr_socket = root.path().join("herdr.sock");
+    let _requests = fake_daemon(&derived_socket(&runtime));
 
     let mut session = Session::start(&[
-        ("TMUX", &format!("{tmux_socket},1,0")),
-        ("TMUX_PANE", "%1"),
+        ("HERDR_SOCKET_PATH", herdr_socket.to_str().unwrap()),
+        ("HERDR_PANE_ID", "w1:p1"),
         ("XDG_RUNTIME_DIR", runtime.to_str().unwrap()),
     ]);
     let unknown_method = session.call(&json!({

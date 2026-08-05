@@ -15,7 +15,7 @@ pub async fn run(args: Vec<String>) -> Result<i32> {
         return Ok(1);
     };
 
-    let config = discover_tmux_config();
+    let config = discover_config();
     let registered = if let Some(config) = config.as_ref() {
         request(config, "register", vec![name.clone()])
             .await
@@ -43,7 +43,7 @@ pub async fn run(args: Vec<String>) -> Result<i32> {
     }
 }
 
-fn discover_tmux_config() -> Option<Config> {
+fn discover_config() -> Option<Config> {
     crate::backend::self_pane()?;
     Config::discover().ok()
 }

@@ -6,8 +6,8 @@
 
 use std::path::{Path, PathBuf};
 
-/// tmux socket path の basename を、path に埋め込める安全な名前へ正規化する。
-pub fn socket_name(socket: &str) -> String {
+/// path 断片を、path に埋め込める安全な名前へ正規化する。
+fn socket_name(socket: &str) -> String {
     Path::new(socket)
         .file_name()
         .and_then(|name| name.to_str())
@@ -22,13 +22,6 @@ pub fn socket_name(socket: &str) -> String {
             }
         })
         .collect()
-}
-
-/// runtime root と tmux socket から daemon の RPC socket path を導出する。
-pub fn rpc_socket_path(runtime_root: &Path, tmux_socket: &str) -> PathBuf {
-    runtime_root
-        .join("agent-talkd")
-        .join(format!("{}.sock", socket_name(tmux_socket)))
 }
 
 /// herdr socket path から、衝突しない一意な名前を導出する。
@@ -67,18 +60,9 @@ mod tests {
 
     #[test]
     fn socket_name_normalizes_unsafe_basename_characters() {
-        assert_eq!(socket_name("/tmp/tmux-1000/default"), "default");
-        assert_eq!(socket_name("/tmp/tmux-1000/my.sock name"), "my_sock_name");
-        assert_eq!(socket_name("/tmp/tmux-1000/"), "tmux-1000");
+        assert_eq!(socket_name("/run/herdr/default"), "default");
+        assert_eq!(socket_name("/run/herdr/my.sock name"), "my_sock_name");
         assert_eq!(socket_name(""), "default");
-    }
-
-    #[test]
-    fn rpc_socket_path_matches_the_daemon_layout() {
-        assert_eq!(
-            rpc_socket_path(Path::new("/run/user/1000"), "/tmp/tmux-1000/default"),
-            PathBuf::from("/run/user/1000/agent-talkd/default.sock")
-        );
     }
 
     #[test]

@@ -12,11 +12,11 @@ it("renders loading then agent status", async () => {
             {
               name: "claude",
               state: "busy",
-              pane_id: "%2",
+              pane_id: "w1:p2",
               session: "work",
               location: "work:1.0",
               cwd: "/tmp/a b",
-              backend: "tmux",
+              backend: "herdr",
             },
           ],
         }),
@@ -43,18 +43,18 @@ it("opens a screen from the keyboard and restores focus when returning", async (
                 {
                   name: "codex",
                   state: "idle",
-                  pane_id: "%4",
+                  pane_id: "w1:p4",
                   session: "work",
                   location: "work:0.0",
                   cwd: "/tmp/work",
-                  backend: "tmux",
+                  backend: "herdr",
                 },
               ],
             }),
             { status: 200 },
           )
         : new Response(
-            JSON.stringify({ pane_id: "%4", screen: "terminal output" }),
+            JSON.stringify({ pane_id: "w1:p4", screen: "terminal output" }),
             {
               status: 200,
             },
@@ -111,16 +111,6 @@ it("shows session badges and hops between same-backend siblings only", async () 
         cwd: "/tmp/knowledge",
         backend: "herdr",
       },
-      // 罠: 同名 session だが別 backend。switcher に混ざってはならない。
-      {
-        name: "cursor",
-        state: "idle",
-        pane_id: "%9",
-        session: "knowledge",
-        location: "knowledge:0.0",
-        cwd: "/tmp/other",
-        backend: "tmux",
-      },
     ],
   };
   const fetch = vi.fn((input: RequestInfo | URL) => {
@@ -143,7 +133,7 @@ it("shows session badges and hops between same-backend siblings only", async () 
 
   // 一覧に session (workspace label) の badge が見える。
   const badges = await screen.findAllByText("knowledge");
-  expect(badges.length).toBeGreaterThanOrEqual(3);
+  expect(badges.length).toBeGreaterThanOrEqual(2);
 
   await fireEvent.click(
     screen.getByRole("button", { name: "claude の Screen を表示" }),
@@ -152,7 +142,7 @@ it("shows session badges and hops between same-backend siblings only", async () 
     name: "同一 session の agent 切り替え",
   });
   const buttons = switcher.querySelectorAll("button");
-  // 兄弟は同一 backend の claude / codex だけ (tmux の cursor は混ざらない)。
+  // 兄弟は同一 session の claude / codex だけ。
   expect(
     Array.from(buttons).map((button) => button.textContent?.trim()),
   ).toEqual(["claude", "codex"]);
