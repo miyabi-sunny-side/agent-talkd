@@ -8,6 +8,7 @@ const agent: Agent = {
   state: "idle",
   pane_id: "%7",
   session: "work",
+  backend: "tmux",
   location: "work:1.0",
   cwd: "/tmp/work",
 };

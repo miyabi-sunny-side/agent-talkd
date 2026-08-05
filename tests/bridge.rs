@@ -248,6 +248,31 @@ impl Harness {
         ])
     }
 
+    fn http_get(&self, path: &str) -> String {
+        let mut stream = TcpStream::connect(("127.0.0.1", self.http_port)).unwrap();
+        write!(
+            stream,
+            "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+        )
+        .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        response
+    }
+
+    fn http_post(&self, path: &str, content_type: &str, body: &str) -> String {
+        let mut stream = TcpStream::connect(("127.0.0.1", self.http_port)).unwrap();
+        write!(
+            stream,
+            "POST {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        response
+    }
+
     /// 実 tmux pane の表示内容 (呼び鈴の着弾観測用)。
     fn capture_tmux_pane(&self) -> String {
         let output = Command::new("tmux")
@@ -437,6 +462,53 @@ fn one_daemon_bridges_tmux_and_herdr_and_serves_mobile_over_tcp() {
     stream.read_to_string(&mut response).unwrap();
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
     assert!(response.contains("agent-talk"), "{response}");
+
+    let _ = harness.as_tmux_pane(&["internal-daemon-shutdown"]);
+}
+
+/// 手紙 (POST /api/letters) の実機 E2E: TCP から投函した手紙が既存の外部送信
+/// 経路で実 pane に着弾し、mailbox 履歴に残る。allowlist 外の source と
+/// JSON 以外の Content-Type は投函できない。
+#[test]
+#[ignore = "requires permission to create a real tmux server"]
+fn a_letter_posted_over_tcp_reaches_a_real_pane() {
+    let harness = Harness::start();
+    harness.ok(&harness.as_tmux_pane(&["register", "claude"]));
+    wait_for(|| harness.tmux_rpc_socket().exists());
+
+    let letter = format!(
+        r#"{{"source":"mobile","target":"{}","body":"letter over tcp"}}"#,
+        harness.tmux_pane
+    );
+    let accepted = harness.http_post("/api/letters", "application/json", &letter);
+    assert!(accepted.starts_with("HTTP/1.1 200"), "{accepted}");
+    assert!(accepted.contains(r#""path":"sent""#), "{accepted}");
+
+    // 実 tmux pane に呼び鈴が打鍵される (本文は運ばない)。
+    wait_for(|| harness.capture_tmux_pane().contains("read_message"));
+    assert!(
+        !harness.capture_tmux_pane().contains("letter over tcp"),
+        "本文を端末へ注入しない"
+    );
+
+    // mailbox 履歴に out event として残り、LettersPanel から見える。
+    let history = harness.http_get("/api/mailbox/mobile?limit=10");
+    assert!(history.starts_with("HTTP/1.1 200"), "{history}");
+    assert!(history.contains("letter over tcp"), "{history}");
+
+    // allowlist 外の source は 403 で、履歴も増えない。
+    let rejected = harness.http_post(
+        "/api/letters",
+        "application/json",
+        &format!(
+            r#"{{"source":"stranger","target":"{}","body":"nope"}}"#,
+            harness.tmux_pane
+        ),
+    );
+    assert!(rejected.starts_with("HTTP/1.1 403"), "{rejected}");
+    // JSON 以外の Content-Type は 415 (cross-site simple request の遮断)。
+    let wrong_type = harness.http_post("/api/letters", "text/plain", &letter);
+    assert!(wrong_type.starts_with("HTTP/1.1 415"), "{wrong_type}");
 
     let _ = harness.as_tmux_pane(&["internal-daemon-shutdown"]);
 }

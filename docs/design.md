@@ -63,7 +63,13 @@ routeは次の順で分類します。
 4. `GET /api/mailboxes`は現在のallowlist、`GET /api/mailbox/<mailbox>`は既存の
    `mailbox-list`と同じ非consume event viewを返す。mailbox tokenとallowlist、
    `after`、`limit`の検査は既存primitiveと共有する。
-5. 未知の`/api/`以下は静的fallbackへ流さずJSON 404にする。
+5. `POST /api/letters`は唯一の書き込みrouteで、既存の外部mailbox送信経路
+   (`send --from` と同一のallowlist・resolve・journal-first・配達/requeue) を
+   そのまま通す。独自の送信実装を持たない。JSON以外のContent-Typeを415で
+   弾きCORS headerを返さないことで、browserのcross-site simple requestを
+   遮断する。無認証TCPでの投函自体は閉域LANの運用受容 (decision 0002) と
+   agent-terrace時代の前例に基づくuser裁定である。
+6. 未知の`/api/`以下は静的fallbackへ流さずJSON 404にする。
 6. その他のGETは埋め込みassetを返し、該当assetがなければ`/index.html`へfallbackする。
 
 失敗応答は`{"error":"<code>"}`です。statusはcallerが再試行と選択修正を区別できるよう

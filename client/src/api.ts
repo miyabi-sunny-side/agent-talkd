@@ -1,5 +1,7 @@
 export type AgentState = "idle" | "busy";
 
+export type Backend = "tmux" | "herdr";
+
 export interface Agent {
   name: string;
   state: AgentState;
@@ -7,6 +9,7 @@ export interface Agent {
   session: string;
   location: string;
   cwd: string;
+  backend: Backend;
 }
 
 export interface ScreenCapture {
@@ -96,6 +99,47 @@ export async function fetchMailbox(
   return body;
 }
 
+export interface LetterAccepted {
+  version: 1;
+  id: number;
+  path: "sent" | "queued";
+  to: string;
+  name: string;
+}
+
+export async function sendLetter(
+  source: string,
+  target: string,
+  body: string,
+): Promise<LetterAccepted> {
+  const response = await fetch("/api/letters", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ source, target, body }),
+  });
+  if (!response.ok) {
+    const detail = (await response.json().catch(() => null)) as {
+      error?: string;
+    } | null;
+    throw new Error(detail?.error ?? `letter failed (${response.status})`);
+  }
+  const accepted = (await response.json()) as unknown;
+  if (!isLetterAccepted(accepted))
+    throw new Error("letters returned an invalid response");
+  return accepted;
+}
+
+function isLetterAccepted(value: unknown): value is LetterAccepted {
+  return (
+    isRecord(value) &&
+    value.version === 1 &&
+    Number.isSafeInteger(value.id) &&
+    (value.path === "sent" || value.path === "queued") &&
+    typeof value.to === "string" &&
+    typeof value.name === "string"
+  );
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
@@ -114,7 +158,8 @@ function isAgent(value: unknown): value is Agent {
     ["name", "pane_id", "session", "location", "cwd"].every(
       (key) => typeof value[key] === "string",
     ) &&
-    (value.state === "idle" || value.state === "busy")
+    (value.state === "idle" || value.state === "busy") &&
+    (value.backend === "tmux" || value.backend === "herdr")
   );
 }
 

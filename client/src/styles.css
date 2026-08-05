@@ -1,5 +1,7 @@
 :root {
-  font-family: "Hiragino Mincho ProN", "Yu Mincho", Georgia, serif;
+  font-family:
+    "Hiragino Kaku Gothic ProN", "Yu Gothic UI", "Noto Sans CJK JP",
+    "Noto Sans JP", system-ui, sans-serif;
   color: #e9e4d8;
   background: #171714;
   font-synthesis: none;
@@ -544,4 +546,130 @@ output.failed,
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
   }
+}
+
+/* --- agent 一覧の session/label badge --- */
+.identity-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.identity-name strong {
+  overflow: hidden;
+  font-size: 17px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-badge {
+  display: inline-block;
+  padding: 1px 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--paper);
+  background: var(--ink-raised);
+  vertical-align: middle;
+}
+
+/* --- Screen 内の兄弟 agent 切り替え --- */
+.sibling-switcher {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 12px 0;
+  flex-wrap: wrap;
+}
+
+.sibling-switcher .switcher-scope {
+  font-size: 12px;
+  color: var(--paper-muted);
+  letter-spacing: 0.06em;
+}
+
+.sibling-switcher button {
+  padding: 6px 16px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--paper);
+  cursor: pointer;
+  font-size: 14px;
+}
+
+.sibling-switcher button.active {
+  background: var(--paper);
+  color: var(--ink);
+  font-weight: 600;
+}
+
+/* --- 手紙を出す --- */
+.letter-compose {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin: 14px 0 20px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--ink-raised);
+}
+
+.letter-compose label {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+  color: var(--paper-muted);
+}
+
+.letter-compose select,
+.letter-compose textarea {
+  font: inherit;
+  color: var(--paper);
+  background: var(--ink);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+
+.letter-compose textarea {
+  resize: vertical;
+  min-height: 72px;
+}
+
+.letter-compose .compose-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.letter-compose button[type="submit"] {
+  padding: 8px 20px;
+  border: 1px solid var(--paper);
+  border-radius: 999px;
+  background: var(--paper);
+  color: var(--ink);
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.letter-compose button[type="submit"]:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.letter-compose .compose-status {
+  font-size: 13px;
+  color: var(--paper-muted);
+}
+
+.letter-compose .compose-status.failed {
+  color: #e08585;
 }

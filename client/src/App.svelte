@@ -9,6 +9,18 @@
   let message = $state("");
   let view = $state<"registry" | "screen" | "letters">("registry");
   let selectedAgent = $state<Agent | null>(null);
+  // 同一 backend + 同一 session の兄弟 agent (claude ⇄ codex の行き来)。
+  // session 名だけで判定すると tmux session と herdr label の同名衝突で
+  // 別 backend へ飛ぶため、backend も一致させる。
+  const siblings = $derived(
+    selectedAgent === null
+      ? []
+      : agents.filter(
+          (candidate) =>
+            candidate.backend === selectedAgent!.backend &&
+            candidate.session === selectedAgent!.session,
+        ),
+  );
 
   async function refresh(): Promise<void> {
     phase = "loading";
@@ -129,9 +141,11 @@
                   aria-hidden="true"
                 ></span>
                 <span class="identity"
-                  ><strong>{agent.name}</strong><span title={agent.cwd}
-                    >{agent.cwd}</span
-                  ></span
+                  ><span class="identity-name"
+                    ><strong>{agent.name}</strong><span class="session-badge"
+                      >{agent.session}</span
+                    ></span
+                  ><span title={agent.cwd}>{agent.cwd}</span></span
                 >
                 <span class="coordinates"
                   ><span>{agent.location}</span><code>{agent.pane_id}</code
@@ -153,6 +167,23 @@
     <button class="back-button" type="button" onclick={backToRegistry}
       >← agent 一覧へ</button
     >
+    {#if siblings.length > 1}
+      <nav class="sibling-switcher" aria-label="同一 session の agent 切り替え">
+        <span class="switcher-scope">{selectedAgent.session}</span>
+        {#each siblings as sibling (sibling.pane_id)}
+          <button
+            type="button"
+            class:active={sibling.pane_id === selectedAgent.pane_id}
+            aria-current={sibling.pane_id === selectedAgent.pane_id
+              ? "true"
+              : undefined}
+            onclick={() => (selectedAgent = sibling)}
+          >
+            {sibling.name}
+          </button>
+        {/each}
+      </nav>
+    {/if}
     {#key selectedAgent.pane_id}<ScreenPanel agent={selectedAgent} />{/key}
   {:else}
     <button class="back-button" type="button" onclick={backToRegistry}
@@ -162,6 +193,6 @@
   {/if}
 
   <footer class="site-footer">
-    <span>READ ONLY</span><span>同一 tmux server</span>
+    <span>OBSERVE + LETTERS</span><span>tmux + herdr</span>
   </footer>
 </main>

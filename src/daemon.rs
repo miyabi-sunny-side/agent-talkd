@@ -215,6 +215,12 @@ enum HttpEvent {
     Who {
         reply: oneshot::Sender<std::result::Result<Vec<WebAgent>, String>>,
     },
+    Letter {
+        source: String,
+        target: String,
+        body: String,
+        reply: oneshot::Sender<std::result::Result<serde_json::Value, WebError>>,
+    },
     Screen {
         pane: String,
         reply: oneshot::Sender<std::result::Result<WebScreen, WebError>>,
@@ -238,6 +244,8 @@ struct WebAgent {
     session: String,
     location: String,
     cwd: String,
+    /// 兄弟 agent の判定 (session 同名の backend 跨ぎを混ぜない) に使う。
+    backend: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -511,12 +519,13 @@ async fn route_http(
     tx: mpsc::Sender<Event>,
 ) -> std::result::Result<HttpResponse<Full<Bytes>>, std::convert::Infallible> {
     let response = match classify_http(request.method(), request.uri().path()) {
-        HttpRoute::MethodNotAllowed => response(
+        HttpRoute::MethodNotAllowed(allow) => response(
             StatusCode::METHOD_NOT_ALLOWED,
             "application/json",
             br#"{"error":"method_not_allowed"}"#,
         )
-        .with_header(ALLOW, "GET"),
+        .with_header(ALLOW, allow),
+        HttpRoute::Letters => request_web_letter(request, &tx).await,
         HttpRoute::Hello => json_response(
             StatusCode::OK,
             &serde_json::json!({
@@ -582,6 +591,70 @@ async fn request_web_screen(tx: &mpsc::Sender<Event>, pane: String) -> HttpRespo
     }
 }
 
+/// `POST /api/letters` — 唯一の書き込み route。
+///
+/// 無認証 TCP 面に出るため、browser からの cross-site simple request を弾く:
+/// Content-Type は application/json のみ受理 (form/text-plain は 415)、CORS header は
+/// 一切返さない (preflight が通らないので他 site の fetch は送れない)。
+/// source の許可は daemon 側の allowlist (`@agent_talkd_allowed_sources`、既定 deny)
+/// が最終判定する — UI の申告は信用しない。
+async fn request_web_letter(
+    request: HttpRequest<Incoming>,
+    tx: &mpsc::Sender<Event>,
+) -> HttpResponse<Full<Bytes>> {
+    use http_body_util::BodyExt;
+
+    #[derive(serde::Deserialize)]
+    struct Letter {
+        source: String,
+        target: String,
+        body: String,
+    }
+
+    let json_content_type = request
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(';')
+                .next()
+                .map(str::trim)
+                .is_some_and(|media| media.eq_ignore_ascii_case("application/json"))
+        });
+    if !json_content_type {
+        return json_error(StatusCode::UNSUPPORTED_MEDIA_TYPE, "json_only");
+    }
+    let limited = http_body_util::Limited::new(request.into_body(), MAX_BODY_BYTES);
+    let Ok(collected) = limited.collect().await else {
+        return json_error(StatusCode::PAYLOAD_TOO_LARGE, "letter_too_large");
+    };
+    let Ok(letter) = serde_json::from_slice::<Letter>(&collected.to_bytes()) else {
+        return json_error(StatusCode::BAD_REQUEST, "invalid_letter");
+    };
+    if letter.source.is_empty() || letter.target.is_empty() || letter.body.trim().is_empty() {
+        return json_error(StatusCode::BAD_REQUEST, "invalid_letter");
+    }
+    let (reply, receive) = oneshot::channel();
+    if tx
+        .send(Event::Http(HttpEvent::Letter {
+            source: letter.source,
+            target: letter.target,
+            body: letter.body,
+            reply,
+        }))
+        .await
+        .is_err()
+    {
+        return json_error(StatusCode::SERVICE_UNAVAILABLE, "broker_unavailable");
+    }
+    match receive.await {
+        Ok(Ok(accepted)) => json_response(StatusCode::OK, &accepted),
+        Ok(Err(error)) => json_error(error.status, error.code),
+        Err(_) => json_error(StatusCode::SERVICE_UNAVAILABLE, "broker_unavailable"),
+    }
+}
+
 async fn request_web_mailboxes(tx: &mpsc::Sender<Event>) -> HttpResponse<Full<Bytes>> {
     let (reply, receive) = oneshot::channel();
     if tx
@@ -634,7 +707,8 @@ async fn request_web_mailbox(
 
 #[derive(Debug, PartialEq, Eq)]
 enum HttpRoute {
-    MethodNotAllowed,
+    MethodNotAllowed(&'static str),
+    Letters,
     Hello,
     Who,
     Screen(String),
@@ -647,8 +721,17 @@ enum HttpRoute {
 }
 
 fn classify_http(method: &Method, path: &str) -> HttpRoute {
+    // 手紙の投函だけが唯一の書き込み route (ADR 0001 の GET 専用を user 指示で
+    // 部分的に撤回)。それ以外の非 GET は従来どおり一切受けない。
+    if path == "/api/letters" {
+        return if method == Method::POST {
+            HttpRoute::Letters
+        } else {
+            HttpRoute::MethodNotAllowed("POST")
+        };
+    }
     if method != Method::GET {
-        return HttpRoute::MethodNotAllowed;
+        return HttpRoute::MethodNotAllowed("GET");
     }
     match path {
         "/api/hello" => HttpRoute::Hello,
@@ -866,11 +949,19 @@ struct Broker {
 }
 
 impl Broker {
-    async fn handle_http_event(&self, event: HttpEvent) {
+    async fn handle_http_event(&mut self, event: HttpEvent) {
         match event {
             HttpEvent::Who { reply } => {
                 let result = self.web_agents().await.map_err(|error| error.to_string());
                 let _ = reply.send(result);
+            }
+            HttpEvent::Letter {
+                source,
+                target,
+                body,
+                reply,
+            } => {
+                let _ = reply.send(self.web_letter(source, target, body).await);
             }
             HttpEvent::Screen { pane, reply } => {
                 let _ = reply.send(self.web_screen(&pane).await);
@@ -901,10 +992,52 @@ impl Broker {
                     session: pane.session.clone(),
                     location: format!("{}:{}.{}", pane.session, pane.window_index, pane.pane_index),
                     cwd: pane.cwd,
+                    backend: pane.backend.as_str(),
                 });
             }
         }
         Ok(agents)
+    }
+
+    /// HTTP からの手紙を既存の外部 mailbox 送信経路へ流す。
+    ///
+    /// 独自の送信実装を持たない — allowlist 判定・resolve・queue 上限・
+    /// journal-first の永続化・配達/requeue は CLI の `send --from` と
+    /// 完全に同一の経路である。拒否時は journal も state も変化しない。
+    async fn web_letter(
+        &mut self,
+        source: String,
+        target: String,
+        body: String,
+    ) -> std::result::Result<serde_json::Value, WebError> {
+        let request = Request {
+            command: "send-v2".into(),
+            args: vec![target],
+            stdin: body,
+            pane: None,
+            send_options: Some(SendOptions {
+                from: Some(source),
+                skill: None,
+                no_reply: false,
+            }),
+        };
+        let response = self
+            .send(request, SendReport::Json)
+            .await
+            .map_err(|_| WebError::new(StatusCode::INTERNAL_SERVER_ERROR, "letter_failed"))?;
+        if response.code == 0 {
+            return serde_json::from_str(response.stdout.trim())
+                .map_err(|_| WebError::new(StatusCode::INTERNAL_SERVER_ERROR, "letter_failed"));
+        }
+        // 表示は code に落とす (本文の日本語エラーは HTTP へ流さない)。
+        if response.stderr.contains("許可されていません") {
+            Err(WebError::new(StatusCode::FORBIDDEN, "source_not_allowed"))
+        } else if response.stderr.contains("見つかりません") || response.stderr.contains("退出済み")
+        {
+            Err(WebError::new(StatusCode::NOT_FOUND, "target_not_found"))
+        } else {
+            Err(WebError::new(StatusCode::BAD_REQUEST, "letter_rejected"))
+        }
     }
 
     async fn web_screen(&self, pane: &str) -> std::result::Result<WebScreen, WebError> {
@@ -3121,6 +3254,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_letter_over_http_reuses_the_external_send_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut broker = registered_pair(&dir).await;
+
+        // 既定 deny: allowlist が空なら 403 で、journal にも state にも痕跡が無い。
+        let error = broker
+            .web_letter("mobile".into(), "claude".into(), "letter body".into())
+            .await
+            .unwrap_err();
+        assert_eq!(error.status, StatusCode::FORBIDDEN);
+        assert_eq!(error.code, "source_not_allowed");
+        assert_eq!(broker.state.messages.len(), 0, "拒否は mutation を残さない");
+
+        // 許可すると CLI の send --from と同一経路で受理される (versioned JSON)。
+        broker.config.allowed_sources.insert("mobile".into());
+        let accepted = broker
+            .web_letter("mobile".into(), "claude".into(), "letter body".into())
+            .await
+            .unwrap();
+        assert_eq!(accepted["version"], 1);
+        assert_eq!(accepted["path"], "sent");
+        assert_eq!(accepted["name"], "claude");
+        let id = accepted["id"].as_u64().unwrap();
+        assert!(broker.state.message(id).is_some(), "journal-first で永続化");
+        assert_eq!(
+            broker.state.mailbox_events("mobile", None, 10).len(),
+            1,
+            "mailbox 履歴に out event が残り、LettersPanel から見える"
+        );
+
+        // 実在しない宛先は 404。
+        let error = broker
+            .web_letter("mobile".into(), "ghost".into(), "x".into())
+            .await
+            .unwrap_err();
+        assert_eq!(error.status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
     async fn cross_backend_scopes_resolve_by_label_alias_and_formal_name() {
         let dir = tempfile::tempdir().unwrap();
         // tmux session "settings" と herdr label "settings" が同名で共存し、
@@ -3545,7 +3717,16 @@ mod tests {
         );
         assert_eq!(
             classify_http(&Method::POST, "/api/who"),
-            HttpRoute::MethodNotAllowed
+            HttpRoute::MethodNotAllowed("GET")
+        );
+        // 手紙の投函だけが唯一の書き込み route。
+        assert_eq!(
+            classify_http(&Method::POST, "/api/letters"),
+            HttpRoute::Letters
+        );
+        assert_eq!(
+            classify_http(&Method::GET, "/api/letters"),
+            HttpRoute::MethodNotAllowed("POST")
         );
         for path in [
             "/api/agents/screen",
@@ -3636,6 +3817,7 @@ mod tests {
             session: "work".into(),
             location: "work:0.1".into(),
             cwd: "/tmp/project with \"quotes\"".into(),
+            backend: "tmux",
         })
         .unwrap();
         assert!(encoded.contains(r#""cwd":"/tmp/project with \"quotes\"""#));

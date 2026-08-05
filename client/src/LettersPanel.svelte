@@ -1,6 +1,13 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { fetchMailbox, fetchMailboxes, type MailboxEvent } from "./api";
+  import {
+    fetchAgents,
+    fetchMailbox,
+    fetchMailboxes,
+    sendLetter,
+    type Agent,
+    type MailboxEvent,
+  } from "./api";
 
   let mailboxes = $state<string[]>([]);
   let selected = $state("");
@@ -9,6 +16,52 @@
   let message = $state("mailbox を確認中");
   let controller: AbortController | undefined;
   let generation = 0;
+
+  // 手紙を出す (compose)。source は選択中の mailbox、宛先は稼働中 agent。
+  let agents = $state<Agent[]>([]);
+  let target = $state("");
+  let draft = $state("");
+  let sending = $state(false);
+  let composeMessage = $state("");
+  let composeFailed = $state(false);
+
+  async function loadAgents(): Promise<void> {
+    try {
+      agents = await fetchAgents();
+      if (!agents.some((agent) => agent.pane_id === target)) {
+        target = agents[0]?.pane_id ?? "";
+      }
+    } catch {
+      // 宛先一覧が取れなくても履歴の閲覧は生かす。
+    }
+  }
+
+  async function submitLetter(event: SubmitEvent): Promise<void> {
+    event.preventDefault();
+    if (sending || selected === "" || target === "" || draft.trim() === "") {
+      return;
+    }
+    sending = true;
+    composeFailed = false;
+    composeMessage = "送信中";
+    try {
+      const accepted = await sendLetter(selected, target, draft);
+      composeMessage =
+        accepted.path === "sent"
+          ? `送信しました #${accepted.id} → ${accepted.name}`
+          : `受理されました (配達待ち) #${accepted.id} → ${accepted.name}`;
+      draft = "";
+      await loadSelected(false);
+    } catch (error) {
+      composeFailed = true;
+      composeMessage =
+        error instanceof Error
+          ? `送信できませんでした (${error.message})`
+          : "送信できませんでした";
+    } finally {
+      sending = false;
+    }
+  }
 
   function formatTime(value: string): string {
     const date = new Date(value);
@@ -97,6 +150,7 @@
 
   onMount(() => {
     void discover();
+    void loadAgents();
     return () => {
       generation += 1;
       controller?.abort();
@@ -114,7 +168,7 @@
       <span class="section-number">三</span>
       <div>
         <h2 id="letters-heading">Letters</h2>
-        <p>external mailbox · read only</p>
+        <p>external mailbox</p>
       </div>
     </div>
     <div class="letter-actions">
@@ -143,6 +197,37 @@
   >
     {message}
   </div>
+
+  {#if selected !== ""}
+    <form class="letter-compose" onsubmit={submitLetter}>
+      <label>
+        <span>宛先</span>
+        <select bind:value={target} aria-label="手紙の宛先 agent">
+          {#each agents as agent (agent.pane_id)}
+            <option value={agent.pane_id}>{agent.session} / {agent.name}</option
+            >
+          {/each}
+        </select>
+      </label>
+      <textarea
+        bind:value={draft}
+        rows="3"
+        placeholder={`${selected} からの手紙の本文`}
+        aria-label="手紙の本文"></textarea>
+      <div class="compose-actions">
+        <button
+          type="submit"
+          disabled={sending || target === "" || draft.trim() === ""}
+          >{sending ? "送信中…" : "手紙を出す"}</button
+        >
+        <span
+          class="compose-status"
+          class:failed={composeFailed}
+          aria-live="polite">{composeMessage}</span
+        >
+      </div>
+    </form>
+  {/if}
 
   {#if phase === "error"}
     <div class="panel-state error" role="alert">

@@ -2,8 +2,20 @@ import { fireEvent, render, screen } from "@testing-library/svelte";
 import { expect, it, vi } from "vitest";
 import LettersPanel from "./LettersPanel.svelte";
 
-function json(value: unknown): Response {
-  return new Response(JSON.stringify(value), { status: 200 });
+function json(value: unknown, status = 200): Response {
+  return new Response(JSON.stringify(value), { status });
+}
+
+function agent(paneId: string, name: string) {
+  return {
+    name,
+    state: "idle",
+    pane_id: paneId,
+    session: "knowledge",
+    location: "knowledge:1.1",
+    cwd: "/tmp/knowledge",
+    backend: "herdr",
+  };
 }
 
 function event(
@@ -27,20 +39,27 @@ function event(
 }
 
 it("discovers mailboxes, distinguishes directions, and requests incremental events", async () => {
-  const fetch = vi
-    .fn()
-    .mockResolvedValueOnce(json({ mailboxes: ["mobile"] }))
-    .mockResolvedValueOnce(
-      json({
-        version: 1,
-        mailbox: "mobile",
-        events: [
-          event(12, "in", "incoming request"),
-          event(13, "out", "outgoing answer"),
-        ],
-      }),
-    )
-    .mockResolvedValueOnce(json({ version: 1, mailbox: "mobile", events: [] }));
+  let mailboxCalls = 0;
+  const fetch = vi.fn((input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url === "/api/mailboxes")
+      return Promise.resolve(json({ mailboxes: ["mobile"] }));
+    if (url === "/api/who")
+      return Promise.resolve(json({ agents: [agent("w2:p1", "claude")] }));
+    mailboxCalls += 1;
+    return Promise.resolve(
+      mailboxCalls === 1
+        ? json({
+            version: 1,
+            mailbox: "mobile",
+            events: [
+              event(12, "in", "incoming request"),
+              event(13, "out", "outgoing answer"),
+            ],
+          })
+        : json({ version: 1, mailbox: "mobile", events: [] }),
+    );
+  });
   vi.stubGlobal("fetch", fetch);
   render(LettersPanel);
 
@@ -49,17 +68,26 @@ it("discovers mailboxes, distinguishes directions, and requests incremental even
   expect(screen.getByText("IN")).toBeTruthy();
   expect(screen.getByText("OUT")).toBeTruthy();
   await fireEvent.click(screen.getByRole("button", { name: "更新" }));
-  await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(3));
-  expect(fetch.mock.calls[2]?.[0]).toBe(
-    "/api/mailbox/mobile?after=13&limit=100",
-  );
+  await vi.waitFor(() => expect(mailboxCalls).toBe(2));
+  const mailboxUrls = fetch.mock.calls
+    .map((call) => String(call[0]))
+    .filter((url) => url.startsWith("/api/mailbox/"));
+  expect(mailboxUrls.at(-1)).toBe("/api/mailbox/mobile?after=13&limit=100");
 });
 
 it("offers retry when mailbox discovery fails", async () => {
-  const fetch = vi
-    .fn()
-    .mockRejectedValueOnce(new Error("offline"))
-    .mockResolvedValueOnce(json({ mailboxes: [] }));
+  let discoveries = 0;
+  const fetch = vi.fn((input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url === "/api/who") return Promise.resolve(json({ agents: [] }));
+    if (url === "/api/mailboxes") {
+      discoveries += 1;
+      return discoveries === 1
+        ? Promise.reject(new Error("offline"))
+        : Promise.resolve(json({ mailboxes: [] }));
+    }
+    return Promise.resolve(json({ version: 1, mailbox: "", events: [] }));
+  });
   vi.stubGlobal("fetch", fetch);
   render(LettersPanel);
 
@@ -73,17 +101,20 @@ it("does not let an older mailbox response overwrite a new selection", async () 
   const mobileResponse = new Promise<Response>((resolve) => {
     resolveMobile = resolve;
   });
-  const fetch = vi
-    .fn()
-    .mockResolvedValueOnce(json({ mailboxes: ["mobile", "desktop"] }))
-    .mockReturnValueOnce(mobileResponse)
-    .mockResolvedValueOnce(
+  const fetch = vi.fn((input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url === "/api/mailboxes")
+      return Promise.resolve(json({ mailboxes: ["mobile", "desktop"] }));
+    if (url === "/api/who") return Promise.resolve(json({ agents: [] }));
+    if (url.startsWith("/api/mailbox/mobile")) return mobileResponse;
+    return Promise.resolve(
       json({
         version: 1,
         mailbox: "desktop",
         events: [event(20, "in", "new desktop letter", "desktop")],
       }),
     );
+  });
   vi.stubGlobal("fetch", fetch);
   render(LettersPanel);
 
@@ -102,4 +133,50 @@ it("does not let an older mailbox response overwrite a new selection", async () 
   await Promise.resolve();
   expect(screen.queryByText("stale mobile letter")).toBeNull();
   expect(screen.getByText("new desktop letter")).toBeTruthy();
+});
+
+it("composes a letter, posts it, and refreshes the history", async () => {
+  let mailboxCalls = 0;
+  const fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url === "/api/mailboxes")
+      return Promise.resolve(json({ mailboxes: ["mobile"] }));
+    if (url === "/api/who")
+      return Promise.resolve(
+        json({ agents: [agent("w2:p1", "claude"), agent("w2:p4", "codex")] }),
+      );
+    if (url === "/api/letters") {
+      expect(init?.method).toBe("POST");
+      expect(JSON.parse(String(init?.body))).toEqual({
+        source: "mobile",
+        target: "w2:p1",
+        body: "査収ください",
+      });
+      return Promise.resolve(
+        json({ version: 1, id: 30, path: "sent", to: "w2:p1", name: "claude" }),
+      );
+    }
+    mailboxCalls += 1;
+    return Promise.resolve(
+      json({
+        version: 1,
+        mailbox: "mobile",
+        events: mailboxCalls === 1 ? [] : [event(30, "out", "査収ください")],
+      }),
+    );
+  });
+  vi.stubGlobal("fetch", fetch);
+  render(LettersPanel);
+
+  const body = await screen.findByLabelText("手紙の本文");
+  await fireEvent.input(body, { target: { value: "査収ください" } });
+  await fireEvent.submit(
+    screen.getByRole("button", { name: "手紙を出す" }).closest("form")!,
+  );
+
+  expect(await screen.findByText("送信しました #30 → claude")).toBeTruthy();
+  // 送信後に履歴が更新され、out event が現れる。
+  expect(await screen.findByText("査収ください")).toBeTruthy();
+  // 本文はクリアされる。
+  expect((body as HTMLTextAreaElement).value).toBe("");
 });

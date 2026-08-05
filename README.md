@@ -208,6 +208,12 @@ HTTP-over-UDSで提供します。これはTCP listenerではなくUnix domain s
 - `GET /api/mailbox/<mailbox>?after=<id>&limit=<n>`: mailbox eventをID順に非consume取得します。
   `after`は排他、`limit`は1〜500で既定100です。JSON event schemaは
   `mailbox-list`と同一です。
+- `POST /api/letters`: 唯一の書き込みroute。`{"source","target","body"}` のJSONを
+  受け、CLIの `send --from` と同一の外部mailbox送信経路 (allowlist・resolve・
+  journal-first・配達/requeue) へ流します。sourceは `@agent_talkd_allowed_sources`
+  (既定 `mobile`) が最終判定し、未許可は403。Content-Typeは `application/json`
+  のみ (それ以外415)、本文上限1MiB (超過413)、CORS headerは返しません
+  (他siteのbrowserからは投函できません)。成功は `{"version":1,"id","path","to","name"}`。
 - 未知の`/api/`以下: JSONの404を返します。撤去済みの旧 `/v1/*` も同じJSON 404で
   明示的に拒否します (SPA entryへはfallbackさせません。200を返すと残存する旧
   updaterのhealth probeが旧APIを正常と誤認するためです)。

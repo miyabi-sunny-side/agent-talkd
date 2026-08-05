@@ -1,5 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
-import { fetchAgents, fetchMailbox, fetchMailboxes, fetchScreen } from "./api";
+import {
+  fetchAgents,
+  fetchMailbox,
+  fetchMailboxes,
+  fetchScreen,
+  sendLetter,
+} from "./api";
 
 function json(value: unknown, status = 200): Response {
   return new Response(JSON.stringify(value), { status });
@@ -19,6 +25,7 @@ describe("HTTP API", () => {
               session: "dev",
               location: "dev:0.1",
               cwd: "/tmp/project with spaces",
+              backend: "tmux",
             },
           ],
         }),
@@ -96,5 +103,45 @@ describe("HTTP API", () => {
       ),
     );
     await expect(fetchMailbox("mobile")).rejects.toThrow("invalid response");
+  });
+});
+
+describe("letters", () => {
+  it("posts a letter as JSON and validates the accepted response", async () => {
+    const fetch = vi
+      .fn()
+      .mockResolvedValueOnce(
+        json({ version: 1, id: 9, path: "sent", to: "%1", name: "claude" }),
+      );
+    vi.stubGlobal("fetch", fetch);
+
+    await expect(sendLetter("mobile", "%1", "hello")).resolves.toEqual({
+      version: 1,
+      id: 9,
+      path: "sent",
+      to: "%1",
+      name: "claude",
+    });
+    const [url, init] = fetch.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/api/letters");
+    expect(init.method).toBe("POST");
+    expect((init.headers as Record<string, string>)["Content-Type"]).toBe(
+      "application/json",
+    );
+    expect(JSON.parse(String(init.body))).toEqual({
+      source: "mobile",
+      target: "%1",
+      body: "hello",
+    });
+  });
+
+  it("surfaces the server error code on rejection", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValueOnce(json({ error: "source_not_allowed" }, 403)),
+    );
+    await expect(sendLetter("mobile", "%1", "hello")).rejects.toThrow(
+      "source_not_allowed",
+    );
   });
 });

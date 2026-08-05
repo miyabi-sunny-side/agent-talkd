@@ -389,3 +389,20 @@ codex は当該箇所を Authority gap として user への確認を推奨し�
 
 user の UX 評価（読めても行動できない、遡れない）と、agent-terrace が外部 mailbox の
 唯一の利用者であるという構造的事実により、両方とも削除で確定した。
+
+
+---
+
+## 追記 (2026-08-05): GET 専用の部分的撤回
+
+本決定の「HTTP は GET 専用 (POST は 405)」は、user 指示により **`POST /api/letters`
+1 route に限り撤回**された。旧 agent-terrace の手紙投函 (置換時に受容された機能後退、
+home-server README の TODO として記録) の回収である。
+
+- 手紙は既存の外部 mailbox 送信経路 (`send --from` と同一の allowlist 判定・resolve・
+  journal-first 永続化・配達/requeue) をそのまま通り、新しい送信実装を持たない。
+- source の許可は `@agent_talkd_allowed_sources` (既定 `mobile`) が最終判定する。
+- Content-Type は `application/json` のみ・CORS header なし (cross-site simple
+  request の遮断)。無認証 TCP での投函は閉域 LAN の運用受容 (decision 0002) と
+  agent-terrace の前例に基づく。
+- **他の書き込み route は引き続き非目標** — GET 専用の原則はこの1 route を除いて有効。
