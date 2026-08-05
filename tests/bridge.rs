@@ -42,13 +42,15 @@ impl Drop for TmuxServer {
     }
 }
 
-/// 偽 herdr。受け取った要求を記録し、固定の pane 構成を返す。
+/// 偽 herdr。受け取った要求を記録し、可変の pane 構成を返す。
 struct FakeHerdr {
     socket: PathBuf,
     requests: Arc<Mutex<Vec<Value>>>,
     alive: Arc<Mutex<bool>>,
     /// `pane.get` が報告する `agent_status`。画面検出のラグを模すために可変。
     status: Arc<Mutex<String>>,
+    /// `(pane_id, agent)` の一覧。稼働中の agent 出現・消滅を模すために可変。
+    panes: Arc<Mutex<Vec<(String, String)>>>,
 }
 
 impl FakeHerdr {
@@ -58,9 +60,11 @@ impl FakeHerdr {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let alive = Arc::new(Mutex::new(true));
         let status = Arc::new(Mutex::new("idle".to_owned()));
+        let panes = Arc::new(Mutex::new(vec![("w1:p1".to_owned(), "codex".to_owned())]));
         let recorded = Arc::clone(&requests);
         let serving = Arc::clone(&alive);
         let reported = Arc::clone(&status);
+        let listing = Arc::clone(&panes);
         thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(stream) = stream else { break };
@@ -70,7 +74,8 @@ impl FakeHerdr {
                 }
                 let recorded = Arc::clone(&recorded);
                 let reported = Arc::clone(&reported);
-                thread::spawn(move || serve_one(stream, &recorded, &reported));
+                let listing = Arc::clone(&listing);
+                thread::spawn(move || serve_one(stream, &recorded, &reported, &listing));
             }
         });
         Self {
@@ -78,7 +83,21 @@ impl FakeHerdr {
             requests,
             alive,
             status,
+            panes,
         }
+    }
+
+    /// 稼働中の agent 出現を模す。
+    fn add_pane(&self, pane_id: &str, agent: &str) {
+        self.panes
+            .lock()
+            .unwrap()
+            .push((pane_id.to_owned(), agent.to_owned()));
+    }
+
+    /// 稼働中の agent 消滅を模す。
+    fn remove_pane(&self, pane_id: &str) {
+        self.panes.lock().unwrap().retain(|(id, _)| id != pane_id);
     }
 
     /// herdr が落ちた状態にする。socket file は残るが応答しなくなる。
@@ -106,7 +125,12 @@ impl FakeHerdr {
     }
 }
 
-fn serve_one(stream: UnixStream, recorded: &Arc<Mutex<Vec<Value>>>, status: &Arc<Mutex<String>>) {
+fn serve_one(
+    stream: UnixStream,
+    recorded: &Arc<Mutex<Vec<Value>>>,
+    status: &Arc<Mutex<String>>,
+    panes: &Arc<Mutex<Vec<(String, String)>>>,
+) {
     let mut reader = BufReader::new(stream.try_clone().unwrap());
     let mut line = String::new();
     if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
@@ -116,20 +140,40 @@ fn serve_one(stream: UnixStream, recorded: &Arc<Mutex<Vec<Value>>>, status: &Arc
         return;
     };
     let method = request["method"].as_str().unwrap_or_default().to_owned();
+    let requested_pane = request["params"]["pane_id"]
+        .as_str()
+        .unwrap_or("w1:p1")
+        .to_owned();
     recorded.lock().unwrap().push(request);
     let agent_status = status.lock().unwrap().clone();
-    let pane = json!({
-        "pane_id": "w1:p1",
-        "terminal_id": "term_fake",
-        "workspace_id": "w1",
-        "tab_id": "w1:t1",
-        "cwd": "/tmp",
-        "agent": "codex",
-        "agent_status": agent_status,
-    });
+    let pane_json = |pane_id: &str, agent: &str| {
+        json!({
+            "pane_id": pane_id,
+            "terminal_id": format!("term_{pane_id}"),
+            "workspace_id": "w1",
+            "tab_id": "w1:t1",
+            "cwd": "/tmp",
+            "agent": agent,
+            "agent_status": agent_status,
+        })
+    };
+    let listing = panes.lock().unwrap().clone();
+    let pane = listing
+        .iter()
+        .find(|(id, _)| *id == requested_pane)
+        .map_or_else(
+            || pane_json("w1:p1", "codex"),
+            |(id, agent)| pane_json(id, agent),
+        );
     let result = match method.as_str() {
         "ping" => json!({"type": "pong", "version": "0.7.5", "protocol": 17}),
-        "pane.list" => json!({"type": "pane_list", "panes": [pane]}),
+        "pane.list" => json!({
+            "type": "pane_list",
+            "panes": listing
+                .iter()
+                .map(|(id, agent)| pane_json(id, agent))
+                .collect::<Vec<_>>(),
+        }),
         // 実機封筒 (2026-08-03 採取): workspace の人間向け名は label に入る。
         "workspace.list" => json!({
             "type": "workspace_list",
@@ -514,6 +558,43 @@ fn a_letter_posted_over_tcp_reaches_a_real_pane() {
     // JSON 以外の Content-Type は 415 (cross-site simple request の遮断)。
     let wrong_type = harness.http_post("/api/letters", "text/plain", &letter);
     assert!(wrong_type.starts_with("HTTP/1.1 415"), "{wrong_type}");
+
+    let _ = harness.as_tmux_pane(&["internal-daemon-shutdown"]);
+}
+
+/// 稼働中に herdr へ現れた agent (hook なし) が、数秒で peer になり、
+/// 消えると debounce の後に登録が外れる。
+#[test]
+#[ignore = "requires permission to create a real tmux server"]
+fn a_herdr_agent_appearing_mid_run_becomes_a_peer_without_hooks() {
+    let harness = Harness::start();
+    harness.ok(&harness.as_tmux_pane(&["register", "claude"]));
+    wait_for(|| harness.tmux_rpc_socket().exists() && harness.herdr_rpc_socket().exists());
+
+    // 稼働中の出現: 仕込みゼロで数 tick 以内に who へ載る。
+    harness.herdr.add_pane("w1:p9", "grok");
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let who = harness.ok(&harness.as_tmux_pane(&["who"]));
+        if common::has_agent(&who, "grok") {
+            assert_eq!(common::agent_backend(&who, "grok"), Some("herdr"), "{who}");
+            break;
+        }
+        assert!(Instant::now() < deadline, "grok discovery timed out: {who}");
+        thread::sleep(Duration::from_millis(200));
+    }
+
+    // 消滅: suspect (1 tick) を経て2連続欠落で外れる。
+    harness.herdr.remove_pane("w1:p9");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let who = harness.ok(&harness.as_tmux_pane(&["who"]));
+        if !common::has_agent(&who, "grok") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "grok eviction timed out: {who}");
+        thread::sleep(Duration::from_millis(200));
+    }
 
     let _ = harness.as_tmux_pane(&["internal-daemon-shutdown"]);
 }

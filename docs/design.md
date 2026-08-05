@@ -149,6 +149,24 @@ daemonのメモリを稼働中の唯一の真実とし、`@agent` と `@agent_st
 自己修復の機会がなく配達が固着する一方、実際にbusyなら直後のbusy hookが
 復元するためです。`@agent_state`を状態の真実として読み戻しません。
 
+登録の経路はbackendで異なります。tmuxはhookによるopt-in登録
+（`register`/`unregister`）で、herdrはdaemon側のpullです — health tickごとに
+snapshotを読み、agentの載っているpaneを冪等に登録します。herdrのpane一覧は
+agent列をnativeに持つため、hookを挟むよりdaemonが観測するほうが正確で、
+登録hookを持たないagent（grok CLI等）もそのままpeerになれます。pull側の規則:
+
+- 同じpaneのagent名が変わったら旧登録を即座に外して引き継ぐ（native identityに
+  猶予は不要。旧登録の残骸は誤配先になる）。
+- snapshotから消えたpaneは即evictせず**suspect**にする — 配送はqueueに留め、
+  当人からのRPCも拒否し、**2回連続の欠落で初めて**登録を外して未受領を回収する。
+  1回の欠落はherdrの検出ラグと区別できないため、その時点で配送やevictを行うと
+  実在する宛先を誤って失う。
+- snapshot取得に失敗した間は判定を進めない（不完全な証拠で消さない）。
+- herdr paneへの手動`unregister`は拒否する。pullが次tickで登録し直すため、
+  受理すると解除→再登録の振動になるだけで、意図した効果を持たない。
+- tmux側のstale pane掃除（reconcile）はtmux paneだけを見る。herdrのlifecycleは
+  pullが単独で所有し、二重の裁定者を作らない。
+
 配送入口は1つです。
 
 1. 依頼ヘッダと本文をID付きでjournalへ永続化します。

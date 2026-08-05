@@ -377,6 +377,29 @@ herdr が拒否を返すため、素の shell へ呼び鈴が入ることはあ�
 （2秒間隔の health tick）で同じ ID のまま自動再試行**されます。`queued` は
 「捨てられた」ではなく「idle を待って自動配送される」の意味です。
 
+### herdr の登録は pull（hook 不要）
+
+tmux の pane は agent 側の hook（SessionStart 等）が `register` を呼ぶ
+opt-in ですが、herdr の pane は **daemon が 2 秒間隔の health tick で herdr の
+snapshot を読み、agent の載っている pane を自動登録**します。grok CLI のように
+登録 hook を持たない agent も、herdr の pane で起動するだけで数秒以内に
+peer になります。
+
+- pane の agent 名が別の agent に変わったら、旧登録を即座に外して新しい名前で
+  引き継ぎます（herdr の agent 列は native な同一性情報のため、猶予は不要です）。
+- snapshot から消えた pane は、まず **suspect**（配送は queue に留め、当人からの
+  RPC も拒否）になり、**2 回連続で欠落したら登録を外して**未受領メッセージを
+  送信元へ回収します。1 tick の検出ラグでは消えません。
+- snapshot の取得自体に失敗している間は判定を一切進めません
+  （不完全な証拠で登録を消さないため）。
+- herdr 側 pane への `unregister` は拒否します — pull が次の tick で登録し直す
+  ため、手動解除は振動を生むだけで意味を持ちません。
+
+hook を持たない agent で MCP tool も使う場合、その agent が MCP server を
+環境変数を絞って spawn する実装なら、`HERDR_PANE_ID` / `HERDR_SOCKET_PATH` /
+`XDG_RUNTIME_DIR` の明示 forward が導入条件です — adapter は接続先を
+これらから導出します（Codex の `env_vars` 設定と同じ要領）。
+
 ### 既知の TODO
 
 - **tmux backend は移行のための一時的な足場**です。移行が完了したら削除します

@@ -112,6 +112,11 @@ impl Multiplexer {
         self.tmux.as_ref()
     }
 
+    #[cfg(test)]
+    pub(crate) fn herdr(&self) -> Option<&Herdr> {
+        self.herdr.as_ref()
+    }
+
     /// 両 backend の pane を連結して返す。
     ///
     /// **片方が落ちていても、もう片方の結果は返す**。移行期には
@@ -123,6 +128,20 @@ impl Multiplexer {
             bail!("すべての multiplexer から pane 一覧を取得できません");
         }
         Ok(panes)
+    }
+
+    /// herdr backend だけの pane snapshot。herdr が構成されていなければ `None`。
+    ///
+    /// herdr 登録の pull 化 (native identity からの継続登録・evict 判定) 用。
+    /// local UDS の poll だけで、tmux の subprocess は起動しない。
+    pub async fn herdr_snapshot(&self) -> Option<Result<Vec<PaneInfo>>> {
+        let herdr = self.herdr.as_ref()?;
+        Some(
+            herdr
+                .panes()
+                .await
+                .map(|panes| panes.into_iter().map(herdr_pane_info).collect()),
+        )
     }
 
     /// **全** backend が答えたときだけ pane 一覧を返す。

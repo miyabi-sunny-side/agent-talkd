@@ -105,6 +105,12 @@ pub struct Agent {
     pub name: String,
     pub state: AgentState,
     pub queue: BTreeSet<u64>,
+    /// herdr の native 検出が一時的に途切れた「疑い」状態 (memory のみ)。
+    /// suspect の間は配達 (直配・drain・催促) と message RPC caller を止め、
+    /// pane の新しい占有者への誤配・他人のメール読みを防ぐ。
+    /// 検出が同一 identity で戻れば解除、欠落が続けば evict される。
+    #[serde(skip)]
+    pub suspect: bool,
 }
 
 #[derive(Debug, Default)]
@@ -129,6 +135,7 @@ impl BrokerState {
                 name,
                 state: AgentState::Idle,
                 queue: BTreeSet::new(),
+                suspect: false,
             },
         );
     }
@@ -181,13 +188,15 @@ impl BrokerState {
         // queue が残っている間は Idle でも直接配達しない。直接配達を許すと、
         // 配達失敗で requeue された古い message を新規 message が追い越す
         // (FIFO の破れ)。queue の先頭は turn-end と health tick の再配達が流す。
-        let dispatch = if agent.state == AgentState::Busy || !agent.queue.is_empty() {
-            agent.queue.insert(id);
-            Dispatch::Queued(id)
-        } else {
-            agent.state = AgentState::Busy;
-            Dispatch::Deliver(id)
-        };
+        // suspect (herdr 検出の途切れ疑い) 中も直配せず queue で待たせる。
+        let dispatch =
+            if agent.state == AgentState::Busy || !agent.queue.is_empty() || agent.suspect {
+                agent.queue.insert(id);
+                Dispatch::Queued(id)
+            } else {
+                agent.state = AgentState::Busy;
+                Dispatch::Deliver(id)
+            };
         self.messages.insert(
             id,
             StoredMessage {
@@ -333,6 +342,7 @@ impl BrokerState {
             name,
             state,
             queue: BTreeSet::new(),
+            suspect: false,
         });
     }
 

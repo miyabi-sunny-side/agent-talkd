@@ -86,11 +86,28 @@ pub struct HerdrPane {
 #[derive(Clone)]
 pub struct Herdr {
     socket: PathBuf,
+    /// test 専用の代役。`Some` のとき socket を一切使わず、この一覧を返す。
+    /// clone 間で共有されるので、テストが tick の合間に中身を差し替えられる。
+    #[cfg(test)]
+    pub(crate) scripted: Option<std::sync::Arc<std::sync::Mutex<Vec<HerdrPane>>>>,
 }
 
 impl Herdr {
     pub fn new(socket: PathBuf) -> Self {
-        Self { socket }
+        Self {
+            socket,
+            #[cfg(test)]
+            scripted: None,
+        }
+    }
+
+    /// herdr を起動せずに固定の pane 一覧を返す代役 (test 専用)。
+    #[cfg(test)]
+    pub fn scripted(panes: Vec<HerdrPane>) -> Self {
+        Self {
+            socket: PathBuf::new(),
+            scripted: Some(std::sync::Arc::new(std::sync::Mutex::new(panes))),
+        }
     }
 
     /// protocol 番号を返す。daemon の health check に使う。
@@ -103,6 +120,10 @@ impl Herdr {
     }
 
     pub async fn panes(&self) -> Result<Vec<HerdrPane>> {
+        #[cfg(test)]
+        if let Some(scripted) = &self.scripted {
+            return Ok(scripted.lock().unwrap().clone());
+        }
         let result = self.call("pane.list", json!({})).await?;
         let panes = result
             .get("panes")
