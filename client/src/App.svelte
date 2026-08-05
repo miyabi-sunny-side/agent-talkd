@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount, tick } from "svelte";
   import { fetchAgents, type Agent } from "./api";
+  import AgentLetterComposer from "./AgentLetterComposer.svelte";
   import LettersPanel from "./LettersPanel.svelte";
   import ScreenPanel from "./ScreenPanel.svelte";
 
@@ -59,31 +60,34 @@
 
 <svelte:head><title>agent talk · observer</title></svelte:head>
 
-<main class:detail-view={view !== "registry"}>
-  <header class="masthead">
-    <button
-      class="wordmark"
-      type="button"
-      onclick={backToRegistry}
-      aria-label="agent registry を表示"
-    >
-      <span class="eyebrow">HERDR / LOCAL BROKER</span>
-      <span class="title">agent <i>talk</i></span>
-    </button>
-    <nav aria-label="表示切り替え">
+<main class:detail-view={view === "screen"}>
+  {#if view !== "screen"}
+    <!-- ブランド masthead は一覧系の画面だけ。詳細では terminal を主役にする。 -->
+    <header class="masthead">
       <button
-        class:active={view === "registry"}
+        class="wordmark"
         type="button"
-        onclick={backToRegistry}>Agents</button
+        onclick={backToRegistry}
+        aria-label="agent registry を表示"
       >
-      <button
-        class:active={view === "letters"}
-        type="button"
-        onclick={() => (view = "letters")}>Letters</button
-      >
-    </nav>
-    <div class="seal" aria-hidden="true">話</div>
-  </header>
+        <span class="eyebrow">HERDR / LOCAL BROKER</span>
+        <span class="title">agent <i>talk</i></span>
+      </button>
+      <nav aria-label="表示切り替え">
+        <button
+          class:active={view === "registry"}
+          type="button"
+          onclick={backToRegistry}>Agents</button
+        >
+        <button
+          class:active={view === "letters"}
+          type="button"
+          onclick={() => (view = "letters")}>Letters</button
+        >
+      </nav>
+      <div class="seal" aria-hidden="true">話</div>
+    </header>
+  {/if}
 
   {#if view === "registry"}
     <section class="registry" aria-labelledby="registry-heading">
@@ -162,9 +166,27 @@
       {/if}
     </section>
   {:else if view === "screen" && selectedAgent}
-    <button class="back-button" type="button" onclick={backToRegistry}
-      >← agent 一覧へ</button
-    >
+    <header class="detail-bar">
+      <button
+        class="back-icon"
+        type="button"
+        onclick={backToRegistry}
+        aria-label="agent 一覧へ戻る"
+      >
+        <svg viewBox="0 0 24 24" aria-hidden="true"
+          ><path d="m15 18-6-6 6-6" /></svg
+        >
+      </button>
+      <div class="detail-identity">
+        <strong>{selectedAgent.name}</strong>
+        <span>{selectedAgent.session} · {selectedAgent.pane_id}</span>
+      </div>
+      <span
+        class:idle={selectedAgent.state === "idle"}
+        class:busy={selectedAgent.state === "busy"}
+        class="status"><i aria-hidden="true"></i>{selectedAgent.state}</span
+      >
+    </header>
     {#if siblings.length > 1}
       <nav class="sibling-switcher" aria-label="同一 session の agent 切り替え">
         <span class="switcher-scope">{selectedAgent.session}</span>
@@ -182,7 +204,10 @@
         {/each}
       </nav>
     {/if}
-    {#key selectedAgent.pane_id}<ScreenPanel agent={selectedAgent} />{/key}
+    {#key selectedAgent.pane_id}
+      <ScreenPanel agent={selectedAgent} />
+      <AgentLetterComposer agent={selectedAgent} />
+    {/key}
   {:else}
     <button class="back-button" type="button" onclick={backToRegistry}
       >← agent 一覧へ</button
@@ -190,7 +215,9 @@
     <LettersPanel />
   {/if}
 
-  <footer class="site-footer">
-    <span>OBSERVE + LETTERS</span><span>herdr</span>
-  </footer>
+  {#if view !== "screen"}
+    <footer class="site-footer">
+      <span>OBSERVE + LETTERS</span><span>herdr</span>
+    </footer>
+  {/if}
 </main>

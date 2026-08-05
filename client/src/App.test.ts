@@ -69,6 +69,15 @@ it("opens a screen from the keyboard and restores focus when returning", async (
   row.focus();
   await fireEvent.keyDown(row, { key: "Enter" });
   expect(await screen.findByText("terminal output")).toBeTruthy();
+  // 詳細ではブランド masthead を出さず、compact な detail bar に集約する
+  // (スマホでヘッダーが画面の半分を占める問題の回帰防止)。
+  expect(screen.queryByText("HERDR / LOCAL BROKER")).toBeNull();
+  expect(screen.queryByRole("navigation", { name: "表示切り替え" })).toBeNull();
+  expect(screen.getByText("work · w1:p4")).toBeTruthy();
+  // この agent へ手紙を出す導線が詳細画面にある。
+  expect(
+    screen.getByRole("button", { name: /codex に手紙を出す/ }),
+  ).toBeTruthy();
   await fireEvent.click(screen.getByRole("button", { name: /agent 一覧へ/ }));
   expect(document.activeElement).toBe(
     screen.getByRole("button", { name: "codex の Screen を表示" }),

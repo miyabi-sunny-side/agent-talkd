@@ -57,24 +57,18 @@
 
 <section
   class="screen-panel"
-  aria-labelledby="screen-heading"
+  aria-label={`${agent.name} screen`}
   aria-busy={phase === "loading"}
 >
-  <header class="panel-heading">
-    <div>
-      <span class="section-number">二</span>
-      <div>
-        <h2 id="screen-heading">Screen</h2>
-        <p>{agent.name} · {agent.location}</p>
-      </div>
-    </div>
+  <!-- 詳細画面は terminal が主役。見出しは detail-bar が担い、ここは
+       更新状態の 1 行だけに抑える。 -->
+  <div class="screen-toolbar">
+    <span class="screen-status" aria-live="polite" aria-atomic="true">
+      {#if phase === "loading"}画面を取得中{:else if phase === "error"}画面を取得できませんでした{:else}2秒ごとに更新{/if}
+    </span>
     <button type="button" class="quiet-button" onclick={() => refresh(false)}
       >更新</button
     >
-  </header>
-
-  <div class="screen-status" aria-live="polite" aria-atomic="true">
-    {#if phase === "loading"}画面を取得中{:else if phase === "error"}画面を取得できませんでした{:else}2秒ごとに更新{/if}
   </div>
 
   {#if phase === "error" && terminal === ""}

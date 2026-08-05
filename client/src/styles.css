@@ -86,6 +86,8 @@ nav,
 .back-button,
 .letter-meta,
 .letter-list footer,
+.detail-identity span,
+.composer-source,
 select {
   font-family: "SFMono-Regular", Consolas, monospace;
 }
@@ -672,4 +674,161 @@ output.failed,
 
 .letter-compose .compose-status.failed {
   color: #e08585;
+}
+
+/* --- agent 詳細 (detail view): terminal を主役にする低い chrome --- */
+main.detail-view {
+  padding-top: max(10px, env(safe-area-inset-top));
+  /* 下端の composer dock に terminal の最終行を隠させない */
+  padding-bottom: calc(84px + env(safe-area-inset-bottom));
+}
+.detail-bar {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--line);
+}
+.back-icon {
+  display: grid;
+  width: 36px;
+  height: 36px;
+  place-items: center;
+  padding: 0;
+  border: 1px solid var(--line);
+  color: var(--paper);
+  background: none;
+  cursor: pointer;
+}
+.back-icon svg {
+  width: 18px;
+  height: 18px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.back-icon:hover {
+  border-color: var(--kaki);
+  color: var(--kaki);
+}
+.detail-identity {
+  display: grid;
+  min-width: 0;
+  line-height: 1.25;
+}
+.detail-identity strong {
+  font-size: 16px;
+  font-weight: 600;
+}
+.detail-identity span {
+  overflow: hidden;
+  color: var(--paper-muted);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.detail-view .sibling-switcher {
+  flex-wrap: nowrap;
+  margin: 10px 0 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.detail-view .screen-panel {
+  padding-top: 8px;
+}
+.screen-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 6px 0;
+}
+.screen-toolbar .screen-status {
+  padding: 0;
+}
+
+/* --- この agent へ手紙を出す (launcher → bottom sheet) --- */
+.composer-dock {
+  position: fixed;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  display: flex;
+  justify-content: center;
+  padding: 10px clamp(16px, 5vw, 56px) calc(12px + env(safe-area-inset-bottom));
+  background: linear-gradient(transparent, var(--ink) 55%);
+  pointer-events: none;
+}
+.composer-launcher {
+  display: inline-flex;
+  gap: 8px;
+  align-items: center;
+  width: min(560px, 100%);
+  justify-content: center;
+  padding: 11px 18px;
+  border: 1px solid var(--kaki);
+  color: var(--paper);
+  background: var(--ink-raised);
+  font-size: 13px;
+  cursor: pointer;
+  pointer-events: auto;
+}
+.composer-launcher:hover {
+  background: var(--kaki);
+  color: var(--ink);
+}
+.composer-sheet {
+  position: fixed;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  z-index: 5;
+  max-height: min(70dvh, 420px);
+  overflow-y: auto;
+  border-top: 1px solid var(--kaki);
+  background: var(--ink-raised);
+  box-shadow: 0 -18px 40px rgba(0, 0, 0, 0.45);
+}
+.composer-form {
+  width: min(1020px, 100%);
+  margin: 0 auto;
+  padding: 14px clamp(16px, 5vw, 56px) calc(16px + env(safe-area-inset-bottom));
+}
+.composer-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+.composer-head strong {
+  font-size: 14px;
+  font-weight: 600;
+}
+.composer-source {
+  flex: 1;
+  color: var(--paper-muted);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+}
+.composer-blocked {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  margin: 0;
+  color: var(--danger);
+  font-size: 12px;
+}
+.draft-badge {
+  padding: 2px 7px;
+  border: 1px solid var(--ochre);
+  color: var(--ochre);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+}
+.composer-form textarea {
+  width: 100%;
 }
