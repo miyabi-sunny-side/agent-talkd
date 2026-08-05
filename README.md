@@ -146,17 +146,20 @@ CLI から送る経路を閉じないためです。
 3. 作業する。返信が必要なら `send_message` で普通に送り返す。返信専用の tool は
    ありません。
 
-接続先の socket は spawn 時の `HERDR_SOCKET_PATH` と `XDG_RUNTIME_DIR`
-（無ければ `HOME`）からデーモンと同じ規則で導出します。tool 引数や
-`AGENT_TALK_RPC_SOCKET` からは受け取らず、subprocess も起動しません。
-`HERDR_SOCKET_PATH` は絶対 path、`HERDR_PANE_ID` は `w1:p2` 形式
-(segment は数字と大文字英字) です。どちらかが欠けているか書式が不正なら、
-tool を1つも公開せずに終了します。
+接続先の socket は `XDG_RUNTIME_DIR`（無ければ `HOME`）から導出します。
+`HERDR_SOCKET_PATH` があればデーモンと同じ規則でその herdr 用の path を、
+無ければ既定 session の固定 path (`agent-talkd/herdr.sock`) を使います。
+tool 引数や `AGENT_TALK_RPC_SOCKET` からは受け取らず、subprocess も
+起動しません。
 
-```console
-$ agent-talk-mcp
-agent-talk-mcp: HERDR_SOCKET_PATH が設定されていません
-```
+**環境変数の forward は不要です。** `HERDR_PANE_ID` があれば呼び出し元
+pane として自己申告し、無ければ daemon が接続の peer PID から /proc の
+祖先を遡り、herdr が agent 本体へ与えた `HERDR_PANE_ID` /
+`HERDR_SOCKET_PATH` を読んで呼び出し元 pane を確立します (Linux)。
+launcher が env を clear する agent (grok 等) も設定なしで使えます。
+祖先に identity が見つからない・別の herdr session に属する場合は
+fail closed で、`HERDR_PANE_ID` の明示 forward を案内します。named
+session の herdr を使う場合だけ `HERDR_SOCKET_PATH` の forward が必要です。
 
 未受領のIDは CLI の `who` でも両方向を確認できます。
 
@@ -337,8 +340,10 @@ herdr の pane の中に居る場合（`HERDR_PANE_ID` / `HERDR_SOCKET_PATH` が
 自動的に herdr socket を発見します。**socket file が存在するだけでは
 有効になりません** — 停止済み・無関係な herdr を掴まないためです。
 
-pane id は `w1:p2` 形式で、segment には数字と大文字英字が現れます
-(実測: `wX:p4`, `w1:pA`)。宛先に pane id を直接指定できます。
+pane id は herdr が発行する **opaque な文字列**で、agent-talkd は文法を
+検証しません (採番規則の推測が実採番より狭くて全停止した事故の再発防止)。
+宛先文字列が registry の pane id に完全一致すれば pane 直指定、しなければ
+名前/scope として解決します。
 
 herdr の workspace には人間向けの **label** があり (`workspace.list`)、
 表示 (`who` の location、`:5002` UI) と宛先解決の両方に使います。
@@ -376,10 +381,10 @@ peer になります。
 - herdr 側 pane への `unregister` は拒否します — pull が次の tick で登録し直す
   ため、手動解除は振動を生むだけで意味を持ちません。
 
-hook を持たない agent で MCP tool も使う場合、その agent が MCP server を
-環境変数を絞って spawn する実装なら、`HERDR_PANE_ID` / `HERDR_SOCKET_PATH` /
-`XDG_RUNTIME_DIR` の明示 forward が導入条件です — adapter は接続先を
-これらから導出します（Codex の `env_vars` 設定と同じ要領）。
+hook を持たない agent の MCP tool 利用にも env forward は不要です —
+identity は daemon が接続の peer PID から確立します (上の「MCP server」参照)。
+`XDG_RUNTIME_DIR` が非標準な環境と named session だけが明示 forward を
+必要とします。
 
 ### 既知の TODO
 

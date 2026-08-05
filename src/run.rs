@@ -57,6 +57,7 @@ async fn request(config: &Config, command: &str, args: Vec<String>) -> Option<Re
             stdin: String::new(),
             pane: crate::backend::self_pane(),
             send_options: None,
+            peer_pid: None,
         },
     )
     .await

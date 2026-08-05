@@ -30,6 +30,7 @@ pub async fn run(config: Config, mut command: String, args: Vec<String>) -> Resu
         stdin,
         pane: crate::backend::self_pane(),
         send_options,
+        peer_pid: None,
     };
     let response = lifecycle::request(&config, &request).await?;
     Ok(print_response(&response))

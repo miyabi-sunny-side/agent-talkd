@@ -286,10 +286,8 @@ impl BrokerState {
     /// (新しい住人へ誤配送しないため)。
     pub fn reply_target(&self, message: &Message) -> Option<String> {
         let captured = message.sender_name.as_deref()?;
-        // 送信者が pane (agent) のときだけ返信先になる。human / system は宛先にならない。
-        if !crate::pane_id::is_pane_id(&message.sender) {
-            return None;
-        }
+        // 送信者が登録中の pane のときだけ返信先になる。`human` / `system` は
+        // registry の key (herdr 発行の pane id) には現れないので自然に None になる。
         let agent = self.agents.get(&message.sender)?;
         (agent.name == captured).then(|| message.sender.clone())
     }

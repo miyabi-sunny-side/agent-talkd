@@ -35,7 +35,6 @@ use crate::{
     help,
     herdr::Herdr,
     journal::{Journal, Record},
-    pane_id::is_pane_id,
     protocol::{Request, Response, SendOptions},
     state::{
         AgentState, BrokerState, Dispatch, ExternalMailboxEvent, MailboxDirection, Message, Origin,
@@ -317,6 +316,7 @@ pub async fn run(config: Config) -> Result<()> {
         journal,
         backend: backend.clone(),
         config,
+        pane_resolver: crate::procid::resolve_from_peer,
         herdr_misses: std::collections::HashMap::new(),
     };
     broker.startup().await?;
@@ -765,9 +765,10 @@ fn classify_http(method: &Method, path: &str) -> HttpRoute {
                 .strip_prefix("/api/agents/")
                 .and_then(|rest| rest.strip_suffix("/screen"))
                 .unwrap_or_default();
+            // pane id は opaque — 文法検査せず、登録の有無は Screen handler が
+            // registry で判定する (未登録は 404)。
             match decode_path_segment(encoded) {
-                Some(pane) if valid_pane_id(&pane) => HttpRoute::Screen(pane),
-                Some(_) => HttpRoute::NotFound,
+                Some(pane) => HttpRoute::Screen(pane),
                 None => HttpRoute::BadRequest,
             }
         }
@@ -805,7 +806,10 @@ fn decode_path_segment(encoded: &str) -> Option<String> {
             index += 1;
         }
     }
-    if decoded.contains(&b'/') || decoded.contains(&0) {
+    // decode 後の `/` は許す — pane id は opaque で `/` を含みうる。route の
+    // 構造は decode 前の raw path で既に確定しており、%2F は data にすぎない。
+    // NUL だけは常に拒否する。
+    if decoded.contains(&0) {
         return None;
     }
     String::from_utf8(decoded).ok()
@@ -828,10 +832,6 @@ fn usable_agent_name(name: &str) -> bool {
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-}
-
-fn valid_pane_id(pane: &str) -> bool {
-    is_pane_id(pane)
 }
 
 fn parse_mailbox_query(
@@ -950,10 +950,17 @@ fn response(
 }
 
 async fn serve_client(stream: UnixStream, tx: mpsc::Sender<Event>) -> Result<()> {
+    // 呼び出し元 process の PID を接続から採取する。pane 申告の無い MCP RPC は
+    // この PID の祖先から identity を解決する (env forward 不要化)。
+    let peer_pid = stream
+        .peer_cred()
+        .ok()
+        .and_then(|credentials| credentials.pid());
     let (reader, mut writer) = stream.into_split();
     let mut line = String::new();
     BufReader::new(reader).read_line(&mut line).await?;
-    let request: Request = serde_json::from_str(&line)?;
+    let mut request: Request = serde_json::from_str(&line)?;
+    request.peer_pid = peer_pid;
     let (reply_tx, reply_rx) = oneshot::channel();
     let (flushed_tx, flushed_rx) = oneshot::channel();
     tx.send(Event::Request {
@@ -977,6 +984,8 @@ struct Broker {
     journal: Journal,
     backend: Backend,
     config: Config,
+    /// peer PID → pane identity の解決関数。test では表引きに差し替える。
+    pane_resolver: fn(i32, &Path) -> std::result::Result<String, String>,
     /// herdr pull 同期の欠落 counter (pane → 連続欠落回数、memory のみ)。
     /// 成功 snapshot で識別が確認できるたびに 0 へ戻る。
     herdr_misses: std::collections::HashMap<String, u8>,
@@ -1054,6 +1063,7 @@ impl Broker {
                 skill: None,
                 no_reply: false,
             }),
+            peer_pid: None,
         };
         let response = self
             .send(request, SendReport::Json)
@@ -1119,6 +1129,10 @@ impl Broker {
     }
 
     async fn handle(&mut self, request: Request) -> Response {
+        let request = match self.attach_caller_pane(request) {
+            Ok(request) => request,
+            Err(response) => return response,
+        };
         let result = match canonical_command(&request.command) {
             "register" => self.register(request).await,
             "unregister" => Ok(Self::unregister(&request)),
@@ -1184,6 +1198,33 @@ impl Broker {
                 error!(%error, "request failed");
                 Response::error(error.to_string())
             }
+        }
+    }
+
+    /// pane 申告の無い MCP RPC に、接続の peer PID から解決した呼び出し元 pane を
+    /// 付与する (env forward 不要化)。対象は agent 経路の 4 RPC だけ — 外部 caller
+    /// 用の command (`mailbox-list` 等) は pane 無しのまま扱う。
+    /// 解決の失敗は fail closed で、明示 forward という逃げ道を案内する。
+    fn attach_caller_pane(&self, mut request: Request) -> std::result::Result<Request, Response> {
+        let is_agent_rpc = matches!(
+            canonical_command(&request.command),
+            "send-message" | "read-message" | "ack-message" | "list-peers"
+        );
+        if !is_agent_rpc || request.pane.is_some() {
+            return Ok(request);
+        }
+        let Some(pid) = request.peer_pid else {
+            // peer PID が取れない接続は従来どおり未登録扱いへ落ちる。
+            return Ok(request);
+        };
+        match (self.pane_resolver)(pid, &self.config.herdr_socket) {
+            Ok(pane) => {
+                request.pane = Some(pane);
+                Ok(request)
+            }
+            Err(reason) => Err(Response::error(format!(
+                "呼び出し元の pane を特定できません: {reason} (HERDR_SOCKET_PATH と HERDR_PANE_ID を forward すれば明示できます)"
+            ))),
         }
     }
 
@@ -2113,14 +2154,11 @@ impl Broker {
                 "herdr に接続できません (sandbox 内なら承認付きで再実行): {error}"
             ))
         })?;
-        // pane id の直接指定 (`w1:p2`)。
-        if is_pane_id(addr) {
-            return self
-                .state
-                .agents
-                .get(addr)
-                .map(|agent| (addr.to_owned(), agent.name.clone()))
-                .ok_or_else(|| Response::error(format!("pane {addr} は登録されていません")));
+        // pane id の直接指定。id は herdr 発行の opaque 文字列なので文法では
+        // 判定せず、**registry に完全一致すれば pane 直指定**として最優先で解決する。
+        // 一致しない文字列は名前/scope として解釈へ落ちる。
+        if let Some(agent) = self.state.agents.get(addr) {
+            return Ok((addr.to_owned(), agent.name.clone()));
         }
         // `herdr/<scope>/<name>` は tmux 併存期の正式名称の互換 alias。
         let rest = match addr.split_once('/') {
@@ -2254,14 +2292,13 @@ impl Broker {
                 .agents
                 .get(&sender)
                 .is_some_and(|agent| agent.suspect);
-            let sender_target = is_pane_id(&sender)
-                .then(|| {
-                    self.state
-                        .agents
-                        .get(&sender)
-                        .map(|agent| agent.name.clone())
-                })
-                .flatten()
+            // `human` / `system` は registry の key に現れないので、
+            // 登録の有無だけで pane 送信者かどうかが決まる。
+            let sender_target = self
+                .state
+                .agents
+                .get(&sender)
+                .map(|agent| agent.name.clone())
                 .filter(|expected| {
                     // 生存判定は native identity の一致まで要求する
                     // (`pane_backs_registration`) — 占有者が入れ替わった pane へ
@@ -2757,6 +2794,7 @@ mod tests {
             state,
             journal,
             herdr_misses: std::collections::HashMap::new(),
+            pane_resolver: |_, _| Err("tests は pane_resolver を明示注入する".to_owned()),
             backend: Backend::scripted(panes),
             config: Config {
                 herdr_socket: PathBuf::new(),
@@ -2781,6 +2819,7 @@ mod tests {
             stdin: String::new(),
             pane: pane.map(str::to_owned),
             send_options: None,
+            peer_pid: None,
         }
     }
 
@@ -2798,6 +2837,7 @@ mod tests {
                 state,
                 journal,
                 herdr_misses: std::collections::HashMap::new(),
+                pane_resolver: |_, _| Err("tests は pane_resolver を明示注入する".to_owned()),
                 backend: Backend::scripted(vec![
                     pane_info("w1:p1", Some("codex")),
                     pane_info("w1:p2", Some("claude")),
@@ -2858,6 +2898,74 @@ mod tests {
         adopt_legacy_journal(&empty.path().join("herdr.journal")).unwrap();
     }
 
+    /// pane 申告の無い MCP RPC は、接続の peer PID から呼び出し元 pane を
+    /// daemon 側で解決する (env forward 不要化)。
+    #[tokio::test]
+    async fn a_missing_pane_claim_is_resolved_from_the_peer_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut broker = registered_pair(&dir).await;
+
+        broker.pane_resolver = |pid, _| {
+            assert_eq!(pid, 4242, "接続から採取した peer PID で解決する");
+            Ok("w1:p1".to_owned())
+        };
+        let mut peers = request("list-peers", None, &[]);
+        peers.peer_pid = Some(4242);
+        let response = broker.handle(peers).await;
+        assert_eq!(response.code, 0, "{}", response.stderr);
+        assert_eq!(json(&response)["self"], "w1:p1");
+
+        // 解決の失敗は fail closed で、明示 forward の逃げ道を案内する。
+        broker.pane_resolver = |_, _| Err("祖先に identity が見つかりません".to_owned());
+        let mut denied = request("list-peers", None, &[]);
+        denied.peer_pid = Some(4242);
+        let response = broker.handle(denied).await;
+        assert_eq!(response.code, 1, "{response:?}");
+        assert!(
+            response.stderr.contains("HERDR_PANE_ID"),
+            "{}",
+            response.stderr
+        );
+
+        // 外部 caller 用 command は pane 無しのまま扱い、resolver を呼ばない。
+        broker.pane_resolver = |_, _| panic!("外部 caller 経路で resolver を呼んではならない");
+        broker.config.allowed_sources.insert("mobile".into());
+        let mut mailbox = request("mailbox-list", None, &["mobile"]);
+        mailbox.peer_pid = Some(4242);
+        let response = broker.handle(mailbox).await;
+        assert_eq!(response.code, 0, "{}", response.stderr);
+    }
+
+    /// herdr 発行の id は opaque な文字列 — 文法検証はせず、registry への
+    /// 完全一致だけが pane 直指定になる (65c83bb の全停止事故の再発防止)。
+    #[tokio::test]
+    async fn herdr_issued_ids_are_opaque_and_resolve_by_exact_registry_match() {
+        let dir = tempfile::tempdir().unwrap();
+        // 将来の採番を模した、旧文法に一切載らない id。
+        let weird = "pane/α:next?";
+        let mut broker = broker(
+            &dir,
+            vec![
+                pane_info(weird, Some("codex")),
+                pane_info("w1:p2", Some("claude")),
+            ],
+        );
+        broker.sync_herdr_registry().await;
+        assert!(broker.state.agents.contains_key(weird), "登録に載る");
+
+        // registry 完全一致は pane 直指定として解決する。
+        let resolved = broker.resolve(weird, Some("w1:p2")).await.unwrap();
+        assert_eq!(resolved.1, "codex");
+        // registry に無い文字列は名前として解釈され、daemon は落ちずに不在エラー。
+        let error = broker.resolve("w9:p9", Some("w1:p2")).await.unwrap_err();
+        assert!(error.stderr.contains("見つかりません"), "{}", error.stderr);
+
+        // 配達も opaque id のまま herdr へ渡って成立する。
+        let sent = json(&broker.handle(send_request("w1:p2", weird, "hello")).await);
+        assert_eq!(sent["path"], "sent");
+        assert_eq!(sent["to"], weird);
+    }
+
     /// register は herdr の native identity と一致する名前しか受理しない。
     #[tokio::test]
     async fn register_refuses_a_name_that_contradicts_the_native_identity() {
@@ -2905,6 +3013,7 @@ mod tests {
             stdin: body.to_owned(),
             pane: Some(pane.to_owned()),
             send_options: Some(SendOptions::default()),
+            peer_pid: None,
         }
     }
 
@@ -4154,14 +4263,20 @@ mod tests {
     fn http_routes_are_read_only_and_api_misses_do_not_fall_back() {
         assert_eq!(classify_http(&Method::GET, "/api/hello"), HttpRoute::Hello);
         assert_eq!(classify_http(&Method::GET, "/api/who"), HttpRoute::Who);
-        // 撤去済みの tmux 形式 (`%N`) は screen route に載らない。
+        // pane id は opaque — route は形式で落とさず、登録の有無は handler が
+        // registry で判定する (未登録なら 404)。
         assert_eq!(
             classify_http(&Method::GET, "/api/agents/%251/screen"),
-            HttpRoute::NotFound
+            HttpRoute::Screen("%1".into())
         );
         assert_eq!(
             classify_http(&Method::GET, "/api/agents/w2%3Ap4/screen"),
             HttpRoute::Screen("w2:p4".into())
+        );
+        // `/` を含む opaque な id も percent encode で screen route に載る。
+        assert_eq!(
+            classify_http(&Method::GET, "/api/agents/pane%2F%CE%B1%3Anext%3F/screen"),
+            HttpRoute::Screen("pane/α:next?".into())
         );
         assert_eq!(
             classify_http(&Method::GET, "/api/mailboxes"),
@@ -4202,15 +4317,17 @@ mod tests {
             "/api/agents/screen",
             "/api/agents/%1/screen",
             "/api/agents//screen",
-            "/api/mailbox/bad%2Fname",
         ] {
             assert_eq!(classify_http(&Method::GET, path), HttpRoute::BadRequest);
         }
-        for path in [
-            "/api/agents/%252F/screen",
-            "/api/agents/%250x/screen",
-            "/api/mailbox/Bad",
-        ] {
+        // decode に成功した opaque な pane 文字列は Screen へ通り、未登録なら
+        // handler が 404 を返す。mailbox は従来どおり token 検査で NotFound
+        // (decode 後の `/` も token 検査が拒否する)。
+        assert_eq!(
+            classify_http(&Method::GET, "/api/agents/%252F/screen"),
+            HttpRoute::Screen("%2F".into())
+        );
+        for path in ["/api/mailbox/Bad", "/api/mailbox/bad%2Fname"] {
             assert_eq!(classify_http(&Method::GET, path), HttpRoute::NotFound);
         }
     }
@@ -4219,9 +4336,11 @@ mod tests {
     fn strict_percent_decoder_rejects_malformed_and_unsafe_segments() {
         assert_eq!(decode_path_segment("%251"), Some("%1".into()));
         assert_eq!(decode_path_segment("mobile"), Some("mobile".into()));
+        // decode 後の `/` は opaque な pane id の data として通す
+        // (route 構造は raw path 側で確定済み)。raw の `/` と NUL は拒否。
+        assert_eq!(decode_path_segment("%2F"), Some("/".into()));
         assert_eq!(decode_path_segment("%"), None);
         assert_eq!(decode_path_segment("%GG"), None);
-        assert_eq!(decode_path_segment("%2F"), None);
         assert_eq!(decode_path_segment("%00"), None);
         assert_eq!(decode_path_segment("a/b"), None);
     }

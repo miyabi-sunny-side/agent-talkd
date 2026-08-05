@@ -257,57 +257,25 @@ fn unexpected_arguments_are_rejected_before_the_server_starts() {
 }
 
 #[test]
-fn missing_or_malformed_startup_inputs_fail_closed_without_serving_tools() {
+fn only_a_broken_runtime_root_or_socket_path_fails_closed() {
     let root = tempfile::tempdir().unwrap();
     let runtime = root.path().join("run");
     let runtime = runtime.to_str().unwrap();
+    // HERDR_* は無くてよい (接続先は既定 path、identity は daemon 側で解決)。
+    // 起動を拒むのは「設定されているのに壊れている」入力だけ。
     let cases: Vec<Vec<(&str, &str)>> = vec![
-        // HERDR_SOCKET_PATH 未 forward
-        vec![("HERDR_PANE_ID", "w1:p1"), ("XDG_RUNTIME_DIR", runtime)],
-        // HERDR_PANE_ID 未 forward
-        vec![
-            ("HERDR_SOCKET_PATH", "/run/herdr/herdr.sock"),
-            ("XDG_RUNTIME_DIR", runtime),
-        ],
-        // HERDR_SOCKET_PATH が空 / 書式違反 (相対 path)
-        vec![
-            ("HERDR_SOCKET_PATH", ""),
-            ("HERDR_PANE_ID", "w1:p1"),
-            ("XDG_RUNTIME_DIR", runtime),
-        ],
+        // HERDR_SOCKET_PATH が書式違反 (相対 path)
         vec![
             ("HERDR_SOCKET_PATH", "relative/herdr.sock"),
-            ("HERDR_PANE_ID", "w1:p1"),
-            ("XDG_RUNTIME_DIR", runtime),
-        ],
-        // HERDR_PANE_ID が空 / 書式違反 (撤去済み tmux 形式を含む)
-        vec![
-            ("HERDR_SOCKET_PATH", "/run/herdr/herdr.sock"),
-            ("HERDR_PANE_ID", ""),
-            ("XDG_RUNTIME_DIR", runtime),
-        ],
-        vec![
-            ("HERDR_SOCKET_PATH", "/run/herdr/herdr.sock"),
-            ("HERDR_PANE_ID", "%1"),
-            ("XDG_RUNTIME_DIR", runtime),
-        ],
-        vec![
-            ("HERDR_SOCKET_PATH", "/run/herdr/herdr.sock"),
-            ("HERDR_PANE_ID", "pane-1"),
             ("XDG_RUNTIME_DIR", runtime),
         ],
         // XDG_RUNTIME_DIR が不正 (相対 path) — HOME があっても fallback しない
         vec![
-            ("HERDR_SOCKET_PATH", "/run/herdr/herdr.sock"),
-            ("HERDR_PANE_ID", "w1:p1"),
             ("XDG_RUNTIME_DIR", "relative/run"),
             ("HOME", "/home/tester"),
         ],
         // XDG_RUNTIME_DIR も HOME も無い
-        vec![
-            ("HERDR_SOCKET_PATH", "/run/herdr/herdr.sock"),
-            ("HERDR_PANE_ID", "w1:p1"),
-        ],
+        vec![("HERDR_SOCKET_PATH", "/run/herdr/herdr.sock")],
     ];
     for case in cases {
         let output = mcp(&case)
@@ -328,6 +296,16 @@ fn missing_or_malformed_startup_inputs_fail_closed_without_serving_tools() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+
+    // HERDR_* が一切無くても起動し、tool を公開する (env forward 不要)。
+    let output = mcp(&[("XDG_RUNTIME_DIR", runtime)])
+        .stdin(Stdio::null())
+        .output()
+        .expect("mcp should start");
+    assert!(
+        output.status.success(),
+        "HERDR_* 無しでも fail closed してはならない: {output:?}"
+    );
 }
 
 #[test]
@@ -592,4 +570,33 @@ fn the_mcp_sources_carry_no_subprocess_tcp_or_filesystem_capability() {
             );
         }
     }
+}
+
+/// 片欠け env (`HERDR_PANE_ID` のみ) では pane を自己申告しない。
+///
+/// pane id は herdr session 間で衝突しうるため、socket で帰属を示せない申告は
+/// 既定 session の同名 pane へ誤 bind しうる — adapter は既定 socket へ接続し、
+/// identity は daemon の peer PID 解決 (socket 一致まで検証) に委ねる。
+#[test]
+fn a_pane_id_without_its_socket_is_never_self_reported() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = root.path().join("run");
+    let requests = fake_daemon(&derived_socket(&runtime));
+
+    let mut session = Session::start(&[
+        ("HERDR_PANE_ID", "w9:p9"),
+        ("XDG_RUNTIME_DIR", runtime.to_str().unwrap()),
+    ]);
+    let peers = session.call(&json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "list_peers", "arguments": {}}
+    }));
+    assert_eq!(peers["result"]["isError"], false, "{peers}");
+    let request = requests.recv().unwrap();
+    assert_eq!(request["command"], "list-peers");
+    assert_eq!(
+        request["pane"],
+        Value::Null,
+        "socket 無しの HERDR_PANE_ID を申告してはならない: {request}"
+    );
 }

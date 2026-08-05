@@ -55,9 +55,10 @@ routeは次の順で分類します。
 
 1. GET以外は、`POST /api/letters` を唯一の例外として `Allow` 付きのJSON 405にする。
 2. `GET /api/hello`は製品名とversion、`GET /api/who`はregistry snapshotをJSONで返す。
-3. `GET /api/agents/<pane>/screen`はstrictにdecode・検証した登録paneだけを
-   herdrの`pane.read`へ渡し、現在の表示範囲をJSON内のplain-text文字列で返す。
-   pane形式と登録確認はherdr APIより先に行う。
+3. `GET /api/agents/<pane>/screen`はstrictにpercent decodeしたsegmentを
+   opaqueなpane idとして扱い、登録paneだけをherdrの`pane.read`へ渡して
+   現在の表示範囲をJSON内のplain-text文字列で返す。pane idの文法検証はせず、
+   登録確認をherdr APIより先に行う。
 4. `GET /api/mailboxes`は現在のallowlist、`GET /api/mailbox/<mailbox>`は既存の
    `mailbox-list`と同じ非consume event viewを返す。mailbox tokenとallowlist、
    `after`、`limit`の検査は既存primitiveと共有する。
@@ -86,8 +87,9 @@ HTTP APIの状態変更routeは `POST /api/letters` ただ1つで、それ以外
 415 (JSON以外)・400 (その他) を返し、拒否時はjournalにもstateにも変化を残さない。
 screen captureはherdrの`pane.read`に限定し、
 subprocessを起動しません。screen/mailbox path parameterのencoding不正、screen・
-mailboxesへのquery、mailboxの未知・重複・範囲外queryは400です。decode後のpane ID・
-mailbox token形式が不正、またはpaneが未登録・mailboxが未許可なら404です。登録確認後に
+mailboxesへのquery、mailboxの未知・重複・範囲外queryは400です。mailbox tokenの
+形式が不正、またはpaneが未登録・mailboxが未許可なら404です (pane idは文法検証
+しません — opaqueな文字列として登録の有無だけを見ます)。登録確認後に
 paneが消えた場合だけ410とし、herdr一覧・readまたはbrokerの一時障害は503にして、消滅と
 観測不能を混同しません。capture payloadは1 MiBを上限とし、screen内容をlogへ記録しません。
 mailbox履歴はreadしてもconsumeせず、journal追記、delivery state遷移、doorbell、checkpointへ
@@ -133,12 +135,16 @@ mailbox選択時に履歴をresetし、手動更新では末尾IDを排他的`af
 
 ## 状態と配送
 
+pane idはherdrが発行する**opaqueな文字列**で、brokerは文法を定義しない —
+採番規則の推測が実採番より狭くて配達とMCPが全停止した事故（65c83bbで拡張）の
+構造的な再発防止である。宛先文字列がregistryのpane idに**完全一致**すれば
+pane直指定として最優先で解決し、しなければ`scope/name`文法の名前として解釈
+する（bare名は近接解決。tmux併存期の正式名称`herdr/scope/name`は互換alias）。
+
 paneの表示・解決上のsession名は、herdr自身が持つworkspace **label**
 （`workspace.list`）を使い、labelが無い・宛先構文と衝突する場合は
 workspace_idへfallbackする。workspace_idは互換aliasとして解決だけに残す。
-宛先は`scope/name`文法で、bare名は近接解決である（tmux併存期の正式名称
-`herdr/scope/name`は互換aliasとして受理する）。brokerはlabelをread-onlyで
-消費し、`workspace.rename`を呼ばない。
+brokerはlabelをread-onlyで消費し、`workspace.rename`を呼ばない。
 
 daemonのメモリを稼働中の唯一の真実とします。登録はdaemon側のpullです —
 health tickごとにsnapshotを読み、agentの載っているpaneを冪等に登録します。
@@ -325,9 +331,14 @@ versioned JSON（`{"version":1,"id":0,"path":"sent","to":"w1:p2","name":"claude"
 依存し、agentが人間向けテキストを構造化応答と取り違える余地が残ります。
 
 `skill` / `from` / `pane` はtoolのschemaに存在しません。存在しない引数は誤用も偽装も
-できません。呼び出し元identityはadapterがspawn時の`HERDR_PANE_ID`から導出し、agentは
-触れません。`HERDR_PANE_ID`はrouting metadataであって認証境界ではなく、実際の境界は
-daemon側の同一UID UDSと未登録paneの拒否です。
+できません。呼び出し元identityは、spawn時の`HERDR_PANE_ID`があればadapterが申告し、
+無ければ**daemonが接続のSO_PEERCREDのPIDから/procの祖先を遡り、herdrがagent本体へ
+与えた`HERDR_PANE_ID`/`HERDR_SOCKET_PATH`の2 keyだけを読んで確立**します (Linux)。
+cwdやコマンド名からの推測はしません（同種agentが同じdirectoryに2つ居ると誤配する）。
+祖先が別のherdr sessionに属する場合・identityが見つからない場合はfail closedで、
+明示forwardを案内します。wire上の`peer_pid`はserde skipで、clientの自己申告では
+偽装できません。いずれのidentityもrouting metadataであって認証境界ではなく、実際の
+境界はdaemon側の同一UID UDSと未登録paneの拒否です。
 
 MCP serverはagentのexec sandboxの外で起動されるため、agent自身のshellより広い権限を
 持ちます。そのためtool surfaceを会話だけに限定し、file読み書き・任意path指定・
@@ -382,18 +393,17 @@ subprocessも起動せず、tool引数や`AGENT_TALK_RPC_SOCKET`のような任�
 
 | 入力 | 扱い |
 | --- | --- |
-| `HERDR_SOCKET_PATH` | 必須。絶対pathを検証する |
-| `HERDR_PANE_ID` | 必須。`w<seg>:p<seg>`の書式（segmentは数字と大文字英字）をroutingと同じ文法で検証する |
+| `HERDR_SOCKET_PATH` | 任意。あれば絶対pathを検証してその herdr 用の socket 名を導出、無ければ既定 session の固定名 `herdr` |
+| `HERDR_PANE_ID` | 任意。あれば opaque な id としてそのまま申告 (文法検証しない)、無ければ daemon の peer PID 解決に委ねる |
 | `XDG_RUNTIME_DIR` | 任意。絶対pathならruntime rootに使う |
 | `HOME` | `XDG_RUNTIME_DIR`欠落時のみ必須。`$HOME/.cache/agent-talkd/run`へfallback |
 
-欠落・不正な場合はtoolを1つも公開せずに終了します（fail closed）。曖昧な状態で既定値を
-作ると、実在しないsocketや別のherdrのsocketを掴み、誤ったpaneへ配達する余地が
-生じます。接続後はpeer UIDが自分のeffective UIDと一致することを確認し、daemon側の
+「設定されているのに壊れている」入力とruntime rootの欠落だけがfail closedです。
+接続後はpeer UIDが自分のeffective UIDと一致することを確認し、daemon側の
 same-UID境界と対称にします。
 
-RPC socket pathはbasenameだけが`HERDR_SOCKET_PATH`由来で、**rootは`XDG_RUNTIME_DIR`**
-です。daemonがruntime directoryを使っている環境でMCP側にだけ`XDG_RUNTIME_DIR`が
+RPC socket pathはbasenameだけが`HERDR_SOCKET_PATH`由来（無ければ`herdr`）で、
+**rootは`XDG_RUNTIME_DIR`**です。daemonがruntime directoryを使っている環境でMCP側にだけ`XDG_RUNTIME_DIR`が
 渡らないと、MCPだけがHOME fallbackを導出し、実在しないsocketを掴んで必ず失敗します。
 このときinitializeとtools/listは成功し、tool呼び出しだけが
 `agent-talkd に接続できません (<path>)` というtool errorになります。掴んだpathが

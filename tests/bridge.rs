@@ -15,7 +15,7 @@ use std::{
     net::{TcpListener, TcpStream},
     os::unix::net::{UnixListener, UnixStream},
     path::{Path, PathBuf},
-    process::{Command, Output},
+    process::{Command, Output, Stdio},
     sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
@@ -499,5 +499,66 @@ fn a_lagging_herdr_detection_does_not_strand_queued_messages() {
         "{prompts:?}"
     );
 
+    let _ = harness.as_herdr_pane("w1:p2", &["internal-daemon-shutdown"]);
+}
+
+/// env を一切 forward されない MCP server が、daemon の peer PID 解決で
+/// 自分の pane として会話できる (grok のような launcher の想定)。
+///
+/// 親 process (herdr が env を与えた agent に相当) だけが HERDR_* を持ち、
+/// MCP 子 process は `env -i` で環境を落として起動する。
+#[test]
+#[ignore = "spawns a background daemon; run explicitly"]
+fn an_env_free_mcp_child_is_identified_through_its_ancestor() {
+    let harness = Harness::start();
+    harness.ok(&harness.as_herdr_pane("w1:p2", &["register", "claude"]));
+    wait_for(|| harness.rpc_socket().exists());
+
+    // sh が「herdr が env を与えた agent」役 (HERDR_* を保持したまま生存)、
+    // その子の mcp は XDG_RUNTIME_DIR 以外の env を持たない。
+    // `sh -c '<単一 command>'` は shell が暗黙に exec して親が消えるため、
+    // 後続 command を置いて sh を「HERDR_* を持つ祖先」として生存させる。
+    let script = format!(
+        "env -i XDG_RUNTIME_DIR={} {}; exit $?",
+        harness.runtime.display(),
+        env!("CARGO_BIN_EXE_agent-talk-mcp"),
+    );
+    let mut child = Command::new("sh")
+        .args(["-c", &script])
+        .env("HERDR_PANE_ID", "w1:p1")
+        .env("HERDR_SOCKET_PATH", &harness.herdr.socket)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    let mut call = |line: String| -> serde_json::Value {
+        stdin.write_all(line.as_bytes()).unwrap();
+        stdin.write_all(b"\n").unwrap();
+        let mut response = String::new();
+        reader.read_line(&mut response).unwrap();
+        assert!(!response.is_empty(), "MCP server closed stdout");
+        serde_json::from_str(&response).unwrap()
+    };
+
+    // daemon が peer PID の祖先 (sh) から w1:p1 と解決し、codex として会話できる。
+    let peers = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_peers","arguments":{}}}"#
+            .to_owned(),
+    );
+    assert_eq!(
+        peers["result"]["structuredContent"]["self"], "w1:p1",
+        "{peers}"
+    );
+    let sent = call(
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"send_message","arguments":{"to":"claude","body":"from env-free mcp"}}}"#
+            .to_owned(),
+    );
+    assert_eq!(sent["result"]["structuredContent"]["to"], "w1:p2", "{sent}");
+
+    drop(stdin);
+    let _ = child.wait();
     let _ = harness.as_herdr_pane("w1:p2", &["internal-daemon-shutdown"]);
 }

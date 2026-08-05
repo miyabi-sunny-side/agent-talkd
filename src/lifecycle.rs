@@ -334,6 +334,7 @@ fn internal_request(command: &str) -> Request {
         stdin: String::new(),
         pane: crate::backend::self_pane(),
         send_options: None,
+        peer_pid: None,
     }
 }
 

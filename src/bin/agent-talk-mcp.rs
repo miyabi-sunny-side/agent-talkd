@@ -6,10 +6,6 @@
 
 #[path = "../mcp.rs"]
 mod mcp;
-// daemon の routing と共有する pane id 文法。依存を持たない純粋層のみ。
-#[allow(dead_code)]
-#[path = "../pane_id.rs"]
-mod pane_id;
 // daemon と共有する path 導出。MCP は herdr 由来の path だけを使う。
 #[allow(dead_code)]
 #[path = "../paths.rs"]

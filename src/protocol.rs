@@ -16,6 +16,10 @@ pub struct Request {
     pub pane: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub send_options: Option<SendOptions>,
+    /// daemon が接続の `SO_PEERCRED` から採取する peer PID。
+    /// **wire では受け渡さない** (client の自己申告で identity を偽装させない)。
+    #[serde(skip)]
+    pub peer_pid: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

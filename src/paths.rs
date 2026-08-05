@@ -54,6 +54,15 @@ pub fn herdr_rpc_socket_path(runtime_root: &Path, herdr_socket: &Path) -> PathBu
         .join(format!("{}.sock", herdr_socket_name(herdr_socket)))
 }
 
+/// 既定 session の herdr に対応する RPC socket path。
+///
+/// `HERDR_SOCKET_PATH` が環境に無い process (env clear で spawn された MCP
+/// server 等) の接続先 fallback。named session だけが env での明示を必要とする。
+#[allow(dead_code)] // agent-talk-mcp bin 専用 (daemon は Config が導出する)
+pub fn default_rpc_socket_path(runtime_root: &Path) -> PathBuf {
+    runtime_root.join("agent-talkd").join("herdr.sock")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
