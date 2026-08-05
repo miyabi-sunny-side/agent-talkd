@@ -204,7 +204,8 @@
         <span>宛先</span>
         <select bind:value={target} aria-label="手紙の宛先 agent">
           {#each agents as agent (agent.pane_id)}
-            <option value={agent.pane_id}>{agent.session} / {agent.name}</option
+            <option value={agent.pane_id}
+              >{agent.backend} / {agent.session} / {agent.name} ({agent.pane_id})</option
             >
           {/each}
         </select>

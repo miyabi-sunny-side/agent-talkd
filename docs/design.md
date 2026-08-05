@@ -55,7 +55,7 @@ peer credentialのUIDがdaemonのeffective UIDと一致することを要求し�
 
 routeは次の順で分類します。
 
-1. GET以外は、pathにかかわらず`Allow: GET`付きのJSON 405にする。
+1. GET以外は、`POST /api/letters` を唯一の例外として `Allow` 付きのJSON 405にする。
 2. `GET /api/hello`は製品名とversion、`GET /api/who`はregistry snapshotをJSONで返す。
 3. `GET /api/agents/<pane>/screen`はstrictにdecode・検証した登録paneだけをtmux adapterへ
    渡し、現在の表示範囲をJSON内のplain-text文字列で返す。pane形式と登録確認は
@@ -67,10 +67,11 @@ routeは次の順で分類します。
    (`send --from` と同一のallowlist・resolve・journal-first・配達/requeue) を
    そのまま通す。独自の送信実装を持たない。JSON以外のContent-Typeを415で
    弾きCORS headerを返さないことで、browserのcross-site simple requestを
-   遮断する。無認証TCPでの投函自体は閉域LANの運用受容 (decision 0002) と
-   agent-terrace時代の前例に基づくuser裁定である。
+   遮断する。無認証TCPでの投函は2026-08-05のuser指示
+   (「手紙を出す機能を復活させる」) を直接のauthorityとし、到達範囲は
+   operator所有のVPN/LAN境界、TCPは既定off、processへのauth追加はしない。
 6. 未知の`/api/`以下は静的fallbackへ流さずJSON 404にする。
-6. その他のGETは埋め込みassetを返し、該当assetがなければ`/index.html`へfallbackする。
+7. その他のGETは埋め込みassetを返し、該当assetがなければ`/index.html`へfallbackする。
 
 失敗応答は`{"error":"<code>"}`です。statusはcallerが再試行と選択修正を区別できるよう
 次の意味に固定します。
@@ -82,7 +83,10 @@ routeは次の順で分類します。
 | 410 | 登録確認後にlive paneの消滅を確認した | `pane_unavailable` |
 | 503 | broker、tmux、capture、registry、または静的assetが一時的・実行時に利用できない | `broker_unavailable`, `tmux_unavailable`, `capture_unavailable`, `registry_unavailable`, `static_assets_unavailable` |
 
-HTTP APIは状態変更routeを持ちません。screen captureはshellを介さない個別argvの
+HTTP APIの状態変更routeは `POST /api/letters` ただ1つで、それ以外は読み取り専用の
+ままである。letterの拒否は403 (source未許可)・404 (宛先不在)・413 (本文超過)・
+415 (JSON以外)・400 (その他) を返し、拒否時はjournalにもstateにも変化を残さない。
+screen captureはshellを介さない個別argvの
 `tmux capture-pane`に限定します。screen/mailbox path parameterのencoding不正、screen・
 mailboxesへのquery、mailboxの未知・重複・範囲外queryは400です。decode後のpane ID・
 mailbox token形式が不正、またはpaneが未登録・mailboxが未許可なら404です。登録確認後に
@@ -94,10 +98,13 @@ mailbox履歴はreadしてもconsumeせず、journal追記、delivery state遷�
 0700 directoryとpeer UID検査は別UIDからの開示を防ぎますが、同一UID内のpane所有者や
 人間を区別しません。そのためHTTP socketへ到達できる同一UID callerには、全登録paneの
 screenと、現在allowlistにある全mailbox eventを開示する設計です。この開示範囲を
-pane/mailbox単位の認可と誤解してはなりません。一方、letter送信とbusy recoveryはhuman
-authorityによる変更・割り込みなので、同一UIDだけを権限根拠にせず、Port-3のhuman identity
-gateを備えた入口と同時に導入してread-only UDSへ先行配置しません。ブラウザはUDSを直接
-開けないため、transport bridgeも別scopeです。
+pane/mailbox単位の認可と誤解してはなりません。busy recoveryは引き続き
+human identity gateを備えた入口と同時に導入する将来課題である。letter送信は
+2026-08-05のuser指示 (「手紙を出す機能を復活させる」) により、identity gateを
+待たず `POST /api/letters` として導入済み — 認可はprocessに足さず、TCP面は
+`AGENT_TALK_HTTP_ADDR` を明示設定したときだけ開き (既定off)、その到達範囲は
+operator所有のVPN/LAN境界が定める。processはJSON-only Content-Typeを強制し
+CORS headerを返さないことで、browserのcross-site simple requestだけを遮断する。
 
 起動時はstaleなHTTP socketを除去してからbindします。daemonのイベントループ終了時は
 RPC socketとHTTP socketの両方を除去します。bind途中で失敗した場合にHTTPだけを提供する、

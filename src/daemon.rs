@@ -798,9 +798,9 @@ fn hex_value(byte: u8) -> Option<u8> {
 }
 
 fn valid_pane_id(pane: &str) -> bool {
-    pane.strip_prefix('%').is_some_and(|digits| {
-        !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
-    })
+    // 両 backend の pane id 形式 (`%5` / `w1:p2`) を strict parser 1つで判定する。
+    // tmux 形式だけを受けると herdr agent の Screen が実機で 404 になる。
+    BackendKind::of(pane).is_some()
 }
 
 fn parse_mailbox_query(
@@ -3692,6 +3692,11 @@ mod tests {
         assert_eq!(
             classify_http(&Method::GET, "/api/agents/%251/screen"),
             HttpRoute::Screen("%1".into())
+        );
+        // herdr の pane id も screen route に乗る (実管理画面の herdr 表示)。
+        assert_eq!(
+            classify_http(&Method::GET, "/api/agents/w2%3Ap4/screen"),
+            HttpRoute::Screen("w2:p4".into())
         );
         assert_eq!(
             classify_http(&Method::GET, "/api/mailboxes"),

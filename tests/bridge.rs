@@ -451,6 +451,11 @@ fn one_daemon_bridges_tmux_and_herdr_and_serves_mobile_over_tcp() {
         "本文は端末へ注入しない"
     );
 
+    // herdr pane の Screen も HTTP から開ける (pane id 形式の両対応)。
+    let herdr_screen = harness.http_get("/api/agents/w1%3Ap1/screen");
+    assert!(herdr_screen.starts_with("HTTP/1.1 200"), "{herdr_screen}");
+    assert!(herdr_screen.contains("fake herdr screen"), "{herdr_screen}");
+
     // --- 達成条件 3: スマホ向けの TCP 面が応答する ---
     let mut stream = TcpStream::connect(("127.0.0.1", harness.http_port)).unwrap();
     stream

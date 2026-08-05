@@ -181,13 +181,14 @@ pending-to-me: #0
 自分が送って未受領のIDです。後者には配達待ちqueueの分も含みます。どちらの行も
 未受領が無ければ出ません。
 
-## Read-only observation page
+## Observation & letters page
 
-daemonはCLI用RPC socketに加え、read-onlyなagent registry、pane screen、外部mailbox
-履歴と埋め込み済みSPAを
-HTTP-over-UDSで提供します。これはTCP listenerではなくUnix domain socketなので、
-通常のブラウザから直接開くことはできません。TCP proxyやtsnet連携は現時点では
-含まれません。
+daemonはCLI用RPC socketに加え、agent registry、pane screen、外部mailbox履歴の
+閲覧と、手紙の投函 (`POST /api/letters`、唯一の書き込みroute) を持つ埋め込み済み
+SPAをHTTP-over-UDSで提供します。既定はUnix domain socketのみで、
+`AGENT_TALK_HTTP_ADDR` を明示設定したときだけ同じrouteがTCPでも開きます。
+TCP面の到達範囲はoperatorが所有するVPN/LAN境界で定め、processは認証を
+追加しません (2026-08-05のuser指示による裁定)。
 
 既定のHTTP socketは
 `$XDG_RUNTIME_DIR/agent-talkd/<tmux-socket-name>.http.sock`です。
@@ -217,7 +218,7 @@ HTTP-over-UDSで提供します。これはTCP listenerではなくUnix domain s
 - 未知の`/api/`以下: JSONの404を返します。撤去済みの旧 `/v1/*` も同じJSON 404で
   明示的に拒否します (SPA entryへはfallbackさせません。200を返すと残存する旧
   updaterのhealth probeが旧APIを正常と誤認するためです)。
-- GET以外: `Allow: GET`付きの405を返します。
+- GET以外: `POST /api/letters` を除き `Allow` 付きの405を返します。
 - その他のGET: 埋め込み静的ファイルを返し、未知の画面パスはSPA entryへfallbackします。
   静的ファイルを埋め込まずにビルドした場合はJSONの503を返します。
 
@@ -252,9 +253,10 @@ curl --unix-socket \
 HTTP socketへ接続できる同一UIDのcallerは、paneやmailboxごとの所有者確認なしに、すべての
 登録paneの表示内容と現在許可されている全mailboxの履歴を読めます。peer UID検査は別のOS
 userからの接続を拒む境界であり、同一UID内の人間を識別・認可するidentity gateでは
-ありません。API応答はscreen内容をlogへ記録せず、状態変更、journal追記、terminal入力を
-行いません。letter送信とbusy recoveryは人間の権限を使う変更・割り込み操作なので、
-同一UIDだけを根拠に追加せず、Port-3のhuman identity gateと同時に導入します。
+ありません。GET応答はscreen内容をlogへ記録せず、状態変更、journal追記、terminal入力を
+行いません。状態を変えるのは `POST /api/letters` だけで、これは既存の外部mailbox
+送信経路 (allowlist・journal-first) をそのまま通ります。busy recoveryは引き続き
+human identity gateを備えた入口と同時に導入する将来課題です。
 
 `send` は `#<id>` を返し、受信側は呼び鈴に表示された
 `read_message <id>`（MCP。CLI では `agent-talk read <id>`）で依頼本文を

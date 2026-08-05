@@ -399,10 +399,22 @@ user の UX 評価（読めても行動できない、遡れない）と、agent
 1 route に限り撤回**された。旧 agent-terrace の手紙投函 (置換時に受容された機能後退、
 home-server README の TODO として記録) の回収である。
 
+### Authority evidence (user 原文、2026-08-05、本 repo の会話ペイン)
+
+> http管理画面の改修をお願いします
+> - 手紙を出す機能を復活させる
+
+(agent-terrace 置換時の受容記録: 「いつの間に……agent-terrace相当の機能は出来るように
+します。一旦todoに放り込んでおいて、作業を続けてください」— 2026-08-03)
+
+### 契約
+
 - 手紙は既存の外部 mailbox 送信経路 (`send --from` と同一の allowlist 判定・resolve・
   journal-first 永続化・配達/requeue) をそのまま通り、新しい送信実装を持たない。
 - source の許可は `@agent_talkd_allowed_sources` (既定 `mobile`) が最終判定する。
 - Content-Type は `application/json` のみ・CORS header なし (cross-site simple
-  request の遮断)。無認証 TCP での投函は閉域 LAN の運用受容 (decision 0002) と
-  agent-terrace の前例に基づく。
+  request の遮断)。**process は認証を追加しない。TCP 面は `AGENT_TALK_HTTP_ADDR` を
+  明示設定したときだけ開き (既定 off)、その到達範囲は operator 所有の VPN/LAN 境界が
+  定める** — agent-terrace の同形式の運用が先行事例だが、現在の裁定の根拠は上記の
+  user 原文である。
 - **他の書き込み route は引き続き非目標** — GET 専用の原則はこの1 route を除いて有効。
