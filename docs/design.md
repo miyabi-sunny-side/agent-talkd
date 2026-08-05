@@ -162,6 +162,12 @@ agent列をnativeに持つため、hookを挟むよりdaemonが観測するほ�
   1回の欠落はherdrの検出ラグと区別できないため、その時点で配送やevictを行うと
   実在する宛先を誤って失う。
 - snapshot取得に失敗した間は判定を進めない（不完全な証拠で消さない）。
+- daemon起動時は要求の受付前にも1回同期する。journalが復元した古いidentityが
+  最初のtickまでaddressableだと、旧名宛の呼び鈴をpaneの新しい占有者へ送る
+  誤配窓（最大2秒）ができる。
+- 新規メッセージの上限判定は、dispatchのqueue行き条件と同じpredicate
+  （busy・queue残留・suspect）を共有する。busyだけを見ると、suspectの凍結中に
+  queueが上限を素通りして無制限に伸びる。
 - herdr paneへの手動`unregister`は拒否する。pullが次tickで登録し直すため、
   受理すると解除→再登録の振動になるだけで、意図した効果を持たない。
 - tmux側のstale pane掃除（reconcile）はtmux paneだけを見る。herdrのlifecycleは

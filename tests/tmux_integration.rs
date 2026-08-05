@@ -235,12 +235,14 @@ fn daemon_journal_read_recovery_and_pane_exit() {
     assert!(web_static.contains("agent talk · registry"), "{web_static}");
     let unknown_api = http_request(&http, "GET", "/api/missing");
     assert!(unknown_api.starts_with("HTTP/1.1 404"), "{unknown_api}");
-    for path in [
-        "/api/who",
-        "/api/letters",
-        "/api/recover",
-        "/api/mailbox/mobile",
-    ] {
+    // /api/letters は唯一の書き込み route。POST 自体は受理され、
+    // JSON 以外の Content-Type は 415 で拒否される。
+    let letters_not_json = http_request(&http, "POST", "/api/letters");
+    assert!(
+        letters_not_json.starts_with("HTTP/1.1 415"),
+        "{letters_not_json}"
+    );
+    for path in ["/api/who", "/api/recover", "/api/mailbox/mobile"] {
         let write_rejected = http_request(&http, "POST", path);
         assert!(
             write_rejected.starts_with("HTTP/1.1 405"),

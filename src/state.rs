@@ -113,6 +113,15 @@ pub struct Agent {
     pub suspect: bool,
 }
 
+impl Agent {
+    /// 新しいメッセージが直配ではなく queue へ入る条件。dispatch と送信側の
+    /// 上限判定が同じ predicate を共有しないと、queue 行きの送信だけが
+    /// 上限を素通りする。
+    pub fn defers_delivery(&self) -> bool {
+        self.state == AgentState::Busy || !self.queue.is_empty() || self.suspect
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct BrokerState {
     pub agents: HashMap<String, Agent>,
@@ -150,6 +159,7 @@ impl BrokerState {
         }
     }
 
+    #[cfg(test)]
     pub fn is_busy(&self, pane: &str) -> bool {
         self.agents
             .get(pane)
@@ -189,14 +199,13 @@ impl BrokerState {
         // 配達失敗で requeue された古い message を新規 message が追い越す
         // (FIFO の破れ)。queue の先頭は turn-end と health tick の再配達が流す。
         // suspect (herdr 検出の途切れ疑い) 中も直配せず queue で待たせる。
-        let dispatch =
-            if agent.state == AgentState::Busy || !agent.queue.is_empty() || agent.suspect {
-                agent.queue.insert(id);
-                Dispatch::Queued(id)
-            } else {
-                agent.state = AgentState::Busy;
-                Dispatch::Deliver(id)
-            };
+        let dispatch = if agent.defers_delivery() {
+            agent.queue.insert(id);
+            Dispatch::Queued(id)
+        } else {
+            agent.state = AgentState::Busy;
+            Dispatch::Deliver(id)
+        };
         self.messages.insert(
             id,
             StoredMessage {
