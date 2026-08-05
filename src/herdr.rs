@@ -6,8 +6,8 @@
 //! 配送には **状態ガード** を必ず挟む。
 //! herdr の入力系 API 自体には steer ガードが無く、working / blocked な
 //! pane にも文字を撃ち込める。承認ダイアログへ Enter を撃ち込む事故を避けるため、
-//! herdr が **積極的に `idle` と判定した pane にだけ**送る (README の
-//! 「multiplexer backend」節)。`unknown` は idle の証拠にならないので送らない。
+//! herdr が **積極的に `idle` または `done` と判定した pane にだけ**送る
+//! (README の「herdr backend」節)。`unknown` は安全の証拠にならないので送らない。
 
 use std::path::PathBuf;
 
@@ -52,12 +52,17 @@ impl AgentStatus {
         }
     }
 
-    /// 自動配送を許すのは、herdr が **積極的に** idle と判定したときだけ。
+    /// 自動配送を許すのは `idle` と `done`。
     ///
+    /// steer-safety が守るのは進行中のターン (`working`) と承認ダイアログ等の
+    /// 入力待ち (`blocked`)。`done` はターンが完了して入力欄が空いた状態で、
+    /// user がその pane を表示するまで保たれる**表示上の**バッジにすぎない —
+    /// これを配送不可と同一視すると、非表示 tab 宛の message が user の巡回まで
+    /// 滞留する。done への配達は未閲覧バッジを消して新ターンを始める。
     /// `Unknown` を許さないのは、herdr の detection manifest に無い画面形状が
     /// idle fallback になり得るため。負の証拠を根拠に入力してはならない。
     pub fn accepts_delivery(self) -> bool {
-        matches!(self, Self::Idle)
+        matches!(self, Self::Idle | Self::Done)
     }
 }
 
@@ -172,10 +177,11 @@ impl Herdr {
             .collect())
     }
 
-    /// idle と確認できた pane の **agent** にだけ呼び鈴を届ける。
+    /// 配達可能 (`idle` / `done`) と確認できた pane の **agent** にだけ
+    /// 呼び鈴を届ける。
     ///
     /// 状態の取得と送信の間には原理的に race があるが、herdr には
-    /// 「idle なら送る」を atomic に行う API が無い。窓を最小化するため、
+    /// 「配達可能なら送る」を atomic に行う API が無い。窓を最小化するため、
     /// 直前に取得した状態で判断する。
     ///
     /// 送信は `pane.send_text` ではなく `agent.prompt` を使う。submit の作法
@@ -187,7 +193,7 @@ impl Herdr {
     pub async fn deliver(&self, pane_id: &str, text: &str) -> Result<Delivery> {
         #[cfg(test)]
         if let Some(scripted) = &self.scripted {
-            // 実実装と同じ規則: pane 不在は Err、idle 以外は Skipped。
+            // 実実装と同じ規則: pane 不在は Err、配達可能以外は Skipped。
             let status = scripted
                 .lock()
                 .unwrap()
@@ -474,8 +480,8 @@ mod tests {
     /// 「送信を試みて失敗する」ではなく「**そもそも入力系 API を発行しない**」
     /// ことを、偽サーバーが受け取った method 列で証明する。
     #[tokio::test]
-    async fn deliver_never_sends_text_to_a_pane_that_is_not_idle() {
-        for status in ["working", "blocked", "unknown", "done"] {
+    async fn deliver_never_sends_text_to_a_pane_that_is_not_deliverable() {
+        for status in ["working", "blocked", "unknown"] {
             let owned = status.to_owned();
             let fake = FakeHerdr::start(move |method, _| match method {
                 "pane.get" => pane_get(&pane("w1:p1", "codex", &owned)),
@@ -497,29 +503,34 @@ mod tests {
         }
     }
 
-    /// 達成条件 2 の対: idle なら agent へ prompt として届く。
+    /// 達成条件 2 の対: idle / done なら agent へ prompt として届く。
     /// 拒否だけして届かないのでは無意味だし、入力欄に置くだけでは turn が始まらない。
+    /// done を含めるのは、非表示 tab の完了バッジが user の巡回まで配達を
+    /// 塞がないため。
     #[tokio::test]
-    async fn deliver_prompts_the_agent_of_an_idle_pane() {
-        let fake = FakeHerdr::start(|method, _| match method {
-            "pane.get" => pane_get(&pane("w1:p2", "claude", "idle")),
-            _ => ok(&json!({})),
-        });
+    async fn deliver_prompts_the_agent_of_an_idle_or_done_pane() {
+        for status in ["idle", "done"] {
+            let owned = status.to_owned();
+            let fake = FakeHerdr::start(move |method, _| match method {
+                "pane.get" => pane_get(&pane("w1:p2", "claude", &owned)),
+                _ => ok(&json!({})),
+            });
 
-        let delivery = fake
-            .client()
-            .deliver("w1:p2", "[agent-talk] #1")
-            .await
-            .unwrap();
+            let delivery = fake
+                .client()
+                .deliver("w1:p2", "[agent-talk] #1")
+                .await
+                .unwrap();
 
-        assert_eq!(delivery, Delivery::Sent);
-        // send_text / send_keys ではなく agent.prompt ちょうど1発。
-        assert_eq!(fake.methods(), vec!["pane.get", "agent.prompt"]);
-        let sent = fake.requests.lock().unwrap().last().cloned().unwrap();
-        assert_eq!(sent["params"]["target"], "w1:p2");
-        assert_eq!(sent["params"]["text"], "[agent-talk] #1");
-        // event loop を塞ぐ wait を仕込まない。
-        assert!(sent["params"].get("wait").is_none(), "{sent}");
+            assert_eq!(delivery, Delivery::Sent, "{status} は配送可能");
+            // send_text / send_keys ではなく agent.prompt ちょうど1発。
+            assert_eq!(fake.methods(), vec!["pane.get", "agent.prompt"], "{status}");
+            let sent = fake.requests.lock().unwrap().last().cloned().unwrap();
+            assert_eq!(sent["params"]["target"], "w1:p2");
+            assert_eq!(sent["params"]["text"], "[agent-talk] #1");
+            // event loop を塞ぐ wait を仕込まない。
+            assert!(sent["params"].get("wait").is_none(), "{sent}");
+        }
     }
 
     /// agent が pane から消えた race では herdr が `agent_not_running` を返す。

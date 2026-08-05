@@ -2398,8 +2398,9 @@ impl Broker {
         true
     }
 
-    /// 配達済みのまま受領報告が無い message について、宛先が idle のときだけ
-    /// 受領催促の呼び鈴を送る。催促は message を新規作成しない
+    /// 配達済みのまま受領報告が無い message について、宛先が broker 上 idle
+    /// かつ herdr の観測が配達可能 (idle/done) のときだけ受領催促の呼び鈴を送る。
+    /// 催促は message を新規作成しない
     /// (催促自体が受領報告の対象になる再帰を避ける)。
     /// タイマーは memory のみで、restart 後は配達時刻から数え直す。
     async fn nag_unacked(&mut self) {
@@ -4112,6 +4113,77 @@ mod tests {
         assert_eq!(refused.code, 1);
         assert!(refused.stderr.contains("herdr"), "{}", refused.stderr);
         assert!(broker.state.agents.contains_key("w1:p7"));
+    }
+
+    /// herdr が `done` (完了出力の未閲覧バッジ) と報告する pane にも、
+    /// 直配・queue drain・受領催促のすべてが user の閲覧を待たずに届く。
+    /// steer-safety の拒否対象は working / blocked / unknown のまま。
+    #[tokio::test(start_paused = true)]
+    async fn a_done_pane_receives_mail_drain_and_reminders_without_being_viewed() {
+        let dir = tempfile::tempdir().unwrap();
+        let done_claude = HerdrPane {
+            status: AgentStatus::Done,
+            ..pane_info("w1:p2", Some("claude"))
+        };
+        let mut broker = broker(
+            &dir,
+            vec![pane_info("w1:p1", Some("codex")), done_claude.clone()],
+        );
+        broker.sync_herdr_registry().await;
+
+        // 直配: done pane へは queue 行きにならず即配達される。
+        let first = json(
+            &broker
+                .handle(send_request("w1:p1", "claude", "first"))
+                .await,
+        );
+        assert_eq!(first["path"], "sent", "done は配達可能");
+        let first_id = first["id"].as_u64().unwrap();
+
+        // drain: queue が残った done pane も health tick が先頭から流す。
+        let second = json(
+            &broker
+                .handle(send_request("w1:p1", "claude", "second"))
+                .await,
+        );
+        assert_eq!(second["path"], "queued");
+        let second_id = second["id"].as_u64().unwrap();
+        broker.state.ack(first_id);
+        broker.state.set_state("w1:p2", AgentState::Idle);
+        let before = bells(&broker).len();
+        broker.drain_queued().await;
+        let drained: Vec<_> = bells(&broker)[before..].to_vec();
+        assert_eq!(drained.len(), 1, "{drained:?}");
+        assert!(
+            drained[0].1.contains(&format!("read_message {second_id}")),
+            "{drained:?}"
+        );
+
+        // 催促: 配達済み・未 ack の message への nag も done pane に届く。
+        broker.turn_end(Some("w1:p2".into())).await.unwrap();
+        tokio::time::advance(std::time::Duration::from_secs(61)).await;
+        let before = bells(&broker).len();
+        broker.nag_unacked().await;
+        let nags: Vec<_> = bells(&broker)[before..].to_vec();
+        assert_eq!(nags.len(), 1, "done pane にも催促が届く: {nags:?}");
+        assert!(nags[0].1.contains("受領催促"), "{nags:?}");
+
+        // steer-safety: working へは催促も含めて一文字も送らない。
+        set_herdr_panes(
+            &broker,
+            vec![
+                pane_info("w1:p1", Some("codex")),
+                HerdrPane {
+                    status: AgentStatus::Working,
+                    ..pane_info("w1:p2", Some("claude"))
+                },
+            ],
+        );
+        broker.turn_end(Some("w1:p2".into())).await.unwrap();
+        tokio::time::advance(std::time::Duration::from_mins(6)).await;
+        let before = bells(&broker).len();
+        broker.nag_unacked().await;
+        assert_eq!(bells(&broker).len(), before, "working には催促を撃たない");
     }
 
     #[tokio::test]

@@ -562,3 +562,27 @@ fn an_env_free_mcp_child_is_identified_through_its_ancestor() {
     let _ = child.wait();
     let _ = harness.as_herdr_pane("w1:p2", &["internal-daemon-shutdown"]);
 }
+
+/// 非表示 tab の `done` バッジは配達を塞がない — user が tab を開かなくても
+/// 呼び鈴が agent.prompt で届く。
+#[test]
+#[ignore = "spawns a background daemon; run explicitly"]
+fn a_done_pane_receives_the_bell_without_the_user_opening_its_tab() {
+    let harness = Harness::start();
+    harness.ok(&harness.as_herdr_pane("w1:p2", &["register", "claude"]));
+    wait_for(|| harness.rpc_socket().exists());
+
+    // 全 pane が「ターン完了・未閲覧」の done を報告している状態。
+    harness.herdr.report_status("done");
+    let sent = harness.ok(&harness.as_herdr_pane("w1:p2", &["send", "w1:p1", "--", "for codex"]));
+    assert!(
+        sent.contains("sent"),
+        "done は queue 行きにならず即配達: {sent}"
+    );
+    wait_for(|| !harness.herdr.prompts().is_empty());
+    let (target, bell) = harness.herdr.prompts().remove(0);
+    assert_eq!(target, "w1:p1");
+    assert!(bell.contains("read_message"), "{bell:?}");
+
+    let _ = harness.as_herdr_pane("w1:p2", &["internal-daemon-shutdown"]);
+}
