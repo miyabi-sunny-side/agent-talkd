@@ -146,7 +146,7 @@ it("disables sending with a reason when no mailbox is allowed", async () => {
   expect(screen.queryByRole("button", { name: "手紙を出す" })).toBeNull();
   // textarea が無くても focus は dialog に入り、閉じる/Escape が効く。
   expect(document.activeElement).toBe(
-    screen.getByRole("dialog", { name: "codex への手紙" }),
+    screen.getByRole("region", { name: "codex への手紙" }),
   );
 });
 

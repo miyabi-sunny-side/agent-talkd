@@ -49,24 +49,31 @@ it("polls every two seconds while visible", async () => {
 });
 
 it("does not let an older refresh overwrite a newer response", async () => {
+  // 1回目の応答が遅れている間に visibilitychange 由来の refresh が走り、
+  // 遅れて届いた古い応答が新しい画面を上書きしない。
   let resolveFirst: (value: Response) => void = () => undefined;
-  let resolveSecond: (value: Response) => void = () => undefined;
   const fetch = vi
     .fn()
     .mockReturnValueOnce(
       new Promise<Response>((resolve) => (resolveFirst = resolve)),
     )
-    .mockReturnValueOnce(
-      new Promise<Response>((resolve) => (resolveSecond = resolve)),
-    );
+    .mockResolvedValueOnce(capture("new screen"));
   vi.stubGlobal("fetch", fetch);
   render(ScreenPanel, { agent });
   await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(1));
 
-  await fireEvent.click(screen.getByRole("button", { name: "更新" }));
-  resolveSecond(capture("new screen"));
+  document.dispatchEvent(new Event("visibilitychange"));
   expect(await screen.findByText("new screen")).toBeTruthy();
   resolveFirst(capture("stale screen"));
   await Promise.resolve();
   expect(screen.queryByText("stale screen")).toBeNull();
+});
+
+it("shows neither a refresh button nor a poll status line", async () => {
+  // 詳細は terminal が主役。更新は router (ブラウザ reload) が担う。
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(capture("terminal")));
+  render(ScreenPanel, { agent });
+  expect(await screen.findByText("terminal")).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "更新" })).toBeNull();
+  expect(screen.queryByText("2秒ごとに更新")).toBeNull();
 });

@@ -60,17 +60,8 @@
   aria-label={`${agent.name} screen`}
   aria-busy={phase === "loading"}
 >
-  <!-- 詳細画面は terminal が主役。見出しは detail-bar が担い、ここは
-       更新状態の 1 行だけに抑える。 -->
-  <div class="screen-toolbar">
-    <span class="screen-status" aria-live="polite" aria-atomic="true">
-      {#if phase === "loading"}画面を取得中{:else if phase === "error"}画面を取得できませんでした{:else}2秒ごとに更新{/if}
-    </span>
-    <button type="button" class="quiet-button" onclick={() => refresh(false)}
-      >更新</button
-    >
-  </div>
-
+  <!-- terminal が主役。poll (2s, visible 時のみ) は黙って続き、状態表示と
+       手動更新は置かない — reload は router が担う (DESIGN.md §7.5)。 -->
   {#if phase === "error" && terminal === ""}
     <div class="panel-state error" role="alert">
       <p>pane が終了したか、一時的に capture できません。</p>

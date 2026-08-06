@@ -1,10 +1,20 @@
 <!doctype html>
 <html lang="ja">
   <head>
+    <!-- theme flash 防止: bundle より先に保存済みテーマを同期適用する
+         (規則は src/theme.ts と同一に保つ。DESIGN.md §4.2)。 -->
+    <script>
+      try {
+        var storedTheme = localStorage.getItem("agent-talkd:theme");
+        if (storedTheme === "dark" || storedTheme === "light") {
+          document.documentElement.dataset.theme = storedTheme;
+        }
+      } catch (error) {}
+    </script>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="theme-color" content="#171714" />
-    <title>agent talk · registry</title>
+    <title>agent talk · observer</title>
   </head>
   <body>
     <div id="app"></div>
