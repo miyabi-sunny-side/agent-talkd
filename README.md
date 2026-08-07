@@ -69,7 +69,7 @@ adapterはアーカイブ側から配置してください。
 
 ## CLI
 
-`run`, `register`, `unregister`, `busy`, `idle`, `turn-end`, `who`, `resolve`,
+`run`, `register`, `unregister`, `who`, `resolve`,
 `send`, `read`, `update`, `ensure-daemon`, `daemon-status` を提供します。
 `read-message`, `ack-message`, `list-peers` は MCP adapter が使う配管コマンドで、依頼本文・
 受領報告の結果・登録agentと未受領IDをそれぞれJSONで返します。送信側の
@@ -170,8 +170,9 @@ codex      idle/idle   herdr main:1.5 (w1:p5)  /home/miyabi/projects/sunny-side/
 pending-to-me: #0
 ```
 
-状態列は `agent-talkd の把握/herdr の観測`、backend 列は tmux 併存期の
-表形式を維持した固定値 `herdr` です。
+状態列は `herdr の状態を idle/busy に正規化した値/herdr の生の観測`、backend列は
+tmux併存期の表形式を維持した固定値`herdr`です。agent-talkd独自のBusy/Idle状態は
+持ちません。
 
 `pending-to-me` は自分宛で配達完了済みかつ未受領のID、`pending-from-me <pane>` は
 自分が送って未受領のIDです。後者には配達待ちqueueの分も含みます。どちらの行も
@@ -250,20 +251,19 @@ HTTP socketへ接続できる同一UIDのcallerは、paneやmailboxごとの所�
 userからの接続を拒む境界であり、同一UID内の人間を識別・認可するidentity gateでは
 ありません。GET応答はscreen内容をlogへ記録せず、状態変更、journal追記、terminal入力を
 行いません。状態を変えるのは `POST /api/letters` だけで、これは既存の外部mailbox
-送信経路 (allowlist・journal-first) をそのまま通ります。busy recoveryは引き続き
-human identity gateを備えた入口と同時に導入する将来課題です。
+送信経路 (allowlist・journal-first) をそのまま通ります。
 
 `send` は `#<id>` を返し、受信側は呼び鈴に表示された
 `read_message <id>`（MCP。CLI では `agent-talk read <id>`）で依頼本文を
 取得します。`read` は本文を消しません（読了だけを記録します）。配達済みの
 まま受領報告が1分間ないメッセージには、daemonが受領催促の呼び鈴を送ります。
-催促が出るのはbroker把握の状態がidleで、かつherdrの観測が配達可能
-（idle / done）のときだけです（読了済みならackを、未読なら読むことを促し、
+催促が出るのはherdrの観測が配達可能（idle / done）のときだけです
+（読了済みならackを、未読なら読むことを促し、
 5分間隔より詰めて連打しません）。
 メッセージが消えるのは受信側が受領報告（`ack-message` / MCP の `ack_message`）を
 送った後で、それまでは何度でも読み直せます。配達が完了していないqueue中の
 メッセージは、呼び鈴より先に本文を読ませないため `read` も `ack-message` も拒否します。
-本文、未配達queue、状態遷移は既定で
+本文、未配達queue、受領状態は既定で
 `$XDG_STATE_HOME/agent-talkd/`（未設定時は `~/.local/state/agent-talkd/`）
 のjournalに保存します。従来の `~/.cache/agent-talk/*.md` は新規作成せず、
 既存ファイルも自動削除しません。
@@ -370,16 +370,16 @@ pane には herdr が拒否を返すため、素の shell へ呼び鈴が入る�
 
 ### herdr の登録は pull（hook 不要）
 
-**daemon が 2 秒間隔の health tick で herdr の snapshot を読み、agent の
-載っている pane を自動登録**します。grok CLI のように
+**daemon はsend・message RPCの受信時に即座に、待機中は2秒間隔のhealth tickで
+herdrのsnapshotを読み、agentの載っているpaneを同期**します。grok CLIのように
 登録 hook を持たない agent も、herdr の pane で起動するだけで数秒以内に
 peer になります。
 
 - pane の agent 名が別の agent に変わったら、旧登録を即座に外して新しい名前で
   引き継ぎます（herdr の agent 列は native な同一性情報のため、猶予は不要です）。
-- snapshot から消えた pane は、まず **suspect**（配送は queue に留め、当人からの
-  RPC も拒否）になり、**2 回連続で欠落したら登録を外して**未受領メッセージを
-  送信元へ回収します。1 tick の検出ラグでは消えません。
+- 成功したsnapshotから消えたpaneは即座に登録を外し、未受領メッセージを
+  送信元へ回収します。pen-cliなどによる高速なspace削除・再作成でも古い登録を
+  次のsnapshotまで持ち越しません。
 - snapshot の取得自体に失敗している間は判定を一切進めません
   （不完全な証拠で登録を消さないため）。
 - herdr 側 pane への `unregister` は拒否します — pull が次の tick で登録し直す

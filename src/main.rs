@@ -78,11 +78,7 @@ async fn run() -> Result<i32> {
         return run::run(args).await;
     }
 
-    if matches!(
-        command.as_str(),
-        "register" | "unregister" | "busy" | "idle" | "turn-end"
-    ) && backend::self_pane().is_none()
-    {
+    if matches!(command.as_str(), "register" | "unregister") && backend::self_pane().is_none() {
         return Ok(0);
     }
     if matches!(command.as_str(), "gc" | "watch") {

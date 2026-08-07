@@ -98,8 +98,7 @@ mailbox履歴はreadしてもconsumeせず、journal追記、delivery state遷�
 0700 directoryとpeer UID検査は別UIDからの開示を防ぎますが、同一UID内のpane所有者や
 人間を区別しません。そのためHTTP socketへ到達できる同一UID callerには、全登録paneの
 screenと、現在allowlistにある全mailbox eventを開示する設計です。この開示範囲を
-pane/mailbox単位の認可と誤解してはなりません。busy recoveryは引き続き
-human identity gateを備えた入口と同時に導入する将来課題である。letter送信は
+pane/mailbox単位の認可と誤解してはなりません。letter送信は
 2026-08-05のuser指示 (「手紙を出す機能を復活させる」) により、identity gateを
 待たず `POST /api/letters` として導入済み — 認可はprocessに足さず、TCP面は
 `AGENT_TALK_HTTP_ADDR` を明示設定したときだけ開き (既定off)、その到達範囲は
@@ -146,8 +145,9 @@ paneの表示・解決上のsession名は、herdr自身が持つworkspace **labe
 workspace_idへfallbackする。workspace_idは互換aliasとして解決だけに残す。
 brokerはlabelをread-onlyで消費し、`workspace.rename`を呼ばない。
 
-daemonのメモリを稼働中の唯一の真実とします。登録はdaemon側のpullです —
-health tickごとにsnapshotを読み、agentの載っているpaneを冪等に登録します。
+herdrの成功snapshotをagentの存在・identity・稼働状態・pane位置の唯一の真実とします。
+daemonのメモリとjournalはmessage本文・未配達queue・受領状態だけを所有します。
+sendとmessage RPCの受信時に即時snapshotを読み、待機中はhealth tickごとに同期します。
 互換の`register` commandはherdrの検出と一致する名前だけを受理し（不一致・
 agent不在・snapshot取得不能は拒否）、daemon起動時はsnapshotの取得に成功する
 まで要求を受け付けません。
@@ -157,39 +157,36 @@ pull側の規則:
 
 - 同じpaneのagent名が変わったら旧登録を即座に外して引き継ぐ（native identityに
   猶予は不要。旧登録の残骸は誤配先になる）。
-- snapshotから消えたpaneは即evictせず**suspect**にする — 配送はqueueに留め、
-  当人からのRPCも拒否し、**2回連続の欠落で初めて**登録を外して未受領を回収する。
-  1回の欠落はherdrの検出ラグと区別できないため、その時点で配送やevictを行うと
-  実在する宛先を誤って失う。
+- 成功snapshotから消えたpaneは即evictし、未受領を回収する。API取得失敗は
+  成功snapshot上の欠落ではないため、登録もmessageも変更せず次回へ持ち越す。
 - snapshot取得に失敗した間は判定を進めない（不完全な証拠で消さない）。
+- send・read・ack・peer一覧などidentityを要するmessage RPCは、要求時のsnapshot取得に
+  失敗した場合、古い登録を使わずfail closedでエラーを返す。
 - daemon起動時は要求の受付前にも1回同期する。journalが復元した古いidentityが
   最初のtickまでaddressableだと、旧名宛の呼び鈴をpaneの新しい占有者へ送る
   誤配窓（最大2秒）ができる。
-- 新規メッセージの上限判定は、dispatchのqueue行き条件と同じpredicate
-  （busy・queue残留・suspect）を共有する。busyだけを見ると、suspectの凍結中に
-  queueが上限を素通りして無制限に伸びる。
+- 新規メッセージの上限判定は、dispatchのqueue行き条件（queue残留）と同じ
+  predicateを共有する。
 - 手動`unregister`は拒否する。pullが次tickで登録し直すため、
   受理すると解除→再登録の振動になるだけで、意図した効果を持たない。
 
 配送入口は1つです。
 
 1. 依頼ヘッダと本文をID付きでjournalへ永続化します。
-2. 宛先がbroker上idle（配送待ちでない）なら、`read_message <id>`と
+2. 宛先に先行queueがなく、herdrが配達可能なら、`read_message <id>`と
    `ack_message`を案内する呼び鈴をherdrの`agent.prompt`でagent本人へ
    submitします。herdrが**積極的にidleまたはdoneと判定したpaneにだけ**送り、
    `working`/`blocked`/`unknown`には一文字も送りません（doneは完了出力の
    未閲覧バッジで、配達可能にしないと非表示tab宛がuserの巡回まで滞留する。
    doneへの配達は未閲覧バッジを消して新ターンを始める）。スキル指定時も
    端末へ入るのは、daemonが検証・生成したスキルトークンと固定の呼び鈴だけです。
-3. 宛先がbusyなら、配送待ちqueueへ入れてから`queued (busy)`を返します。
+3. herdrがworking/blocked/unknown、または先行queueがあれば、配送待ちqueueへ
+   入れて`queued (waiting)`を返します。
    **queueが空でない間は宛先がidleでも新規メッセージを直接配達しません**
    （配達失敗でrequeueされた古いメッセージを新規が追い越すFIFOの破れの防止）。
-4. `turn-end`は宛先をidleにし、queue先頭を1件だけ配送してbusyへ戻します。
-   加えて、**idleのままqueueが残っているpaneは2秒間隔のhealth tickが先頭を
-   1件ずつ再配送**します。turn-endの一瞬はherdrの画面検出がまだworkingを
-   返すことがあり、その1回の失敗だけを配送契機にするとメッセージが滞留する
-   ためです。配送の安全境界（busyへ送らない、herdrの配達可能ガード =
-   idle/done）は不変で、検出が追いついた次のtickで同じIDがFIFOのまま流れます。
+4. **queueが残っているpaneは2秒間隔のhealth tickが先頭を1件ずつ再配送**します。
+   hookは使わず、毎回herdrの配達可能ガード（idle/done）を通します。検出が
+   追いついた次のtickで同じIDがFIFOのまま流れます。
 5. `read`は本文を返し、読了だけを記録します（memoryのみ）。受領報告が来るまで
    何度でも読めます。
 6. `ack`は受領報告をjournalへ追記・fsyncしてから、そのメッセージを削除対象に
@@ -198,9 +195,9 @@ pull側の規則:
    新しいメッセージとして作成します。通知は送信元paneごとに1通へ集約し、
    回収した全メッセージのIDと本文を含めます（呼び鈴も送信元あたり1回）。
 8. 配達済みのまま受領報告が1分間ないメッセージには、受領催促の呼び鈴を
-   送ります。催促が出るのはbroker状態がidleで、かつherdrの観測が配達可能
-   （idle/done）のときだけです。読了済みならack、未読なら読むことを促し、
-   同じメッセージへの催促は5分間隔より詰めません。busy中は撃たず、催促の
+   送ります。催促が出るのはherdrの観測が配達可能（idle/done）のときだけです。
+   読了済みならack、未読なら読むことを促し、同じメッセージへの催促は5分間隔
+   より詰めません。working/blocked/unknownには撃たず、催促の
    状態はmemoryのみで再起動後は配達時刻から数え直します。
 
 ## 永続化の不変条件
@@ -213,11 +210,11 @@ journal（tmux socket名で命名）がちょうど1つ残っていて新名の 
 新規開始もせず起動を失敗させます（新しい空journalはIDを再利用して
 しまうため、手動でのrenameを求めます）。
 
-- `sent`または`queued (busy)`を返す前に本文のappendと`fsync`を完了する。
+- `sent`または`queued (waiting)`を返す前に本文のappendと`fsync`を完了する。
 - journal書き込みに失敗したメッセージを配達済み・queuedとして報告しない。
 - daemon再起動時に未受領本文と未配達queueを復元する。
 - 受領報告済み（Acked）かつ配送待ちqueueにない本文だけをcheckpointで圧縮消滅させる。
-  読んだだけの本文は消さない。queue内の本文はAckedでも、後続の`turn-end`配送まで
+  読んだだけの本文は消さない。queue内の本文はAckedでも、後続のtick配送まで
   保持する。保持と可視性を同じ1つの真偽値で判定しない。
 - checkpointの発火は、総レコード数ではなく**前回checkpoint以降に追記した
   レコード数**（256件）で判定する。総数で判定すると、圧縮後のsnapshot自体が
@@ -274,9 +271,9 @@ IDを失ったとき、本文が残っていても受け手自身が再発見で
 
 受領報告を忘れてもメッセージは残ります（誤削除より安全側）。自動では削除しま
 せんが、放置もしません: 配達済みのまま受領報告が1分間ないメッセージには、宛先が
-broker状態がidleで、かつherdrの観測が配達可能（idle/done）のときだけdaemonが
+herdrの観測が配達可能（idle/done）のときだけdaemonが
 受領催促の呼び鈴を送ります。読了済みならack、未読なら読むことを促し、pane単位で
-1回の呼び鈴に集約し、同じメッセージへは5分間隔より詰めません。busy中は撃たず、催促は新しいメッセージを作りません（催促自体が受領報告の
+1回の呼び鈴に集約し、同じメッセージへは5分間隔より詰めません。working/blocked/unknownには撃たず、催促は新しいメッセージを作りません（催促自体が受領報告の
 対象になる再帰を避けるため）。催促タイマーはmemoryのみで、restart後は配達時刻
 から数え直します。
 

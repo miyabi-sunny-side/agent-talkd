@@ -15,8 +15,6 @@ pub const GLOBAL: &str = r"agent-talk: herdr 上の対話エージェント同�
   agent-talk mailbox-list <mailbox> [--after <id>] [--limit <n>]
   agent-talk register <name>
   agent-talk unregister
-  agent-talk busy | idle
-  agent-talk turn-end
   agent-talk who
   agent-talk gc
   agent-talk resolve <addr>
@@ -50,18 +48,6 @@ pub const COMMANDS: &[CommandHelp] = &[
     CommandHelp {
         command: "unregister",
         text: "usage: agent-talk unregister\n\n現在のpaneのagent登録を解除します。",
-    },
-    CommandHelp {
-        command: "busy",
-        text: "usage: agent-talk busy\n\n現在のpaneをbusy状態にします。",
-    },
-    CommandHelp {
-        command: "idle",
-        text: "usage: agent-talk idle\n\n現在のpaneをidle状態にします。",
-    },
-    CommandHelp {
-        command: "turn-end",
-        text: "usage: agent-talk turn-end\n\n現在のpaneのturn終了を通知します。",
     },
     CommandHelp {
         command: "who",
@@ -163,9 +149,6 @@ mod tests {
             "run",
             "register",
             "unregister",
-            "busy",
-            "idle",
-            "turn-end",
             "who",
             "gc",
             "watch",
@@ -187,6 +170,12 @@ mod tests {
         assert_eq!(COMMANDS.len(), expected.len());
         for command in expected {
             assert!(is_known(command), "missing help entry: {command}");
+        }
+        for removed in ["busy", "idle", "turn-end"] {
+            assert!(
+                !is_known(removed),
+                "hook state command remains public: {removed}"
+            );
         }
     }
 }

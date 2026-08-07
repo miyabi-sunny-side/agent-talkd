@@ -33,7 +33,7 @@ use crate::{
     backend::{Backend, PaneInfo},
     config::{Config, is_safe_token},
     help,
-    herdr::Herdr,
+    herdr::{AgentStatus, Herdr},
     journal::{Journal, Record},
     protocol::{Request, Response, SendOptions},
     state::{
@@ -156,7 +156,7 @@ impl SendReport {
             Self::Text => match path {
                 SendPath::Sent => Response::ok(format!("sent -> {pane} ({addr}): #{id}\n")),
                 SendPath::Queued => {
-                    Response::ok(format!("queued (busy) -> {pane} ({addr}): #{id}\n"))
+                    Response::ok(format!("queued (waiting) -> {pane} ({addr}): #{id}\n"))
                 }
             },
             Self::Json => Response::ok(format!(
@@ -317,7 +317,6 @@ pub async fn run(config: Config) -> Result<()> {
         backend: backend.clone(),
         config,
         pane_resolver: crate::procid::resolve_from_peer,
-        herdr_misses: std::collections::HashMap::new(),
     };
     broker.startup().await?;
     info!(source = "daemon", "started");
@@ -986,9 +985,6 @@ struct Broker {
     config: Config,
     /// peer PID → pane identity の解決関数。test では表引きに差し替える。
     pane_resolver: fn(i32, &Path) -> std::result::Result<String, String>,
-    /// herdr pull 同期の欠落 counter (pane → 連続欠落回数、memory のみ)。
-    /// 成功 snapshot で識別が確認できるたびに 0 へ戻る。
-    herdr_misses: std::collections::HashMap<String, u8>,
 }
 
 impl Broker {
@@ -1030,7 +1026,7 @@ impl Broker {
             if let Some(agent) = self.state.agents.get(&pane.pane_id) {
                 agents.push(WebAgent {
                     name: agent.name.clone(),
-                    state: agent.state,
+                    state: display_state(pane.status),
                     pane_id: pane.pane_id,
                     session: pane.session.clone(),
                     location: format!("{}:{}.{}", pane.session, pane.window_index, pane.pane_index),
@@ -1129,16 +1125,21 @@ impl Broker {
     }
 
     async fn handle(&mut self, request: Request) -> Response {
+        let command = canonical_command(&request.command).to_owned();
+        if matches!(
+            command.as_str(),
+            "send" | "send-v2" | "send-message" | "read-message" | "ack-message" | "list-peers"
+        ) && let Err(error) = self.refresh_herdr_registry().await
+        {
+            return Response::error(format!("herdr snapshot を取得できません: {error}"));
+        }
         let request = match self.attach_caller_pane(request) {
             Ok(request) => request,
             Err(response) => return response,
         };
-        let result = match canonical_command(&request.command) {
+        let result = match command.as_str() {
             "register" => self.register(request).await,
             "unregister" => Ok(Self::unregister(&request)),
-            "busy" => self.change_state(request.pane, AgentState::Busy, "hook"),
-            "idle" => self.change_state(request.pane, AgentState::Idle, "hook"),
-            "turn-end" => self.turn_end(request.pane).await,
             "who" => self.who(&request).await,
             "resolve" => self.resolve_command(request).await,
             "send" if request.send_options.is_none() => self.send(request, SendReport::Text).await,
@@ -1257,13 +1258,7 @@ impl Broker {
             )));
         }
         match self.state.agents.get(&pane) {
-            Some(agent) if agent.name == *name => {
-                // pull 同期が登録済み。冪等成功にし、識別の確認として suspect を解く。
-                self.herdr_misses.remove(&pane);
-                if let Some(agent) = self.state.agents.get_mut(&pane) {
-                    agent.suspect = false;
-                }
-            }
+            Some(agent) if agent.name == *name => {}
             Some(_) => {
                 // 交代: pull 同期の takeover と同じ経路 (回収が durable になってから登録)。
                 if !self
@@ -1294,61 +1289,16 @@ impl Broker {
         )
     }
 
-    fn change_state(
-        &mut self,
-        pane: Option<String>,
-        state: AgentState,
-        source: &'static str,
-    ) -> Result<Response> {
-        let Some(pane) = pane else {
-            return Ok(Response::ok(""));
-        };
-        self.journal.append(&Record::State {
-            pane: pane.clone(),
-            state,
-        })?;
-        self.state.set_state(&pane, state);
-        info!(%pane, ?state, source, "state changed");
-        Ok(Response::ok(""))
-    }
-
-    async fn turn_end(&mut self, pane: Option<String>) -> Result<Response> {
-        let Some(pane) = pane else {
-            return Ok(Response::ok(""));
-        };
-        self.journal.append(&Record::State {
-            pane: pane.clone(),
-            state: AgentState::Idle,
-        })?;
-        let delivered = match self.deliver_queued_head(&pane, "turn-end").await {
-            Ok(delivered) => delivered,
-            Err(reason) => return Ok(Response::error(reason)),
-        };
-        info!(%pane, source = "turn-end", queued = delivered, "turn ended");
-        Ok(Response::ok(""))
-    }
-
-    /// queue 先頭を1件だけ配達する。turn-end と health tick の再配達が共有する
-    /// 唯一の配送状態遷移 (成功: State Busy → Complete / 失敗: 同 ID requeue +
-    /// State Idle)。呼び出し時点で pane は daemon memory 上 Idle であること。
+    /// queue 先頭を1件だけ配達する。send と health tick の再配達が共有する
+    /// 唯一の queue 配送状態遷移 (成功: Complete / 失敗: 同 ID requeue)。
     /// 返り値は「配達対象があったか」。journal へ書けない場合だけ Err。
     async fn deliver_queued_head(
         &mut self,
         pane: &str,
         source: &'static str,
     ) -> std::result::Result<bool, String> {
-        // suspect 中は配達しない (占有者交代の疑いがある間、誤配の窓を開けない)。
-        if self
-            .state
-            .agents
-            .get(pane)
-            .is_some_and(|agent| agent.suspect)
-        {
-            self.state.set_state(pane, AgentState::Idle);
-            return Ok(false);
-        }
         let message_id = loop {
-            let Some(id) = self.state.turn_end(pane) else {
+            let Some(id) = self.state.take_queued_head(pane) else {
                 break None;
             };
             if self.state.message(id).is_some() {
@@ -1365,19 +1315,10 @@ impl Broker {
             }
         };
         let Some(id) = message_id else {
-            self.state.set_state(pane, AgentState::Idle);
             return Ok(false);
         };
-        if let Err(error) = self.journal.append(&Record::State {
-            pane: pane.to_owned(),
-            state: AgentState::Busy,
-        }) {
-            self.state.requeue_after_delivery_failure(pane, id);
-            return Err(format!("配達状態を journal に書き込めません: {error}"));
-        }
         let Some(stored) = self.state.message(id) else {
             error!(%pane, id, "message body disappeared before delivery");
-            self.state.set_state(pane, AgentState::Idle);
             return Err(format!(
                 "message #{id} の本文が見つからないため配達を中止しました"
             ));
@@ -1388,21 +1329,16 @@ impl Broker {
                 pane: pane.to_owned(),
                 id,
             }) {
+                self.state.requeue_after_delivery_failure(pane, id);
                 return Err(error.to_string());
             }
             self.state.complete_delivery(pane, id);
             info!(%pane, id, source, "delivered");
         } else {
             self.state.requeue_after_delivery_failure(pane, id);
-            // 配達失敗は正常系 (相手が busy 判定など)。次の契機で再試行される。
+            // 配達失敗は正常系 (相手が working 判定など)。次の契機で再試行される。
             // silent にすると診断できないので debug には残す。
             debug!(%pane, id, source, "queued delivery failed; will retry");
-            if let Err(error) = self.journal.append(&Record::State {
-                pane: pane.to_owned(),
-                state: AgentState::Idle,
-            }) {
-                return Err(error.to_string());
-            }
         }
         Ok(true)
     }
@@ -1428,7 +1364,6 @@ impl Broker {
         }
         self.state
             .restore_agent(pane.to_owned(), name.to_owned(), AgentState::Idle);
-        self.herdr_misses.remove(pane);
         info!(%pane, %name, source, "registered");
         true
     }
@@ -1439,22 +1374,22 @@ impl Broker {
     /// 現れた数秒後には peer になる。lifecycle は次の3規則:
     /// - **出現** (未登録 pane に identity): 即 pull 登録。idempotent。
     /// - **交代** (登録名と別の identity): 強い証拠なので debounce せず即 takeover —
-    ///   旧登録を回収してから新 identity を登録する。回収の永続化に失敗したら
-    ///   suspect のまま新登録もしない (旧宛の mail を新占有者へ流さない)。
-    /// - **欠落** (pane 消滅 or identity 無し): 1回目で suspect (配達と message RPC
-    ///   caller を遮断)、**成功 snapshot 2連続**で evict。同一 identity が戻れば解除。
+    ///   旧登録を回収してから新 identity を登録する。
+    /// - **欠落** (pane 消滅 or identity 無し): 成功 snapshot を正として即 evict。
     ///   snapshot の RPC 失敗は判定を一切進めない (不完全な証拠で消さない)。
     async fn sync_herdr_registry(&mut self) {
         // 定期 tick は取得失敗で判定を進めない (不完全な証拠で消さない)。
-        let Ok(panes) = self.backend.panes().await else {
-            return;
-        };
+        let _ = self.refresh_herdr_registry().await;
+    }
+
+    async fn refresh_herdr_registry(&mut self) -> Result<()> {
+        let panes = self.backend.panes().await?;
         self.apply_herdr_snapshot(panes).await;
+        Ok(())
     }
 
     async fn apply_herdr_snapshot(&mut self, panes: Vec<PaneInfo>) {
-        // 宛先文法に載らない名前は identity 無しとして扱う (登録もしないし、
-        // 既存登録の pane がその名前に変われば欠落と同じ suspect → evict を辿る)。
+        // 宛先文法に載らない名前は identity 無しとして扱う。
         let detected: std::collections::HashMap<String, Option<String>> = panes
             .into_iter()
             .map(|pane| {
@@ -1469,12 +1404,7 @@ impl Broker {
                 None => {
                     self.register_observed(pane_id, name, "herdr-pull");
                 }
-                Some(agent) if agent.name == *name => {
-                    self.herdr_misses.remove(pane_id);
-                    if let Some(agent) = self.state.agents.get_mut(pane_id) {
-                        agent.suspect = false;
-                    }
-                }
+                Some(agent) if agent.name == *name => {}
                 Some(_) => {
                     // 交代: 旧登録の回収が durable になった後にだけ新 identity を登録。
                     // Register の append に失敗しても旧登録は既に消えており、
@@ -1484,16 +1414,12 @@ impl Broker {
                         .await
                     {
                         self.register_observed(pane_id, name, "herdr-pull");
-                    } else if let Some(agent) = self.state.agents.get_mut(pane_id) {
-                        // 回収を永続化できない間は疑い扱いのまま次 tick で再試行。
-                        agent.suspect = true;
                     }
                 }
             }
         }
-        // 欠落 (登録済み pane が identity 付きで見えない)。旧 journal から
-        // 復元された herdr 文法に載らない登録 (撤去済み tmux の `%N` 等) も
-        // ここに落ち、同じ suspect → evict で退役する。
+        // 欠落 (登録済み pane が identity 付きで見えない)。成功 snapshot は
+        // herdr の現在そのものなので debounce せず即 evict する。
         let missing: Vec<String> = self
             .state
             .agents
@@ -1501,42 +1427,21 @@ impl Broker {
             .filter(|pane| detected.get(*pane).is_none_or(Option::is_none))
             .cloned()
             .collect();
-        // まず欠落した全 pane を suspect にしてから evict する。同 tick で
-        // 送信元と宛先が同時に欠落した場合、evict 側の未受領回収通知は
-        // 送信元の suspect を見て queue に退避する — 処理順が map の順序に
-        // 依存すると、先に evict された側の通知が silent に落ちる。
-        let mut evictions = Vec::new();
         for pane in missing {
-            let misses = self.herdr_misses.entry(pane.clone()).or_insert(0);
-            *misses = misses.saturating_add(1);
-            if *misses >= 2 {
-                evictions.push(pane.clone());
-            }
-            if let Some(agent) = self.state.agents.get_mut(&pane) {
-                agent.suspect = true;
-            }
-        }
-        for pane in evictions {
-            if self.remove_agent(&pane, "宛先エージェントが退出した").await {
-                self.herdr_misses.remove(&pane);
-            }
-            // remove の永続化に失敗した場合は suspect のまま次 tick で再試行。
+            self.remove_agent(&pane, "宛先エージェントが退出した").await;
         }
     }
 
-    /// Idle のまま queue が残っている pane の先頭を、health tick ごとに拾い直す。
+    /// queue が残っている pane の先頭を、health tick ごとに拾い直す。
     ///
-    /// turn-end の一瞬は herdr の画面検出がまだ working を返すことがあり、
-    /// その1回の失敗で再契機が無いと message が滞留する。idle の正の証拠が
+    /// 送信時に herdr が working を返した message を保持し、idle の正の証拠が
     /// 次に得られた時点 (最大 tick 間隔 + API 時間) で同じ ID を再配達する。
     async fn drain_queued(&mut self) {
         let candidates: Vec<String> = self
             .state
             .agents
             .iter()
-            .filter(|(_, agent)| {
-                agent.state == AgentState::Idle && !agent.queue.is_empty() && !agent.suspect
-            })
+            .filter(|(_, agent)| !agent.queue.is_empty())
             .map(|(pane, _)| pane.clone())
             .collect();
         for pane in candidates {
@@ -1549,8 +1454,7 @@ impl Broker {
     async fn who(&self, request: &Request) -> Result<Response> {
         let panes = self.backend.panes().await?;
         let mut output = String::new();
-        // herdr 自身が持つ状態を併記する
-        // (agent-talkd の hook 由来の状態より信頼できる場面がある)。
+        // herdr 自身が持つ状態を、表示用の idle/busy と生値で併記する。
         // backend 列は tmux 併存期の名残だが、表を読む既存クライアントを
         // 壊さないため列自体は残す (値は常に herdr)。
         for pane in &panes {
@@ -1559,7 +1463,11 @@ impl Broker {
                     output,
                     "{:<10} {:<11} {:<5} {}:{}.{} ({})  {}",
                     agent.name,
-                    format!("{}/{}", agent.state.as_str(), pane.status.as_str()),
+                    format!(
+                        "{}/{}",
+                        display_state(pane.status).as_str(),
+                        pane.status.as_str()
+                    ),
                     "herdr",
                     pane.session,
                     pane.window_index,
@@ -1674,8 +1582,7 @@ impl Broker {
                 "本文がサイズ上限 ({MAX_BODY_BYTES} bytes) を超えています"
             )));
         }
-        // dispatch と同じ predicate (`defers_delivery`) で判定する。busy だけを
-        // 見ると、suspect や queue 残留で queue 行きになる送信が上限を素通りする。
+        // dispatch と同じ predicate (`defers_delivery`) で判定する。
         if self
             .state
             .agents
@@ -1750,9 +1657,6 @@ impl Broker {
                 }
                 let Some(stored) = self.state.message(id) else {
                     error!(%pane, id, "new message body missing before persistence");
-                    if matches!(dispatch, Dispatch::Deliver(_)) {
-                        self.state.set_state(&pane, AgentState::Idle);
-                    }
                     self.state.discard_message(id);
                     return Ok(Response::error(format!(
                         "message #{id} の本文が見つからないため配達を中止しました"
@@ -1780,9 +1684,6 @@ impl Broker {
                         event: event.clone(),
                     })
                 {
-                    if matches!(dispatch, Dispatch::Deliver(_)) {
-                        self.state.set_state(&pane, AgentState::Idle);
-                    }
                     self.state.discard_message(id);
                     return Ok(Response::error(format!(
                         "mailbox journal に書き込めず配達を続行できません: {error}"
@@ -1797,9 +1698,6 @@ impl Broker {
                     retires: None,
                     also_retires: Vec::new(),
                 }) {
-                    if matches!(dispatch, Dispatch::Deliver(_)) {
-                        self.state.set_state(&pane, AgentState::Idle);
-                    }
                     self.state.discard_message(id);
                     return Ok(Response::error(format!(
                         "本文を journal に書き込めず配達できません: {error}"
@@ -1809,28 +1707,22 @@ impl Broker {
                     info!(%pane, id, source = "send", "queued");
                     return Ok(report.accepted(SendPath::Queued, id, &pane, addr, &expected));
                 }
-                if let Err(error) = self.journal.append(&Record::State {
-                    pane: pane.clone(),
-                    state: AgentState::Busy,
-                }) {
-                    self.state.set_state(&pane, AgentState::Idle);
-                    return Ok(Response::error(format!(
-                        "配達状態を書き込めず配達できません (#{id}): {error}"
-                    )));
-                }
                 let Some(stored) = self.state.message(id) else {
                     error!(%pane, id, "persisted message body missing before delivery");
-                    self.state.set_state(&pane, AgentState::Idle);
                     return Ok(Response::error(format!(
                         "message #{id} の本文が見つからないため配達を中止しました"
                     )));
                 };
                 let bell = stored.message.bell.clone();
                 if self.backend.deliver(&pane, &bell).await.is_ok() {
-                    self.journal.append(&Record::Complete {
+                    if let Err(error) = self.journal.append(&Record::Complete {
                         pane: pane.clone(),
                         id,
-                    })?;
+                    }) {
+                        warn!(%error, %pane, id, "cannot complete delivery; it will be retried");
+                        self.state.requeue_after_delivery_failure(&pane, id);
+                        return Ok(report.accepted(SendPath::Queued, id, &pane, addr, &expected));
+                    }
                     self.state.complete_delivery(&pane, id);
                     info!(%pane, id, source = "send", "delivered");
                     Ok(report.accepted(SendPath::Sent, id, &pane, addr, &expected))
@@ -1841,7 +1733,6 @@ impl Broker {
                         .await
                         .is_ok_and(|panes| panes.iter().any(|item| item.pane_id == pane));
                     if !target_is_live {
-                        self.state.set_state(&pane, AgentState::Idle);
                         // 配達不能な terminal tombstone。受領報告待ちにはしない。
                         self.journal.append(&Record::Consumed { id })?;
                         self.state.ack(id);
@@ -1851,14 +1742,6 @@ impl Broker {
                         )));
                     }
                     self.state.requeue_after_delivery_failure(&pane, id);
-                    if let Err(error) = self.journal.append(&Record::State {
-                        pane: pane.clone(),
-                        state: AgentState::Idle,
-                    }) {
-                        return Ok(Response::error(format!(
-                            "配達状態を書き込めず配達できません (message #{id}): {error}"
-                        )));
-                    }
                     Ok(report.accepted(SendPath::Queued, id, &pane, addr, &expected))
                 }
             }
@@ -1873,14 +1756,7 @@ impl Broker {
     /// daemon は単一の event loop で1リクエストを最後まで処理するため、この判定と
     /// 後続の操作の間に他のリクエストが割り込むことはない。
     fn caller_is_registered(&self, pane: Option<&str>) -> bool {
-        // suspect (herdr の検出が途切れた疑い) の pane は、占有者が入れ替わって
-        // いる可能性があるため message RPC を一時的に受けない (他人のメール読みの遮断)。
-        pane.is_some_and(|pane| {
-            self.state
-                .agents
-                .get(pane)
-                .is_some_and(|agent| !agent.suspect)
-        })
+        pane.is_some_and(|pane| self.state.agents.contains_key(pane))
     }
 
     /// `read` / `ack` が共有する宛先・配達状態の検査
@@ -1990,7 +1866,7 @@ impl Broker {
                 let agent = self.state.agents.get(&pane.pane_id)?;
                 Some(serde_json::json!({
                     "name": agent.name,
-                    "state": agent.state,
+                    "state": display_state(pane.status),
                     "location": format!("{}:{}.{}", pane.session, pane.window_index, pane.pane_index),
                     "pane": pane.pane_id,
                     "cwd": pane.cwd,
@@ -2225,7 +2101,7 @@ impl Broker {
                     "agent-talk: 宛先 '{addr}' の候補が複数あります。<scope>/<name> で指定してください:\n"
                 );
                 for (pane, agent) in candidates {
-                    stderr.push_str(&pretty(agent.name.as_str(), agent.state, pane));
+                    stderr.push_str(&pretty(agent.name.as_str(), pane));
                 }
                 Err(Response {
                     code: 1,
@@ -2240,7 +2116,7 @@ impl Broker {
         let mut output = String::new();
         for pane in panes {
             if let Some(agent) = self.state.agents.get(&pane.pane_id) {
-                output.push_str(&pretty(&agent.name, agent.state, pane));
+                output.push_str(&pretty(&agent.name, pane));
             }
         }
         output
@@ -2284,14 +2160,6 @@ impl Broker {
                 .push(message);
         }
         for (sender, originals) in groups {
-            // suspect の送信元は snapshot に一瞬映らないだけかもしれない。
-            // 通知は捨てず queue へ入れる (dispatch が suspect を Queued にする) —
-            // 復帰すれば drain が届け、evict されれば通知ごと terminal に退役する。
-            let sender_suspect = self
-                .state
-                .agents
-                .get(&sender)
-                .is_some_and(|agent| agent.suspect);
             // `human` / `system` は registry の key に現れないので、
             // 登録の有無だけで pane 送信者かどうかが決まる。
             let sender_target = self
@@ -2304,10 +2172,9 @@ impl Broker {
                     // (`pane_backs_registration`) — 占有者が入れ替わった pane へ
                     // 旧名宛て通知を送らない。
                     Some(sender.as_str()) != excluded_pane
-                        && (sender_suspect
-                            || panes.iter().any(|pane| {
-                                pane.pane_id == sender && pane_backs_registration(pane, expected)
-                            }))
+                        && panes.iter().any(|pane| {
+                            pane.pane_id == sender && pane_backs_registration(pane, expected)
+                        })
                 });
             let Some(expected) = sender_target else {
                 // 通知先が居ない場合も、残った `Pending` を terminal `Acked` にする。
@@ -2398,13 +2265,16 @@ impl Broker {
         true
     }
 
-    /// 配達済みのまま受領報告が無い message について、宛先が broker 上 idle
-    /// かつ herdr の観測が配達可能 (idle/done) のときだけ受領催促の呼び鈴を送る。
+    /// 配達済みのまま受領報告が無い message について、herdr の観測が
+    /// 配達可能 (idle/done) のときだけ受領催促の呼び鈴を送る。
     /// 催促は message を新規作成しない
     /// (催促自体が受領報告の対象になる再帰を避ける)。
     /// タイマーは memory のみで、restart 後は配達時刻から数え直す。
     async fn nag_unacked(&mut self) {
         let now = tokio::time::Instant::now();
+        let Ok(panes) = self.backend.panes().await else {
+            return;
+        };
         // pane ごとに1回の呼び鈴へ集約する: (id, 読了済みか) の列。
         let mut due: BTreeMap<String, Vec<(u64, bool)>> = BTreeMap::new();
         for stored in self.state.messages.values() {
@@ -2414,11 +2284,14 @@ impl Broker {
             let Some(agent) = self.state.agents.get(&stored.target_pane) else {
                 continue;
             };
-            // busy 中・identity が変わった pane・suspect の pane には撃たない。
-            if agent.state != AgentState::Idle
-                || agent.name != stored.message.target_name
-                || agent.suspect
-            {
+            if agent.name != stored.message.target_name {
+                continue;
+            }
+            if !panes.iter().any(|pane| {
+                pane.pane_id == stored.target_pane
+                    && pane_backs_registration(pane, &stored.message.target_name)
+                    && pane.status.accepts_delivery()
+            }) {
                 continue;
             }
             let Some(delivered_at) = stored.delivered_at else {
@@ -2438,25 +2311,7 @@ impl Broker {
         }
         for (pane, items) in due {
             let bell = nag_bell(&items);
-            // 通常配達と同じく、鍵盤へ触れる前に Busy を永続化する (steer 安全)。
-            if let Err(error) = self.journal.append(&Record::State {
-                pane: pane.clone(),
-                state: AgentState::Busy,
-            }) {
-                warn!(%error, %pane, "cannot persist nag state; skipping reminder");
-                continue;
-            }
-            self.state.set_state(&pane, AgentState::Busy);
             let delivered = self.backend.deliver(&pane, &bell).await.is_ok();
-            if !delivered {
-                self.state.set_state(&pane, AgentState::Idle);
-                if let Err(error) = self.journal.append(&Record::State {
-                    pane: pane.clone(),
-                    state: AgentState::Idle,
-                }) {
-                    warn!(%error, %pane, "cannot restore state after failed reminder");
-                }
-            }
             // 失敗時も cooldown は消費する。2秒ごとの health tick で連打しない。
             for (id, _) in &items {
                 if let Some(stored) = self.state.messages.get_mut(id) {
@@ -2471,30 +2326,18 @@ impl Broker {
     }
 
     /// 永続化前に作りかけた通知を in-memory から取り消す。
-    fn rollback_notice(&mut self, sender: &str, id: u64, dispatch: Dispatch) {
-        if matches!(dispatch, Dispatch::Deliver(_)) {
-            self.state.set_state(sender, AgentState::Idle);
-        }
+    fn rollback_notice(&mut self, _sender: &str, id: u64, _dispatch: Dispatch) {
         self.state.discard_message(id);
     }
 
-    /// durable な通知を配達する。失敗しても通知は queue に残り、次の turn-end で鳴る。
+    /// durable な通知を配達する。失敗しても通知は queue に残り、次の tick で鳴る。
     /// **新しい通知は作らない。**
     async fn deliver_notice(&mut self, sender: &str, id: u64, dispatch: Dispatch) {
         if !matches!(dispatch, Dispatch::Deliver(_)) {
             return;
         }
-        if let Err(error) = self.journal.append(&Record::State {
-            pane: sender.to_owned(),
-            state: AgentState::Busy,
-        }) {
-            warn!(%error, id, "cannot persist notice delivery state; leaving it queued");
-            self.state.requeue_after_delivery_failure(sender, id);
-            return;
-        }
         let Some(stored) = self.state.message(id) else {
             error!(id, "failure notification body missing before delivery");
-            self.state.set_state(sender, AgentState::Idle);
             return;
         };
         let bell = stored.message.bell.clone();
@@ -2505,17 +2348,12 @@ impl Broker {
             }) {
                 // journal 上は未配達のまま。再起動後に同じ通知が再配達される。
                 warn!(%error, id, "cannot complete notice delivery; it will be retried");
+                self.state.requeue_after_delivery_failure(sender, id);
                 return;
             }
             self.state.complete_delivery(sender, id);
         } else {
             self.state.requeue_after_delivery_failure(sender, id);
-            if let Err(error) = self.journal.append(&Record::State {
-                pane: sender.to_owned(),
-                state: AgentState::Idle,
-            }) {
-                warn!(%error, id, "cannot requeue notice; it stays queued in the journal");
-            }
         }
     }
 
@@ -2561,10 +2399,18 @@ fn format_ids(ids: &[u64]) -> String {
         .join(" ")
 }
 
-fn pretty(name: &str, state: AgentState, pane: &PaneInfo) -> String {
+fn display_state(status: AgentStatus) -> AgentState {
+    if status.accepts_delivery() {
+        AgentState::Idle
+    } else {
+        AgentState::Busy
+    }
+}
+
+fn pretty(name: &str, pane: &PaneInfo) -> String {
     format!(
         "{name:<10} {:<5} {}:{}.{} ({})  {}\n",
-        state.as_str(),
+        display_state(pane.status).as_str(),
         pane.session,
         pane.window_index,
         pane.pane_index,
@@ -2794,7 +2640,6 @@ mod tests {
         Broker {
             state,
             journal,
-            herdr_misses: std::collections::HashMap::new(),
             pane_resolver: |_, _| Err("tests は pane_resolver を明示注入する".to_owned()),
             backend: Backend::scripted(panes),
             config: Config {
@@ -2837,7 +2682,6 @@ mod tests {
             let mut legacy = Broker {
                 state,
                 journal,
-                herdr_misses: std::collections::HashMap::new(),
                 pane_resolver: |_, _| Err("tests は pane_resolver を明示注入する".to_owned()),
                 backend: Backend::scripted(vec![
                     pane_info("w1:p1", Some("codex")),
@@ -3109,14 +2953,14 @@ mod tests {
         assert_eq!(sent["to"], "w1:p2");
         assert_eq!(sent["name"], "claude");
 
-        let queued = json(
+        let second = json(
             &broker
                 .handle(send_request("w1:p1", "claude", "second"))
                 .await,
         );
-        assert_eq!(queued["version"], 1);
-        assert_eq!(queued["path"], "queued");
-        assert!(queued["id"].as_u64().unwrap() > sent["id"].as_u64().unwrap());
+        assert_eq!(second["version"], 1);
+        assert_eq!(second["path"], "sent");
+        assert!(second["id"].as_u64().unwrap() > sent["id"].as_u64().unwrap());
     }
 
     #[tokio::test]
@@ -3295,7 +3139,7 @@ mod tests {
             broker.state.message(original).unwrap().acked,
             "通知が durable になった時点で original は退役している"
         );
-        // 配達に失敗した通知は queue に残り、送信者の次の turn-end で鳴る。
+        // 配達に失敗した通知は queue に残り、次の health tick で再試行する。
         assert!(broker.state.agents["w1:p1"].queue.len() == 1);
 
         for _ in 0..3 {
@@ -3496,12 +3340,11 @@ mod tests {
         let id = json(&broker.handle(send_request("w1:p1", "claude", "body")).await)["id"]
             .as_u64()
             .unwrap();
-        // 配達済み → %2 が読んだが ack せず turn を終えた。
+        // 配達済み → %2 が読んだが ack しない。
         let read = broker
             .handle(request("read-message", Some("w1:p2"), &[&id.to_string()]))
             .await;
         assert_eq!(read.code, 0, "{}", read.stderr);
-        broker.turn_end(Some("w1:p2".into())).await.unwrap();
 
         let before = bells(&broker).len();
         broker.nag_unacked().await;
@@ -3521,15 +3364,9 @@ mod tests {
             bell.contains("読まれたまま") && bell.contains("ack_message"),
             "読了済みには ack を促す: {bell}"
         );
-        assert!(
-            broker.state.is_busy("w1:p2"),
-            "催促も通常配達と同じく Busy を先に立てる"
-        );
-
-        // busy の間も、idle へ戻って cooldown 中も、追い討ちしない。
+        // cooldown 中は追い討ちしない。
         tokio::time::advance(std::time::Duration::from_secs(61)).await;
         broker.nag_unacked().await;
-        broker.turn_end(Some("w1:p2".into())).await.unwrap();
         broker.nag_unacked().await;
         assert_eq!(
             bells(&broker).len(),
@@ -3543,7 +3380,6 @@ mod tests {
         assert_eq!(bells(&broker).len(), before + 2);
 
         // ack すれば止まる。
-        broker.turn_end(Some("w1:p2".into())).await.unwrap();
         let acked = broker
             .handle(request("ack-message", Some("w1:p2"), &[&id.to_string()]))
             .await;
@@ -3554,21 +3390,37 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn an_unread_message_is_nagged_to_read_and_a_busy_target_is_left_alone() {
+    async fn an_unread_message_is_nagged_to_read_and_a_working_target_is_left_alone() {
         let dir = tempfile::tempdir().unwrap();
         let mut broker = registered_pair(&dir).await;
         let id = json(&broker.handle(send_request("w1:p1", "claude", "body")).await)["id"]
             .as_u64()
             .unwrap();
 
-        // 配達直後の %2 は Busy のまま。催促は撃たれない。
+        set_herdr_panes(
+            &broker,
+            vec![
+                pane_info("w1:p1", Some("codex")),
+                HerdrPane {
+                    status: AgentStatus::Working,
+                    ..pane_info("w1:p2", Some("claude"))
+                },
+            ],
+        );
+        // herdr が working の間は催促しない。
         let before = bells(&broker).len();
         tokio::time::advance(std::time::Duration::from_mins(2)).await;
         broker.nag_unacked().await;
-        assert_eq!(bells(&broker).len(), before, "busy 中は催促しない");
+        assert_eq!(bells(&broker).len(), before, "working 中は催促しない");
 
-        // idle に戻ると未読向けの文言で催促される。
-        broker.turn_end(Some("w1:p2".into())).await.unwrap();
+        // herdr が idle に戻ると未読向けの文言で催促される。
+        set_herdr_panes(
+            &broker,
+            vec![
+                pane_info("w1:p1", Some("codex")),
+                pane_info("w1:p2", Some("claude")),
+            ],
+        );
         broker.nag_unacked().await;
         let after: Vec<_> = bells(&broker)[before..].to_vec();
         assert_eq!(after.len(), 1);
@@ -3747,7 +3599,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_flapping_herdr_detection_suspects_then_evicts() {
+    async fn a_successful_snapshot_evicts_a_missing_agent_immediately() {
         let dir = tempfile::tempdir().unwrap();
         let mut broker = registered_pair(&dir).await;
         set_herdr_panes(
@@ -3766,53 +3618,78 @@ mod tests {
         );
         let pending_id = sent["id"].as_u64().unwrap();
 
-        // 欠落1回目: suspect — 登録は残るが、配達も message RPC も止まる。
+        // 成功 snapshot から消えた時点で退出確定。pen-cli が同じ space を
+        // 高速再作成しても、古い宛先を次 tick まで残さない。
         set_herdr_panes(
             &broker,
             vec![pane_info("w1:p1", Some("codex")), pane_info("w1:p7", None)],
         );
-        broker.sync_herdr_registry().await;
-        assert!(
-            broker.state.agents.contains_key("w1:p7"),
-            "1回の欠落では消えない"
-        );
-        assert!(broker.state.agents["w1:p7"].suspect);
-        let refused = broker
-            .handle(request("read-message", Some("w1:p7"), &["1"]))
-            .await;
-        assert!(
-            refused.stderr.contains("登録済みのagent pane"),
-            "suspect 中の caller は message RPC を使えない: {}",
-            refused.stderr
-        );
-        let before = bells(&broker).len();
-        broker.drain_queued().await;
-        assert_eq!(bells(&broker).len(), before, "suspect 中は配達しない");
-
-        // 同一 identity が戻れば解除、mail は無傷。
-        set_herdr_panes(
-            &broker,
-            vec![
-                pane_info("w1:p1", Some("codex")),
-                pane_info("w1:p7", Some("grok")),
-            ],
-        );
-        broker.sync_herdr_registry().await;
-        assert!(!broker.state.agents["w1:p7"].suspect);
-        assert!(!broker.state.message(pending_id).unwrap().acked);
-
-        // 2連続の欠落で evict + 集約回収。
-        set_herdr_panes(
-            &broker,
-            vec![pane_info("w1:p1", Some("codex")), pane_info("w1:p7", None)],
-        );
-        broker.sync_herdr_registry().await;
         broker.sync_herdr_registry().await;
         assert!(!broker.state.agents.contains_key("w1:p7"));
         assert_eq!(
             notices_for(&broker, pending_id),
             1,
             "未受領は送信元へ回収通知される"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_send_rechecks_herdr_and_delivers_without_turn_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut broker = registered_pair(&dir).await;
+
+        let first = json(
+            &broker
+                .handle(send_request("w1:p1", "claude", "first"))
+                .await,
+        );
+        let second = json(
+            &broker
+                .handle(send_request("w1:p1", "claude", "second"))
+                .await,
+        );
+
+        assert_eq!(first["path"], "sent");
+        assert_eq!(second["path"], "sent", "herdr は引き続き idle");
+        let delivered = bells(&broker);
+        assert_eq!(delivered.len(), 2, "hook を待たず2通ともpromptする");
+        assert!(delivered[0].1.contains("read_message 0"), "{delivered:?}");
+        assert!(delivered[1].1.contains("read_message 1"), "{delivered:?}");
+    }
+
+    #[tokio::test]
+    async fn a_waiting_target_still_honors_the_queue_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut broker = registered_pair(&dir).await;
+        broker.config.queue_limit = 1;
+        set_herdr_panes(
+            &broker,
+            vec![
+                pane_info("w1:p1", Some("codex")),
+                HerdrPane {
+                    status: AgentStatus::Working,
+                    ..pane_info("w1:p2", Some("claude"))
+                },
+            ],
+        );
+
+        let first = json(
+            &broker
+                .handle(send_request("w1:p1", "claude", "first"))
+                .await,
+        );
+        assert_eq!(first["path"], "queued");
+        let journal_before = std::fs::read(&broker.config.journal).unwrap();
+
+        let second = broker
+            .handle(send_request("w1:p1", "claude", "second"))
+            .await;
+        assert!(second.stderr.contains("キュー保持上限"), "{second:?}");
+        assert_eq!(broker.state.queue_len("w1:p2"), 1);
+        assert_eq!(
+            std::fs::read(&broker.config.journal).unwrap(),
+            journal_before,
+            "拒否した message を journal に追記しない"
         );
     }
 
@@ -3845,7 +3722,6 @@ mod tests {
         );
         broker.sync_herdr_registry().await;
         assert_eq!(broker.state.agents["w1:p7"].name, "gemini");
-        assert!(!broker.state.agents["w1:p7"].suspect);
         assert_eq!(
             notices_for(&broker, pending_id),
             1,
@@ -3871,7 +3747,6 @@ mod tests {
             broker.sync_herdr_registry().await;
         }
         assert!(broker.state.agents.contains_key("w1:p7"));
-        assert!(!broker.state.agents["w1:p7"].suspect);
     }
 
     #[tokio::test]
@@ -3894,48 +3769,6 @@ mod tests {
             broker.state.agents["w1:p7"].name, "gemini",
             "受付開始前に snapshot と同期し、最初の tick までの誤配窓を作らない"
         );
-    }
-
-    #[tokio::test]
-    async fn a_suspect_target_still_honors_the_queue_limit() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut broker = registered_pair(&dir).await;
-        broker.config.queue_limit = 1;
-        set_herdr_panes(
-            &broker,
-            vec![
-                pane_info("w1:p1", Some("codex")),
-                pane_info("w1:p7", Some("grok")),
-            ],
-        );
-        broker.sync_herdr_registry().await;
-        set_herdr_panes(
-            &broker,
-            vec![pane_info("w1:p1", Some("codex")), pane_info("w1:p7", None)],
-        );
-        broker.sync_herdr_registry().await;
-        assert!(broker.state.agents["w1:p7"].suspect);
-
-        let first = broker
-            .handle(send_request("w1:p1", "w1:p7", "queued"))
-            .await;
-        assert_eq!(first.code, 0, "{}", first.stderr);
-        let journal_path = broker.config.journal.clone();
-        let lines = move || {
-            std::fs::read_to_string(&journal_path)
-                .unwrap()
-                .lines()
-                .count()
-        };
-        let before = lines();
-        let second = broker.handle(send_request("w1:p1", "w1:p7", "over")).await;
-        assert!(
-            second.stderr.contains("キュー保持上限"),
-            "suspect 宛でも上限は効く: {}",
-            second.stderr
-        );
-        assert_eq!(lines(), before, "拒否は journal に何も書かない");
-        assert_eq!(broker.state.queue_len("w1:p7"), 1);
     }
 
     #[tokio::test]
@@ -3970,93 +3803,6 @@ mod tests {
             1,
             "herdr の送信元にも回収通知が返る"
         );
-    }
-
-    #[tokio::test]
-    async fn a_suspect_sender_keeps_its_failure_notice_queued_until_recovery() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut broker = registered_pair(&dir).await;
-        set_herdr_panes(
-            &broker,
-            vec![
-                pane_info("w1:p1", Some("codex")),
-                pane_info("w1:p6", Some("grok")),
-                pane_info("w1:p7", Some("gemini")),
-            ],
-        );
-        broker.sync_herdr_registry().await;
-        let sent = json(
-            &broker
-                .handle(send_request("w1:p6", "w1:p7", "question"))
-                .await,
-        );
-        let pending_id = sent["id"].as_u64().unwrap();
-
-        // 宛先が先に1回欠落し、次の tick で送信元も一瞬映らないまま宛先が evict。
-        set_herdr_panes(
-            &broker,
-            vec![pane_info("w1:p6", Some("grok")), pane_info("w1:p7", None)],
-        );
-        broker.sync_herdr_registry().await;
-        set_herdr_panes(&broker, vec![]);
-        broker.sync_herdr_registry().await;
-        assert!(!broker.state.agents.contains_key("w1:p7"));
-        assert!(broker.state.agents["w1:p6"].suspect);
-        assert_eq!(
-            notices_addressed_to(&broker, "w1:p6", pending_id),
-            1,
-            "suspect の送信元宛でも通知を捨てない"
-        );
-        assert_eq!(
-            broker.state.queue_len("w1:p6"),
-            1,
-            "通知は復帰待ちの queue に入る"
-        );
-
-        // 復帰すれば隔離が解けて drain 対象に戻る。通知は queue に残ったまま。
-        set_herdr_panes(&broker, vec![pane_info("w1:p6", Some("grok"))]);
-        broker.sync_herdr_registry().await;
-        assert!(!broker.state.agents["w1:p6"].suspect);
-        assert_eq!(broker.state.queue_len("w1:p6"), 1);
-    }
-
-    #[tokio::test]
-    async fn a_takeover_that_cannot_be_journaled_leaves_the_old_identity_suspect() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut broker = registered_pair(&dir).await;
-        set_herdr_panes(
-            &broker,
-            vec![
-                pane_info("w1:p1", Some("codex")),
-                pane_info("w1:p7", Some("grok")),
-            ],
-        );
-        broker.sync_herdr_registry().await;
-        let sent = json(
-            &broker
-                .handle(send_request("w1:p1", "w1:p7", "for grok"))
-                .await,
-        );
-        let pending_id = sent["id"].as_u64().unwrap();
-
-        // 旧 pending の回収を永続化できない間は、交代を一切進めない。
-        broker.journal.fail_next_appends(10);
-        set_herdr_panes(&broker, vec![pane_info("w1:p7", Some("gemini"))]);
-        broker.sync_herdr_registry().await;
-        assert_eq!(
-            broker.state.agents["w1:p7"].name, "grok",
-            "回収が durable になるまで旧登録が残る"
-        );
-        assert!(
-            broker.state.agents["w1:p7"].suspect,
-            "残った旧登録は隔離される"
-        );
-
-        broker.journal.clear_failpoints();
-        broker.sync_herdr_registry().await;
-        assert_eq!(broker.state.agents["w1:p7"].name, "gemini");
-        assert!(!broker.state.agents["w1:p7"].suspect);
-        assert_eq!(notices_for(&broker, pending_id), 1);
     }
 
     #[tokio::test]
@@ -4138,9 +3884,18 @@ mod tests {
                 .await,
         );
         assert_eq!(first["path"], "sent", "done は配達可能");
-        let first_id = first["id"].as_u64().unwrap();
 
         // drain: queue が残った done pane も health tick が先頭から流す。
+        set_herdr_panes(
+            &broker,
+            vec![
+                pane_info("w1:p1", Some("codex")),
+                HerdrPane {
+                    status: AgentStatus::Working,
+                    ..pane_info("w1:p2", Some("claude"))
+                },
+            ],
+        );
         let second = json(
             &broker
                 .handle(send_request("w1:p1", "claude", "second"))
@@ -4148,8 +3903,10 @@ mod tests {
         );
         assert_eq!(second["path"], "queued");
         let second_id = second["id"].as_u64().unwrap();
-        broker.state.ack(first_id);
-        broker.state.set_state("w1:p2", AgentState::Idle);
+        set_herdr_panes(
+            &broker,
+            vec![pane_info("w1:p1", Some("codex")), done_claude],
+        );
         let before = bells(&broker).len();
         broker.drain_queued().await;
         let drained: Vec<_> = bells(&broker)[before..].to_vec();
@@ -4160,7 +3917,6 @@ mod tests {
         );
 
         // 催促: 配達済み・未 ack の message への nag も done pane に届く。
-        broker.turn_end(Some("w1:p2".into())).await.unwrap();
         tokio::time::advance(std::time::Duration::from_secs(61)).await;
         let before = bells(&broker).len();
         broker.nag_unacked().await;
@@ -4179,7 +3935,6 @@ mod tests {
                 },
             ],
         );
-        broker.turn_end(Some("w1:p2".into())).await.unwrap();
         tokio::time::advance(std::time::Duration::from_mins(6)).await;
         let before = bells(&broker).len();
         broker.nag_unacked().await;
@@ -4190,13 +3945,24 @@ mod tests {
     async fn a_new_send_never_overtakes_the_queue_and_the_tick_drains_it() {
         let dir = tempfile::tempdir().unwrap();
         let mut broker = registered_pair(&dir).await;
-        // send1 で %2 は Busy になり、send2 は queue に入る。
+        set_herdr_panes(
+            &broker,
+            vec![
+                pane_info("w1:p1", Some("codex")),
+                HerdrPane {
+                    status: AgentStatus::Working,
+                    ..pane_info("w1:p2", Some("claude"))
+                },
+            ],
+        );
+        // working 中はsend1/send2ともqueueに入り、FIFOを作る。
         let first = json(
             &broker
                 .handle(send_request("w1:p1", "claude", "first"))
                 .await,
         );
-        assert_eq!(first["path"], "sent");
+        assert_eq!(first["path"], "queued");
+        let first_id = first["id"].as_u64().unwrap();
         let second = json(
             &broker
                 .handle(send_request("w1:p1", "claude", "second"))
@@ -4205,11 +3971,7 @@ mod tests {
         assert_eq!(second["path"], "queued");
         let second_id = second["id"].as_u64().unwrap();
 
-        // 配達失敗後に Idle へ戻った状態 (queue が残ったまま idle) を作る。
-        broker.state.ack(first["id"].as_u64().unwrap());
-        broker.state.set_state("w1:p2", AgentState::Idle);
-
-        // Idle でも queue が残っている間、新規 send は直接配達で追い越さない。
+        // queue が残っている間、新規sendは追い越さない。
         let third = json(
             &broker
                 .handle(send_request("w1:p1", "claude", "third"))
@@ -4221,25 +3983,33 @@ mod tests {
         );
         let third_id = third["id"].as_u64().unwrap();
 
-        // health tick の drain が queue 先頭 (send2) だけを配達する。
+        set_herdr_panes(
+            &broker,
+            vec![
+                pane_info("w1:p1", Some("codex")),
+                pane_info("w1:p2", Some("claude")),
+            ],
+        );
+        // health tick の drain が queue 先頭から1通ずつ配達する。
         let before = bells(&broker).len();
         broker.drain_queued().await;
         let after: Vec<_> = bells(&broker)[before..].to_vec();
         assert_eq!(after.len(), 1, "1 tick で流すのは先頭の1件だけ");
         assert!(
-            after[0].1.contains(&format!("read_message {second_id}")),
-            "先頭 (send2) が先に配達される: {:?}",
+            after[0].1.contains(&format!("read_message {first_id}")),
+            "先頭 (send1) が先に配達される: {:?}",
             after[0]
         );
-        assert!(broker.state.is_busy("w1:p2"), "配達後は Busy に戻る");
+        assert!(broker.state.is_queued("w1:p2", second_id));
         assert!(broker.state.is_queued("w1:p2", third_id));
 
-        // 受信側の turn-end で send3 が続き、順序が送信順と一致する。
-        broker.turn_end(Some("w1:p2".into())).await.unwrap();
+        broker.drain_queued().await;
+        broker.drain_queued().await;
         let drained: Vec<_> = bells(&broker)[before..].to_vec();
-        assert_eq!(drained.len(), 2);
+        assert_eq!(drained.len(), 3);
         assert!(
-            drained[1].1.contains(&format!("read_message {third_id}")),
+            drained[1].1.contains(&format!("read_message {second_id}"))
+                && drained[2].1.contains(&format!("read_message {third_id}")),
             "{drained:?}"
         );
         assert_eq!(broker.state.queue_len("w1:p2"), 0, "queue は空になる");

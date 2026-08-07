@@ -103,14 +103,7 @@ pub struct ExternalMailboxEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Agent {
     pub name: String,
-    pub state: AgentState,
     pub queue: BTreeSet<u64>,
-    /// herdr の native 検出が一時的に途切れた「疑い」状態 (memory のみ)。
-    /// suspect の間は配達 (直配・drain・催促) と message RPC caller を止め、
-    /// pane の新しい占有者への誤配・他人のメール読みを防ぐ。
-    /// 検出が同一 identity で戻れば解除、欠落が続けば evict される。
-    #[serde(skip)]
-    pub suspect: bool,
 }
 
 impl Agent {
@@ -118,7 +111,7 @@ impl Agent {
     /// 上限判定が同じ predicate を共有しないと、queue 行きの送信だけが
     /// 上限を素通りする。
     pub fn defers_delivery(&self) -> bool {
-        self.state == AgentState::Busy || !self.queue.is_empty() || self.suspect
+        !self.queue.is_empty()
     }
 }
 
@@ -145,28 +138,13 @@ impl BrokerState {
             pane,
             Agent {
                 name,
-                state: AgentState::Idle,
                 queue: BTreeSet::new(),
-                suspect: false,
             },
         );
     }
 
     pub fn remove(&mut self, pane: &str) {
         self.agents.remove(pane);
-    }
-
-    pub fn set_state(&mut self, pane: &str, state: AgentState) {
-        if let Some(agent) = self.agents.get_mut(pane) {
-            agent.state = state;
-        }
-    }
-
-    #[cfg(test)]
-    pub fn is_busy(&self, pane: &str) -> bool {
-        self.agents
-            .get(pane)
-            .is_some_and(|agent| agent.state == AgentState::Busy)
     }
 
     pub fn queue_len(&self, pane: &str) -> usize {
@@ -198,15 +176,13 @@ impl BrokerState {
             bell: make_bell(id),
             target_name: expected_name.to_owned(),
         };
-        // queue が残っている間は Idle でも直接配達しない。直接配達を許すと、
+        // queue が残っている間は直接配達しない。直接配達を許すと、
         // 配達失敗で requeue された古い message を新規 message が追い越す
-        // (FIFO の破れ)。queue の先頭は turn-end と health tick の再配達が流す。
-        // suspect (herdr 検出の途切れ疑い) 中も直配せず queue で待たせる。
+        // (FIFO の破れ)。queue の先頭は health tick の再配達が流す。
         let dispatch = if agent.defers_delivery() {
             agent.queue.insert(id);
             Dispatch::Queued(id)
         } else {
-            agent.state = AgentState::Busy;
             Dispatch::Deliver(id)
         };
         self.messages.insert(
@@ -269,12 +245,9 @@ impl BrokerState {
             .find(|event| event.id == id)
     }
 
-    pub fn turn_end(&mut self, pane: &str) -> Option<u64> {
+    pub fn take_queued_head(&mut self, pane: &str) -> Option<u64> {
         let agent = self.agents.get_mut(pane)?;
-        agent.state = AgentState::Idle;
-        let id = agent.queue.pop_first()?;
-        agent.state = AgentState::Busy;
-        Some(id)
+        agent.queue.pop_first()
     }
 
     pub fn message(&self, id: u64) -> Option<&StoredMessage> {
@@ -348,12 +321,10 @@ impl BrokerState {
         pending
     }
 
-    pub fn restore_agent(&mut self, pane: String, name: String, state: AgentState) {
+    pub fn restore_agent(&mut self, pane: String, name: String, _legacy_state: AgentState) {
         self.agents.entry(pane).or_insert(Agent {
             name,
-            state,
             queue: BTreeSet::new(),
-            suspect: false,
         });
     }
 
@@ -394,7 +365,6 @@ impl BrokerState {
             stored.delivered_at = None;
         }
         if let Some(agent) = self.agents.get_mut(pane) {
-            agent.state = AgentState::Idle;
             agent.queue.insert(id);
         }
     }
@@ -449,22 +419,24 @@ mod tests {
     }
 
     #[test]
-    fn busy_messages_are_fifo_and_delivered_once() {
+    fn failed_delivery_queue_is_fifo_and_delivered_once() {
         let mut state = BrokerState::default();
         state.register("%1".into(), "claude".into());
-        state.set_state("%1", AgentState::Busy);
+        let Dispatch::Deliver(first) = state
+            .dispatch("%1", from("%2"), "one".into(), "claude", bell)
+            .unwrap()
+        else {
+            panic!("first message should attempt immediate delivery");
+        };
+        state.requeue_after_delivery_failure("%1", first);
+        assert!(matches!(
+            state.dispatch("%1", from("%2"), "two".into(), "claude", bell),
+            Ok(Dispatch::Queued(_))
+        ));
 
-        for body in ["one", "two"] {
-            assert!(matches!(
-                state.dispatch("%1", from("%2"), body.into(), "claude", bell),
-                Ok(Dispatch::Queued(_))
-            ));
-        }
-
-        let first = state.turn_end("%1").unwrap();
+        let first = state.take_queued_head("%1").unwrap();
         assert_eq!(state.message(first).unwrap().message.brief, "one");
-        assert_eq!(state.agents["%1"].state, AgentState::Busy);
-        let second = state.turn_end("%1").unwrap();
+        let second = state.take_queued_head("%1").unwrap();
         assert_eq!(state.message(second).unwrap().message.brief, "two");
         assert!(state.agents["%1"].queue.is_empty());
     }
@@ -473,7 +445,6 @@ mod tests {
     fn removing_agent_keeps_unread_messages_for_failure_reporting() {
         let mut state = BrokerState::default();
         state.register("%1".into(), "claude".into());
-        state.set_state("%1", AgentState::Busy);
         for body in ["one", "two"] {
             state
                 .dispatch("%1", from("%2"), body.into(), "claude", bell)
@@ -508,13 +479,13 @@ mod tests {
     fn pending_to_me_hides_queued_ids_that_pending_from_me_still_shows() {
         let mut state = BrokerState::default();
         state.register("%1".into(), "claude".into());
-        state.set_state("%1", AgentState::Busy);
-        let Dispatch::Queued(queued) = state
+        let Dispatch::Deliver(queued) = state
             .dispatch("%1", from("%2"), "queued".into(), "claude", bell)
             .unwrap()
         else {
-            panic!("message should be queued");
+            panic!("message should attempt delivery");
         };
+        state.requeue_after_delivery_failure("%1", queued);
         assert!(
             state.pending_to_me("%1").is_empty(),
             "配達完了前の ID は呼び鈴の前に読めてはならない"
@@ -529,14 +500,13 @@ mod tests {
     fn pending_views_track_only_the_callers_own_ids() {
         let mut state = BrokerState::default();
         state.register("%1".into(), "claude".into());
-        state.set_state("%1", AgentState::Busy);
         let mut mine = Vec::new();
         for (sender, body) in [("%2", "a"), ("%3", "b"), ("%2", "c")] {
-            let Dispatch::Queued(id) = state
+            let id = match state
                 .dispatch("%1", from(sender), body.into(), "claude", bell)
                 .unwrap()
-            else {
-                panic!("message should be queued");
+            {
+                Dispatch::Deliver(id) | Dispatch::Queued(id) => id,
             };
             state.complete_delivery("%1", id);
             if sender == "%2" {
@@ -626,7 +596,6 @@ mod tests {
             assert_eq!(message.sender_label(), label);
             assert_eq!(state.reply_target(&message), None);
             state.ack(id);
-            state.set_state("%1", AgentState::Idle);
         }
     }
 
@@ -649,11 +618,13 @@ mod tests {
     fn many_sends_have_unique_ids_and_no_duplicates() {
         let mut state = BrokerState::default();
         state.register("%1".into(), "claude".into());
-        state.set_state("%1", AgentState::Busy);
         for index in 0..1000 {
-            state
+            let dispatch = state
                 .dispatch("%1", from("%2"), index.to_string(), "claude", bell)
                 .unwrap();
+            if let Dispatch::Deliver(id) = dispatch {
+                state.requeue_after_delivery_failure("%1", id);
+            }
         }
         let ids: Vec<_> = state.agents["%1"].queue.iter().copied().collect();
         assert_eq!(ids.len(), 1000);

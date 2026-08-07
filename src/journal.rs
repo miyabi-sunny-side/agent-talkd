@@ -212,7 +212,9 @@ impl Journal {
                 &Record::Register {
                     pane: pane.clone(),
                     name: agent.name.clone(),
-                    state: agent.state,
+                    // 旧 daemon が checkpoint を読めるよう field は残す。
+                    // live state の正は herdr であり、この値は復元に使わない。
+                    state: AgentState::Idle,
                 },
             )?;
         }
@@ -306,7 +308,9 @@ fn replay(state: &mut BrokerState, record: Record) {
             state.restore_agent(pane, name, agent_state);
         }
         Record::Remove { pane } => state.remove(&pane),
-        Record::State { pane, state: next } => state.set_state(&pane, next),
+        // 旧 journal の hook 由来 state は読み込み互換のため parse するが、
+        // live state の正は herdr なので replay しない。
+        Record::State { .. } => {}
         Record::Enqueue {
             pane,
             mut message,
@@ -362,6 +366,25 @@ mod tests {
             bell: format!("read {id}"),
             target_name: "claude".into(),
         }
+    }
+
+    fn enqueue(state: &mut BrokerState, pane: &str, body: &str) -> u64 {
+        let dispatch = state
+            .dispatch(
+                pane,
+                Origin::new("%2", "codex"),
+                body.into(),
+                "claude",
+                |id| format!("read {id}"),
+            )
+            .unwrap();
+        let id = match dispatch {
+            Dispatch::Deliver(id) | Dispatch::Queued(id) => id,
+        };
+        if matches!(dispatch, Dispatch::Deliver(_)) {
+            state.requeue_after_delivery_failure(pane, id);
+        }
+        id
     }
 
     #[test]
@@ -455,7 +478,6 @@ mod tests {
         let path = dir.path().join("queue.journal");
         let (mut journal, mut state) = Journal::open(path.clone()).unwrap();
         state.register("%1".into(), "claude".into());
-        state.set_state("%1", AgentState::Busy);
         journal
             .append(&Record::Register {
                 pane: "%1".into(),
@@ -464,18 +486,7 @@ mod tests {
             })
             .unwrap();
         for body in ["keep", "drop"] {
-            let Dispatch::Queued(id) = state
-                .dispatch(
-                    "%1",
-                    Origin::new("%2", "codex"),
-                    body.into(),
-                    "claude",
-                    |id| format!("read {id}"),
-                )
-                .unwrap()
-            else {
-                panic!("message was not queued");
-            };
+            let id = enqueue(&mut state, "%1", body);
             journal
                 .append(&Record::Enqueue {
                     pane: "%1".into(),
@@ -523,7 +534,6 @@ mod tests {
         let path = dir.path().join("queue.journal");
         let (mut journal, mut state) = Journal::open(path.clone()).unwrap();
         state.register("%1".into(), "claude".into());
-        state.set_state("%1", AgentState::Busy);
         state.register("%2".into(), "codex".into());
         journal
             .append(&Record::Register {
@@ -539,18 +549,7 @@ mod tests {
                 state: AgentState::Idle,
             })
             .unwrap();
-        let Dispatch::Queued(id) = state
-            .dispatch(
-                "%1",
-                Origin::new("%2", "codex"),
-                "failed original".into(),
-                "claude",
-                |id| format!("read {id}"),
-            )
-            .unwrap()
-        else {
-            panic!("message was not queued");
-        };
+        let id = enqueue(&mut state, "%1", "failed original");
         journal
             .append(&Record::Enqueue {
                 pane: "%1".into(),
@@ -651,19 +650,7 @@ mod tests {
         let path = dir.path().join("queue.journal");
         let (mut journal, mut state) = Journal::open(path.clone()).unwrap();
         state.register("%1".into(), "claude".into());
-        state.set_state("%1", AgentState::Busy);
-        let Dispatch::Queued(id) = state
-            .dispatch(
-                "%1",
-                Origin::new("%2", "codex"),
-                "kept".into(),
-                "claude",
-                |id| format!("read {id}"),
-            )
-            .unwrap()
-        else {
-            panic!("message was not queued");
-        };
+        let id = enqueue(&mut state, "%1", "kept");
         journal
             .append(&Record::Enqueue {
                 pane: "%1".into(),
@@ -730,20 +717,8 @@ mod tests {
         let path = dir.path().join("queue.journal");
         let (mut journal, mut state) = Journal::open(path.clone()).unwrap();
         state.register("%1".into(), "claude".into());
-        state.set_state("%1", AgentState::Busy);
         for index in 0..200 {
-            let Dispatch::Queued(id) = state
-                .dispatch(
-                    "%1",
-                    Origin::new("%2", "codex"),
-                    index.to_string(),
-                    "claude",
-                    |id| format!("read {id}"),
-                )
-                .unwrap()
-            else {
-                panic!("message was not queued");
-            };
+            let id = enqueue(&mut state, "%1", &index.to_string());
             journal
                 .append(&Record::Enqueue {
                     pane: "%1".into(),

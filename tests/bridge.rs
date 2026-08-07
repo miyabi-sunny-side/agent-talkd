@@ -290,7 +290,7 @@ fn wait_for(mut condition: impl FnMut() -> bool) {
     }
 }
 
-/// `sent -> ... : #N` / `queued (busy) -> ... : #N` の末尾 ID。
+/// `sent -> ... : #N` / `queued (waiting) -> ... : #N` の末尾 ID。
 fn trailing_id(output: &str) -> u64 {
     output
         .rsplit_once('#')
@@ -412,7 +412,7 @@ fn a_letter_posted_over_tcp_reaches_a_pane() {
 }
 
 /// 稼働中に herdr へ現れた agent (hook なし) が、数秒で peer になり、
-/// 消えると debounce の後に登録が外れる。
+/// 消えると次の成功 snapshot で登録が外れる。
 #[test]
 #[ignore = "spawns a background daemon; run explicitly"]
 fn a_herdr_agent_appearing_mid_run_becomes_a_peer_without_hooks() {
@@ -433,7 +433,7 @@ fn a_herdr_agent_appearing_mid_run_becomes_a_peer_without_hooks() {
         thread::sleep(Duration::from_millis(200));
     }
 
-    // 消滅: suspect (1 tick) を経て2連続欠落で外れる。
+    // 消滅: 次の成功 snapshot で即座に外れる。
     harness.herdr.remove_pane("w1:p9");
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
@@ -448,7 +448,7 @@ fn a_herdr_agent_appearing_mid_run_becomes_a_peer_without_hooks() {
     let _ = harness.as_herdr_pane("w1:p2", &["internal-daemon-shutdown"]);
 }
 
-/// 検出ラグの回帰: turn-end の一瞬に herdr がまだ working を返しても、
+/// 検出ラグの回帰: 送信時に herdr が working を返しても、
 /// queue は滞留せず、idle の正の証拠が出た時点の health tick が同じ ID を
 /// FIFO のまま流す。新規 send は queue を追い越さない。
 #[test]
@@ -476,7 +476,7 @@ fn a_lagging_herdr_detection_does_not_strand_queued_messages() {
         harness.herdr.prompts()
     );
 
-    // 検出が idle に追いついた後、turn-end を発火させなくても tick が流す。
+    // 検出が idle に追いついた後、hook 無しで tick が流す。
     harness.herdr.report_status("idle");
     wait_for(|| !harness.herdr.prompts().is_empty());
     let prompts = harness.herdr.prompts();
@@ -490,8 +490,7 @@ fn a_lagging_herdr_detection_does_not_strand_queued_messages() {
         "1 tick で流すのは先頭の1件だけ: {prompts:?}"
     );
 
-    // 受信側の turn-end で2通目が続き、順序が送信順と一致する。
-    harness.ok(&harness.as_herdr_pane("w1:p1", &["turn-end"]));
+    // hook は無い。herdr が idle のままなら次の reconcile tick が2通目を流す。
     wait_for(|| harness.herdr.prompts().len() >= 2);
     let prompts = harness.herdr.prompts();
     assert!(
