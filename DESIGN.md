@@ -1,6 +1,6 @@
 ---
 name: agent-talkd observation & letters UI
-version: 1
+version: 2
 description: >
   Project design authority for the agent-talkd web client. Self-contained:
   everything needed to implement and verify the UI lives in this file.
@@ -8,20 +8,23 @@ description: >
 
 # agent-talkd — Web UI Design Authority
 
-この文書が本 repository の UI 設計の正である。共有テンプレート (Sumi / Kinari)
-は bootstrap 入力として参照済みで、必要な規則はすべて本書へ複製・適合済み。
-以後テンプレート側の変更に自動追従しない。
-(theme 3択・Kinari token・モーダル規約は copy-then-own で本書が正。)
+この文書が本 repository の UI 設計の正である。共有テンプレート
+`rust-svelte-template` (Sumi / Kinari、参照日 2026-08-08) は bootstrap 入力と
+して copy-then-own 済み。以後テンプレート側の変更に自動追従しない。
+theme 3択・token・モーダル/メニュー規約は本書が正。
 
 ## 1. 目的と範囲
 
 herdr 上で稼働する対話 agent の観測 (registry / terminal screen) と、許可された
 mailbox からの手紙送信 (letters) を行う、同一ホスト・同一 UID 向けの小さな
-操作面。視覚言語は「墨と和紙」— 墨色の地、和紙色の文字、柿色の印。
-縦書き風 masthead・章番号 (一)・brush loader・角印「話」は製品の identity で
-あり、registry / letters 画面で維持する。
+操作面。視覚言語は「墨と和紙」— 墨色の地、和紙色の文字、柿色の accent。
+chrome はテンプレートの静かな 48px app header + compact summary を土台にし、
+session 単位カード・状態 border / 文字色・letter dock を agent-talk の差別化と
+する。モバイル縦スペースを優先する。
 
-過去の「read-only 専用」「composition 禁止」「Port-3 gate」記述は廃止済み。
+過去の「read-only 専用」「composition 禁止」「Port-3 gate」、および
+eyebrow `HERDR / LOCAL BROKER`・角印「話」・縦書き masthead を identity と
+する記述は廃止済み。brush loader は loading 表示として残す。
 手紙送信は正式機能である。
 
 ## 2. 画面と URL (router contract)
@@ -64,9 +67,10 @@ view/selectedAgent を URL と別に持つ state にしない (単一情報源)�
 - **letter**: mailbox (source) → 対象 pane への本文送信。結果は
   sent (即配達) | queued (配達待ち)。mailbox 一覧は許可制で、空 (empty) と
   取得失敗 (error) は別状態。
-- **状態色**: idle = teal 系、busy = ochre 系。row stroke・status dot・status
-  文字にのみ使う。文字 (idle/busy) が常に色と併記され、色だけに依存しない。
-  danger は失敗表示専用で agent 状態には使わない。
+- **状態色**: idle = teal 系 (`--idle`)、busy = ochre 系 (`--busy`)。
+  registry の agent ボタンは **border 色**、詳細の agent タブは **文字色** で
+  視覚表現する。色だけに依存しないため、各 button / tab の `aria-label` に
+  `name (idle|busy|退出)` を必ず含める。danger は失敗表示専用。
 
 ## 4. Theme — 3択制
 
@@ -146,78 +150,62 @@ full-width ボタン3択 (radio semantics, `aria-checked`)。UI 呼称:
 - 本文: `"Hiragino Kaku Gothic ProN", "Yu Gothic UI", "Noto Sans CJK JP",
   "Noto Sans JP", system-ui, sans-serif`
 - mono (meta/status/terminal): `"SFMono-Regular", Consolas, monospace`
-- masthead title `clamp(29px, 6vw, 48px)` / 見出し 15px / 本文 13px /
+- brand 15px / 見出し 13–15px / 本文 13px /
   meta・status 10px mono letter-spacing 0.08em / terminal 12px (狭幅 11px)
 
 ## 6. Layout と spacing
 
-- `main`: `width: min(1020px, 100%)`、中央寄せ。
-  padding `28px clamp(16px,5vw,56px) 18px`。
-- 詳細画面 (`/agent`) は chrome を最小化: `padding-top: max(10px,
-  env(safe-area-inset-top))`、下端は letter dock の tab (44px) が terminal
-  最終行を隠さないだけの padding-bottom を確保。
-- 横 scroll をページに出さない (溢れる要素は自身の overflow container 内で
-  scroll する)。最小対応幅 320px。
+- 一覧 / Letters の `main`: `width: min(1020px, 100%)`、中央寄せ。
+  横 padding `clamp(16px, 5vw, 56px)`。上は app header (48px) が担う。
+- 詳細 (`/agent`): `main` は full-bleed。chrome 2 段 48+40 + hairline 1 =
+  outer **89px** + letter dock tab を除いた高さを terminal に与える。
+- 横 scroll をページに出さない。最小対応幅 320px。カード内 agent ボタンは wrap。
 
 ## 7. Components
 
-### 7.1 Masthead (Registry / Letters のみ)
+### 7.1 App header (Registry / Letters)
 
-eyebrow `HERDR / LOCAL BROKER`、title `agent talk` (talk = accent italic)、
-nav (Agents / Letters / menu ボタン)、角印「話」(狭幅では非表示)。
-詳細画面では表示しない (terminal が主役)。
+テンプレート Header を copy-then-own した 48px sticky bar。
 
-### 7.2 Menu ボタンとメニューモーダル
-
-- menu ボタン: 44×44px の quiet icon button (三本線 SVG)。masthead nav 右端と
-  詳細ヘッダー右端の両方に置く。`aria-haspopup="dialog"`、
+- 左: brand `agent talk` (`talk` = accent italic)。SPA navigate 用 button。
+  full page reload の `<a href="/">` は使わない。
+- 右: ハンバーガー (44×44)。`aria-haspopup="menu"` / `aria-expanded` /
   `aria-label="メニュー"`。
-- メニューモーダル: §8 の共通規約に従う。menu 系レイアウト = caption-muted の
-  section label (`テーマ`) + full-width ボタン縦積み。現時点の項目はテーマ3択
-  のみ。
+- eyebrow / 角印 / 大型 wordmark は置かない。
+
+### 7.2 Menu (template dropdown) とテーマモーダル
+
+- 右寄せ dropdown (overlay + panel)。項目: Agents / Letters / テーマ設定
+  (詳細では Letters + テーマ設定)。
+- 「テーマ設定」はテーマモーダル (§8) を開く。ラベルは §4.4 のとおり。
+- Escape / overlay で閉じ、起点 menu ボタンへ focus 復帰。
 
 ### 7.3 Registry (一覧)
 
-現行仕様を維持: 章番号 `一` + 見出し、`aria-live` の件数 output、
-agent row (4px state stroke / name + session badge / cwd (title に全文) /
-location + pane id / status dot + 文字 / →)。row 全体が button で Enter 起動。
-loading = brush loader、empty = ○ + 静かな文言、error = 再試行付き alert。
-row の ink-in animation は初回描画のみで、poll による再描画で再生させない。
+- compact summary (≤40px): 見出し「稼働中の agent」+ aria-live 件数。章番号なし。
+- agents を backend+session で group し session カード1枚に agent ボタンを並べる
+  (優先: claude → codex → grok → 他)。ボタンは registry 実データから動的生成。
+- ボタン: 可視は name のみ、状態は 2px border 色、aria-label に state、
+  min-height 44px。location / pane_id / cwd は非表示。
+- loading / empty / error は従来どおり。
 
-### 7.4 詳細ヘッダー (1段)
-
-**1行構成・実質1段**。旧 sibling-switcher 行と screen-toolbar 行は削除する。
+### 7.4 詳細ヘッダー (2段)
 
 ```
-[← 戻る 44px] [session名 ●state] [agentタブ (横scroll)] [≡ 44px]
+[agent talk (home)]     [session 名 …]     [≡ menu]
+[ agent tab · agent tab · … (横 scroll)              ]
 ```
 
-- grid: `auto minmax(72px, max-content) minmax(0,1fr) auto`、gap 8–12px。
-- 高さ: 内容 44px + padding-block 4px + border-bottom 1px = **53px**。
-  390px 幅で bounding box ≤56px を守る。
-- 主タイトルは **session (workspace label)** 13–14px semibold、溢れは
-  ellipsis。直下ではなく同一行内に status dot (7px) + state 文字 (10px mono、
-  idle/busy token 色) を添える。
-- **pane id は視覚表示しない**。identity block の `title` と `aria-label` に
-  `session · pane_id` として残す。
-- agent タブ: 同一 backend+session の agent が2つ以上ある時のみ表示。
-  pill (radius 999px、active = on-surface 地 + surface 文字反転、
-  `aria-current="true"`)。行内で `overflow-x: auto`・折返しなし・
-  scrollbar 非表示。タブの tap 領域は高さ ≥36px。切替は replaceState (§2)。
-- 戻るボタン: 44×44px、`aria-label="agent 一覧へ戻る"`。戻り先は `/`
-  (registry の該当 row へ focus 復帰)。
+- 1 段目 48px: brand (`aria-label="agent talk — 一覧へ戻る"`) + session 名。
+  session の title/aria-label に `session · pane_id`。pane id は非表示。
+- 2 段目 40px: 同一 session の agent タブを常時表示。active は下線、状態は
+  文字色 (idle/busy/退出)。切替は replaceState。tap ≥36px。
 
 ### 7.5 Screen (terminal)
 
-- 2秒間隔の visible-only poll を**継続**する (hidden で停止、復帰で即時
-  refresh、unmount で abort)。「2秒ごとに更新」表示と手動更新ボタンは
-  **UI から削除** (reload は router が担う)。
-- terminal: `role="log"`、mono、`--terminal-bg` 地、上辺 2px accent。
-  自身の中で scroll し、ページを横に広げない。
-- 更新失敗: 既存 capture がある時は差し替えず dim (opacity 0.62)。初回失敗は
-  terminal 領域内に説明 + 再試行ボタン (role=alert)。
-- registry 側で pane が消えた場合: header の state 文字を muted の「退出」に
-  し、タブは最新 snapshot の兄弟のみへ更新。terminal は上記失敗系に従う。
+- 2秒間隔の visible-only poll を継続。手動更新 UI なし。
+- terminal: role=log、mono、固定 dark。詳細では viewport 全幅。上辺 2px accent。
+- 失敗・退出時の扱いは従来どおり (dim / 再試行 / タブ更新)。
 
 ### 7.6 Letter dock (ribbon composer) — 詳細画面下部
 
@@ -288,22 +276,21 @@ registry 画面では aria-live output にのみ失敗を示す。
 
 ## 10. Responsive
 
-- 320px〜: ページ横 scroll なし。
-- ≤620px: masthead 2列 (角印非表示)、agent row 2行組、terminal padding 縮小。
-- 390×844 / 412×915 (mobile): 詳細ヘッダー ≤56px、terminal 上端 ≤96px、
+- 320px〜: ページ横 scroll なし。agent ボタンは wrap。
+- 390×844 / 412×915 (mobile): app/detail 1 段目 48px、detail 2 段目 40px、
   terminal 高さ ≥55% viewport。
-- ≥1020px: main は 1020px で中央固定。dock の tab は main と同じ右端基準で
-  よい (viewport 右端でも可、ただし線は全幅)。
+- ≥1020px: 一覧 main は 1020px で中央固定。詳細 terminal は viewport 全幅。
+  dock の tab は右寄せ、上辺の線は全幅。
 
 ## 11. Keyboard / focus / touch
 
-- すべての操作 (row / 戻る / タブ / menu / dock tab / 送信 / 再試行 /
-  selector / モーダル) はキーボード到達可能で focus-visible ring
+- すべての操作 (agent ボタン / brand home / タブ / menu / dock tab / 送信 /
+  再試行 / selector / モーダル) はキーボード到達可能で focus-visible ring
   (accent 2px, offset 2–3px) を持つ。
-- touch target: 主要操作 44×44px 以上 (戻る・menu・dock tab)。タブ pill は
-  ≥36px 高。
-- 詳細 → 戻る で registry の該当 row へ focus 復帰。モーダル・dock は
-  閉時に起点ボタンへ focus 復帰。
+- touch target: 主要操作 44×44px 以上 (agent ボタン・menu・dock tab)。
+  タブは ≥36px 高。
+- 詳細 → brand home で registry の該当 agent ボタンへ focus 復帰。
+  モーダル・dock・dropdown は閉時に起点へ focus 復帰。
 - 非同期状態変化 (件数 / 送信結果) は `aria-live` で通知する。
 
 ## 12. Contrast (実測要件)
@@ -342,7 +329,8 @@ registry 画面では aria-live output にのみ失敗を示す。
   header 状態。jsdom の History API で Back/replace を検証する。
 - `npm run check` (svelte-check) と `npm run format:check` を green に保つ。
 - browser (ui-checker): 390×844 / 412×915 / 1020×800 で、DOM・computed
-  style・getBoundingClientRect・実操作により本書の数値 (ヘッダー ≤56px、
-  tab 44px/108px、panel ≤min(62dvh,420px)、contrast 比、theme 永続化、
-  deep-link reload、Back/Forward) を実測する。prefers-color-scheme と
+  style・getBoundingClientRect・実操作により本書の数値 (app header 48px、
+  detail chrome 89px (48+40+border 1)、dock tab 44px/108px、panel ≤min(62dvh,420px)、
+  contrast 比、theme 永続化、deep-link reload、Back/Forward、eyebrow 不在、
+  session カード、pane 座標非表示) を実測する。prefers-color-scheme と
   prefers-reduced-motion は DevTools emulation で両値を検証する。

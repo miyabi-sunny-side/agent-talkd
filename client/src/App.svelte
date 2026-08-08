@@ -8,6 +8,14 @@
   import ScreenPanel from "./ScreenPanel.svelte";
 
   const REGISTRY_INTERVAL_MS = 5_000;
+  const AGENT_NAME_ORDER = ["claude", "codex", "grok"];
+
+  type SessionGroup = {
+    key: string;
+    session: string;
+    backend: string;
+    agents: Agent[];
+  };
 
   let agents = $state<Agent[]>([]);
   let registryPhase = $state<"loading" | "error" | "ready">("loading");
@@ -15,7 +23,8 @@
   // URL が唯一の画面情報源 (DESIGN.md §2)。view を別 state に持たない。
   let route = $state<Route>(currentRoute());
   let menuOpen = $state(false);
-  let menuOpener: HTMLElement | null = null;
+  let themeOpen = $state(false);
+  let menuButton = $state<HTMLButtonElement | undefined>();
   let pollTimer: ReturnType<typeof setTimeout> | undefined;
 
   const liveAgent = $derived.by(() => {
@@ -43,12 +52,24 @@
   const siblings = $derived(
     displayAgent === null
       ? []
-      : agents.filter(
-          (candidate) =>
-            candidate.backend === displayAgent.backend &&
-            candidate.session === displayAgent.session,
+      : sortAgents(
+          agents.filter(
+            (candidate) =>
+              candidate.backend === displayAgent.backend &&
+              candidate.session === displayAgent.session,
+          ),
         ),
   );
+  // 退出中でも選択 agent をタブに残す (DESIGN.md §7.4 / §7.5)。
+  const tabs = $derived.by(() => {
+    if (displayAgent === null) return [] as Agent[];
+    if (!departed) return siblings.length > 0 ? siblings : [displayAgent];
+    const live = siblings.filter(
+      (candidate) => candidate.pane_id !== displayAgent.pane_id,
+    );
+    return sortAgents([...live, displayAgent]);
+  });
+  const sessionGroups = $derived(groupBySession(agents));
 
   $effect(() => {
     document.title =
@@ -62,6 +83,50 @@
   // 世代番号で single-flight にする。遅れて届いた古い応答が新しい snapshot を
   // 上書きしないため (DESIGN.md §9)。
   let registryGeneration = 0;
+
+  function agentNameRank(name: string): number {
+    const index = AGENT_NAME_ORDER.indexOf(name);
+    return index === -1 ? AGENT_NAME_ORDER.length : index;
+  }
+
+  function sortAgents(list: Agent[]): Agent[] {
+    return [...list].sort((left, right) => {
+      const byName = agentNameRank(left.name) - agentNameRank(right.name);
+      if (byName !== 0) return byName;
+      return left.pane_id.localeCompare(right.pane_id);
+    });
+  }
+
+  function groupBySession(list: Agent[]): SessionGroup[] {
+    const map = new Map<string, SessionGroup>();
+    for (const agent of list) {
+      const key = `${agent.backend}\0${agent.session}`;
+      const existing = map.get(key);
+      if (existing) {
+        existing.agents.push(agent);
+      } else {
+        map.set(key, {
+          key,
+          session: agent.session,
+          backend: agent.backend,
+          agents: [agent],
+        });
+      }
+    }
+    return Array.from(map.values()).map((group) => ({
+      ...group,
+      agents: sortAgents(group.agents),
+    }));
+  }
+
+  function agentAriaLabel(agent: Agent): string {
+    return `${agent.name} (${agent.state}) の Screen を表示`;
+  }
+
+  function tabAriaLabel(agent: Agent, isDeparted: boolean): string {
+    if (isDeparted) return `${agent.name} (退出)`;
+    return `${agent.name} (${agent.state})`;
+  }
 
   async function refresh(initial = false): Promise<void> {
     const current = ++registryGeneration;
@@ -108,13 +173,14 @@
     navigate({ view: "agent", pane: agent.pane_id });
     route = { view: "agent", pane: agent.pane_id };
     cameFromRegistry = true;
+    closeMenu();
   }
 
-  async function focusRow(paneId: string | null): Promise<void> {
+  async function focusAgentButton(paneId: string | null): Promise<void> {
     await tick();
     if (paneId === null) return;
     const target = Array.from(
-      document.querySelectorAll<HTMLButtonElement>(".agent-row"),
+      document.querySelectorAll<HTMLButtonElement>(".agent-btn"),
     ).find((button) => button.dataset.pane === paneId);
     target?.focus();
   }
@@ -122,6 +188,7 @@
   async function backToRegistry(): Promise<void> {
     if (route.view === "registry") return; // 既に一覧。重複 push しない。
     const paneId = route.view === "agent" ? route.pane : null;
+    closeMenu();
     if (cameFromRegistry) {
       // 一覧由来: 履歴を1つ戻す。popstate 側が route と focus を担う。
       window.history.back();
@@ -130,11 +197,12 @@
     // deep-link で直接開いた画面: 戻る先が無いので `/` へ置き換える。
     navigate({ view: "registry" }, "replace");
     route = { view: "registry" };
-    await focusRow(paneId);
+    await focusAgentButton(paneId);
   }
 
   function openLetters(): void {
     if (route.view === "letters") return; // 重複 push しない。
+    closeMenu();
     navigate({ view: "letters" });
     route = { view: "letters" };
     cameFromRegistry = false;
@@ -147,14 +215,32 @@
     route = { view: "agent", pane: sibling.pane_id };
   }
 
-  function openMenu(event: MouseEvent): void {
-    menuOpener = event.currentTarget as HTMLElement;
-    menuOpen = true;
+  function toggleMenu(): void {
+    menuOpen = !menuOpen;
   }
 
-  function closeMenu(): void {
+  function closeMenu(restoreFocus = false): void {
     menuOpen = false;
-    menuOpener?.focus();
+    if (restoreFocus) menuButton?.focus();
+  }
+
+  function openTheme(): void {
+    closeMenu(false);
+    themeOpen = true;
+  }
+
+  function closeTheme(): void {
+    themeOpen = false;
+    menuButton?.focus();
+  }
+
+  function onWindowKeydown(event: KeyboardEvent): void {
+    if (menuOpen && event.key === "Escape") {
+      // letter dock など後続の window Escape ハンドラに奪わせない。
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      closeMenu(true);
+    }
   }
 
   onMount(() => {
@@ -163,10 +249,10 @@
     const unsubscribe = onPopstate((next) => {
       const leaving = route.view === "agent" ? route.pane : null;
       route = next;
-      // browser Back で一覧へ戻った時も、見ていた row へ focus を返す。
+      // browser Back で一覧へ戻った時も、見ていた button へ focus を返す。
       if (next.view === "registry") {
         cameFromRegistry = false;
-        void focusRow(leaving);
+        void focusAgentButton(leaving);
       }
     });
     const onVisibility = (): void => {
@@ -186,181 +272,83 @@
   });
 </script>
 
+<svelte:window onkeydown={onWindowKeydown} />
+
 <main class:detail-view={route.view === "agent"}>
-  {#if route.view !== "agent"}
-    <!-- ブランド masthead は一覧系の画面だけ。詳細では terminal を主役にする。 -->
-    <header class="masthead">
-      <button
-        class="wordmark"
-        type="button"
-        onclick={backToRegistry}
-        aria-label="agent registry を表示"
-      >
-        <span class="eyebrow">HERDR / LOCAL BROKER</span>
-        <span class="title">agent <i>talk</i></span>
-      </button>
-      <nav aria-label="表示切り替え">
-        <button
-          class:active={route.view === "registry"}
-          type="button"
-          onclick={backToRegistry}>Agents</button
-        >
-        <button
-          class:active={route.view === "letters"}
-          type="button"
-          onclick={openLetters}>Letters</button
-        >
-        <button
-          type="button"
-          class="icon-button menu-button"
-          aria-label="メニュー"
-          aria-haspopup="dialog"
-          onclick={openMenu}
-        >
-          <svg viewBox="0 0 24 24" aria-hidden="true"
-            ><path d="M4 7h16M4 12h16M4 17h16" /></svg
-          >
-        </button>
-      </nav>
-      <div class="seal" aria-hidden="true">話</div>
-    </header>
-  {/if}
-
-  {#if route.view === "registry"}
-    <section class="registry" aria-labelledby="registry-heading">
-      <div class="section-heading">
-        <h1 id="registry-heading"><span>一</span> 稼働中の agent</h1>
-        <output
-          aria-live="polite"
-          aria-atomic="true"
-          class:failed={registryPhase === "error"}>{message}</output
-        >
-      </div>
-
-      {#if registryPhase === "loading"}
-        <div class="state-card loading" aria-busy="true">
-          <span class="brush-loader" aria-hidden="true"></span>
-          <p>接続を確かめています</p>
-        </div>
-      {:else if registryPhase === "error"}
-        <div class="state-card error" role="alert">
-          <span class="error-mark" aria-hidden="true">!</span>
-          <div>
-            <strong>一覧を読み込めません</strong>
-            <p>daemon の状態を確認して、もう一度お試しください。</p>
-          </div>
-          <button type="button" onclick={() => refresh(true)}>再試行</button>
-        </div>
-      {:else if agents.length === 0}
-        <div class="state-card empty">
-          <span aria-hidden="true">○</span>
-          <p>静かな待合です。<br />agent が登録されると、ここに現れます。</p>
-        </div>
-      {:else}
-        <ul class="agent-list" aria-label="agent status list">
-          {#each agents as agent, index (agent.pane_id)}
-            <li style={`--index:${index}`}>
-              <button
-                type="button"
-                class="agent-row"
-                data-pane={agent.pane_id}
-                aria-label={`${agent.name} の Screen を表示`}
-                onclick={() => openScreen(agent)}
-                onkeydown={(event) => {
-                  if (event.key === "Enter") {
-                    event.preventDefault();
-                    openScreen(agent);
-                  }
-                }}
-              >
-                <span
-                  class:idle={agent.state === "idle"}
-                  class:busy={agent.state === "busy"}
-                  class="state-stroke"
-                  aria-hidden="true"
-                ></span>
-                <span class="identity"
-                  ><span class="identity-name"
-                    ><strong>{agent.name}</strong><span class="session-badge"
-                      >{agent.session}</span
-                    ></span
-                  ><span title={agent.cwd}>{agent.cwd}</span></span
-                >
-                <span class="coordinates"
-                  ><span>{agent.location}</span><code>{agent.pane_id}</code
-                  ></span
-                >
-                <span
-                  class:idle={agent.state === "idle"}
-                  class:busy={agent.state === "busy"}
-                  class="status"><i aria-hidden="true"></i>{agent.state}</span
-                >
-                <span class="row-arrow" aria-hidden="true">→</span>
-              </button>
-            </li>
-          {/each}
-        </ul>
-      {/if}
-    </section>
-  {:else if route.view === "agent"}
+  {#if route.view === "agent"}
     {#if displayAgent}
-      <header class="detail-bar">
-        <button
-          class="icon-button"
-          type="button"
-          onclick={backToRegistry}
-          aria-label="agent 一覧へ戻る"
-        >
-          <svg viewBox="0 0 24 24" aria-hidden="true"
-            ><path d="m15 18-6-6 6-6" /></svg
+      <header class="detail-chrome">
+        <div class="detail-bar-primary">
+          <button
+            class="brand-link"
+            type="button"
+            onclick={backToRegistry}
+            aria-label="agent talk — 一覧へ戻る"
           >
-        </button>
-        <div
-          class="detail-identity"
-          title={`${displayAgent.session} · ${displayAgent.pane_id}`}
-          aria-label={`${displayAgent.session} · ${displayAgent.pane_id}`}
-        >
-          <strong>{displayAgent.session}</strong>
-          <span
-            class="status"
-            class:idle={!departed && displayAgent.state === "idle"}
-            class:busy={!departed && displayAgent.state === "busy"}
-            class:departed
-            ><i aria-hidden="true"></i>{departed
-              ? "退出"
-              : displayAgent.state}</span
+            agent <i>talk</i>
+          </button>
+          <strong
+            class="detail-session"
+            title={`${displayAgent.session} · ${displayAgent.pane_id}`}
+            aria-label={`${displayAgent.session} · ${displayAgent.pane_id}`}
+            >{displayAgent.session}</strong
           >
-        </div>
-        {#if siblings.length > 1}
-          <nav class="agent-tabs" aria-label="同一 session の agent 切り替え">
-            {#each siblings as sibling (sibling.pane_id)}
-              <button
-                type="button"
-                class:active={sibling.pane_id === displayAgent.pane_id}
-                aria-current={sibling.pane_id === displayAgent.pane_id
-                  ? "true"
-                  : undefined}
-                title={`${sibling.session} · ${sibling.pane_id}`}
-                onclick={() => switchAgentTab(sibling)}
+          <div class="menu-wrapper">
+            <button
+              bind:this={menuButton}
+              type="button"
+              class="icon-button menu-button"
+              aria-label="メニュー"
+              aria-expanded={menuOpen}
+              onclick={toggleMenu}
+            >
+              <svg viewBox="0 0 24 24" aria-hidden="true"
+                ><path d="M4 7h16M4 12h16M4 17h16" /></svg
               >
-                {sibling.name}
-              </button>
-            {/each}
-          </nav>
-        {:else}
-          <span class="agent-tabs" aria-hidden="true"></span>
-        {/if}
-        <button
-          type="button"
-          class="icon-button menu-button"
-          aria-label="メニュー"
-          aria-haspopup="dialog"
-          onclick={openMenu}
-        >
-          <svg viewBox="0 0 24 24" aria-hidden="true"
-            ><path d="M4 7h16M4 12h16M4 17h16" /></svg
-          >
-        </button>
+            </button>
+            {#if menuOpen}
+              <button
+                class="menu-overlay"
+                type="button"
+                tabindex="-1"
+                aria-label="メニューを閉じる"
+                onclick={() => closeMenu(true)}
+              ></button>
+              <nav class="menu-dropdown" aria-label="メニュー">
+                <button class="menu-item" type="button" onclick={openLetters}
+                  >Letters</button
+                >
+                <button class="menu-item" type="button" onclick={openTheme}
+                  >テーマ設定</button
+                >
+              </nav>
+            {/if}
+          </div>
+        </div>
+        <nav class="agent-tabs" aria-label="同一 session の agent 切り替え">
+          {#each tabs as sibling (sibling.pane_id)}
+            {@const isActive = sibling.pane_id === displayAgent.pane_id}
+            {@const isDeparted =
+              isActive && departed
+                ? true
+                : !agents.some((agent) => agent.pane_id === sibling.pane_id)}
+            <button
+              type="button"
+              class:active={isActive}
+              class:departed={isDeparted}
+              class:idle={!isDeparted && sibling.state === "idle"}
+              class:busy={!isDeparted && sibling.state === "busy"}
+              aria-current={isActive ? "true" : undefined}
+              aria-label={tabAriaLabel(sibling, isDeparted)}
+              title={`${sibling.session} · ${sibling.pane_id}`}
+              onclick={() => {
+                if (!isActive) switchAgentTab(sibling);
+              }}
+            >
+              {sibling.name}
+            </button>
+          {/each}
+        </nav>
       </header>
       <!-- pane の占有者が入れ替わったら instance ごと差し替える
            (旧 draft を新しい agent へ見せない・誤送信しない)。 -->
@@ -369,11 +357,35 @@
         <AgentLetterComposer agent={displayAgent} />
       {/key}
     {:else if registryPhase === "loading"}
+      <header class="detail-chrome">
+        <div class="detail-bar-primary">
+          <button
+            class="brand-link"
+            type="button"
+            onclick={backToRegistry}
+            aria-label="agent talk — 一覧へ戻る"
+          >
+            agent <i>talk</i>
+          </button>
+        </div>
+      </header>
       <div class="state-card loading" aria-busy="true">
         <span class="brush-loader" aria-hidden="true"></span>
         <p>接続を確かめています</p>
       </div>
     {:else if registryPhase === "error"}
+      <header class="detail-chrome">
+        <div class="detail-bar-primary">
+          <button
+            class="brand-link"
+            type="button"
+            onclick={backToRegistry}
+            aria-label="agent talk — 一覧へ戻る"
+          >
+            agent <i>talk</i>
+          </button>
+        </div>
+      </header>
       <div class="state-card error" role="alert">
         <span class="error-mark" aria-hidden="true">!</span>
         <div>
@@ -385,6 +397,18 @@
     {:else}
       <!-- deep-link の pane が snapshot に無い。URL は保ち、silent redirect
            しない (DESIGN.md §2)。 -->
+      <header class="detail-chrome">
+        <div class="detail-bar-primary">
+          <button
+            class="brand-link"
+            type="button"
+            onclick={backToRegistry}
+            aria-label="agent talk — 一覧へ戻る"
+          >
+            agent <i>talk</i>
+          </button>
+        </div>
+      </header>
       <div class="state-card empty not-found">
         <span aria-hidden="true">○</span>
         <p>
@@ -396,19 +420,136 @@
       </div>
     {/if}
   {:else}
-    <button class="back-button" type="button" onclick={backToRegistry}
-      >← agent 一覧へ</button
-    >
-    <LettersPanel />
-  {/if}
+    <header class="app-header">
+      <button
+        class="brand-link"
+        type="button"
+        onclick={backToRegistry}
+        aria-label="agent registry を表示"
+      >
+        agent <i>talk</i>
+      </button>
+      <div class="menu-wrapper">
+        <button
+          bind:this={menuButton}
+          type="button"
+          class="icon-button menu-button"
+          aria-label="メニュー"
+          aria-expanded={menuOpen}
+          onclick={toggleMenu}
+        >
+          <svg viewBox="0 0 24 24" aria-hidden="true"
+            ><path d="M4 7h16M4 12h16M4 17h16" /></svg
+          >
+        </button>
+        {#if menuOpen}
+          <button
+            class="menu-overlay"
+            type="button"
+            tabindex="-1"
+            aria-label="メニューを閉じる"
+            onclick={() => closeMenu(true)}
+          ></button>
+          <nav class="menu-dropdown" aria-label="メニュー">
+            <button
+              class="menu-item"
+              type="button"
+              class:active={route.view === "registry"}
+              onclick={backToRegistry}>Agents</button
+            >
+            <button
+              class="menu-item"
+              type="button"
+              class:active={route.view === "letters"}
+              onclick={openLetters}>Letters</button
+            >
+            <button class="menu-item" type="button" onclick={openTheme}
+              >テーマ設定</button
+            >
+          </nav>
+        {/if}
+      </div>
+    </header>
 
-  {#if route.view !== "agent"}
+    {#if route.view === "registry"}
+      <section class="registry" aria-labelledby="registry-heading">
+        <div class="registry-summary">
+          <h1 id="registry-heading">稼働中の agent</h1>
+          <output
+            aria-live="polite"
+            aria-atomic="true"
+            class:failed={registryPhase === "error"}>{message}</output
+          >
+        </div>
+
+        {#if registryPhase === "loading"}
+          <div class="state-card loading" aria-busy="true">
+            <span class="brush-loader" aria-hidden="true"></span>
+            <p>接続を確かめています</p>
+          </div>
+        {:else if registryPhase === "error"}
+          <div class="state-card error" role="alert">
+            <span class="error-mark" aria-hidden="true">!</span>
+            <div>
+              <strong>一覧を読み込めません</strong>
+              <p>daemon の状態を確認して、もう一度お試しください。</p>
+            </div>
+            <button type="button" onclick={() => refresh(true)}>再試行</button>
+          </div>
+        {:else if agents.length === 0}
+          <div class="state-card empty">
+            <span aria-hidden="true">○</span>
+            <p>静かな待合です。<br />agent が登録されると、ここに現れます。</p>
+          </div>
+        {:else}
+          <ul class="session-list" aria-label="agent status list">
+            {#each sessionGroups as group, index (group.key)}
+              <li class="session-card" style={`--index:${index}`}>
+                <h2 class="session-title">{group.session}</h2>
+                <div
+                  class="agent-buttons"
+                  role="group"
+                  aria-label={group.session}
+                >
+                  {#each group.agents as agent (agent.pane_id)}
+                    <button
+                      type="button"
+                      class="agent-btn"
+                      class:idle={agent.state === "idle"}
+                      class:busy={agent.state === "busy"}
+                      data-pane={agent.pane_id}
+                      aria-label={agentAriaLabel(agent)}
+                      onclick={() => openScreen(agent)}
+                      onkeydown={(event) => {
+                        // jsdom は button の native Enter 起動を合成しないため明示する。
+                        if (event.key === "Enter") {
+                          event.preventDefault();
+                          openScreen(agent);
+                        }
+                      }}
+                    >
+                      {agent.name}
+                    </button>
+                  {/each}
+                </div>
+              </li>
+            {/each}
+          </ul>
+        {/if}
+      </section>
+    {:else}
+      <button class="back-button" type="button" onclick={backToRegistry}
+        >← agent 一覧へ</button
+      >
+      <LettersPanel />
+    {/if}
+
     <footer class="site-footer">
       <span>OBSERVE + LETTERS</span><span>herdr</span>
     </footer>
   {/if}
 </main>
 
-{#if menuOpen}
-  <MenuModal onclose={closeMenu} />
+{#if themeOpen}
+  <MenuModal onclose={closeTheme} />
 {/if}

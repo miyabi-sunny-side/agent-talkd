@@ -54,7 +54,7 @@
   class="menu-modal"
   role="dialog"
   aria-modal="true"
-  aria-label="メニュー"
+  aria-label="テーマ設定"
   tabindex="-1"
   onkeydown={onKeydown}
 >

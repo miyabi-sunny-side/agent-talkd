@@ -89,7 +89,7 @@
   }
 
   function onWindowKeydown(event: KeyboardEvent): void {
-    if (event.key === "Escape" && expanded) {
+    if (event.key === "Escape" && expanded && !event.defaultPrevented) {
       event.stopPropagation();
       void closePanel();
     }

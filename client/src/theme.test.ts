@@ -70,7 +70,7 @@ it("closes on Escape, the close button, and the scrim", async () => {
   const onclose = vi.fn();
   const { container } = render(MenuModal, { onclose });
 
-  await fireEvent.keyDown(screen.getByRole("dialog", { name: "メニュー" }), {
+  await fireEvent.keyDown(screen.getByRole("dialog", { name: "テーマ設定" }), {
     key: "Escape",
   });
   expect(onclose).toHaveBeenCalledTimes(1);
