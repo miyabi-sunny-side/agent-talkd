@@ -107,15 +107,36 @@ export interface LetterAccepted {
   name: string;
 }
 
+export async function fetchSkills(
+  paneId: string,
+  signal?: AbortSignal,
+): Promise<string[]> {
+  const body = await getJson(
+    `/api/agents/${encodeURIComponent(paneId)}/skills`,
+    signal,
+  );
+  if (!isSkillsResponse(body))
+    throw new Error("skills returned an invalid response");
+  return body.skills;
+}
+
 export async function sendLetter(
   source: string,
   target: string,
   body: string,
+  skill: string | null = null,
 ): Promise<LetterAccepted> {
+  const payload: {
+    source: string;
+    target: string;
+    body: string;
+    skill?: string;
+  } = { source, target, body };
+  if (skill) payload.skill = skill;
   const response = await fetch("/api/letters", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ source, target, body }),
+    body: JSON.stringify(payload),
   });
   if (!response.ok) {
     const detail = (await response.json().catch(() => null)) as {
@@ -127,6 +148,14 @@ export async function sendLetter(
   if (!isLetterAccepted(accepted))
     throw new Error("letters returned an invalid response");
   return accepted;
+}
+
+function isSkillsResponse(value: unknown): value is { skills: string[] } {
+  return (
+    isRecord(value) &&
+    Array.isArray(value.skills) &&
+    value.skills.every((skill) => typeof skill === "string")
+  );
 }
 
 function isLetterAccepted(value: unknown): value is LetterAccepted {

@@ -207,7 +207,10 @@ TCP面の到達範囲はoperatorが所有するVPN/LAN境界で定め、process�
 - `GET /api/mailbox/<mailbox>?after=<id>&limit=<n>`: mailbox eventをID順に非consume取得します。
   `after`は排他、`limit`は1〜500で既定100です。JSON event schemaは
   `mailbox-list`と同一です。
-- `POST /api/letters`: 唯一の書き込みroute。`{"source","target","body"}` のJSONを
+- `GET /api/agents/<pane>/skills`: 対象 pane の agent に選べる skill 名一覧
+  (HOME 上の installed skill ∩ `AGENT_TALK_ALLOWED_SKILLS`。skill 記法が無い
+  runtime は空配列)。
+- `POST /api/letters`: 唯一の書き込みroute。`{"source","target","body","skill"?}` のJSONを
   受け、CLIの `send --from` と同一の外部mailbox送信経路 (allowlist・resolve・
   journal-first・配達/requeue) へ流します。sourceは `AGENT_TALK_ALLOWED_SOURCES`
   (既定 `mobile`) が最終判定し、未許可は403。Content-Typeは `application/json`

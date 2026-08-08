@@ -4,8 +4,8 @@
   import { currentRoute, navigate, onPopstate, type Route } from "./router";
   import AgentLetterComposer from "./AgentLetterComposer.svelte";
   import LettersPanel from "./LettersPanel.svelte";
-  import MenuModal from "./MenuModal.svelte";
   import ScreenPanel from "./ScreenPanel.svelte";
+  import ThemeModal from "./ThemeModal.svelte";
 
   const REGISTRY_INTERVAL_MS = 5_000;
   const AGENT_NAME_ORDER = ["claude", "codex", "grok"];
@@ -551,5 +551,5 @@
 </main>
 
 {#if themeOpen}
-  <MenuModal onclose={closeTheme} />
+  <ThemeModal onclose={closeTheme} />
 {/if}

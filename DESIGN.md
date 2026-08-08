@@ -139,11 +139,11 @@ terminal 固定 dark (後述) が実用上の問題になった時に選択肢�
 
 ### 4.4 テーマ切替 UI
 
-ハンバーガー (menu) ボタン → メニューモーダル内「テーマ」section →
-full-width ボタン3択 (radio semantics, `aria-checked`)。UI 呼称:
-**「墨 — ダーク」「生成り — ライト」「システムに従う」**。
-クリックで即適用 + 即保存し、モーダルは開いたままにする (変化を目視確認
-できる)。閉じるのは共通3経路 (§8 モーダル規約)。
+ハンバーガー → dropdown「テーマ設定」→ テンプレート移植の ThemeModal
+(Modal + Icon)。3択 radio (icon 付き): **自動 / ライト / ダーク**
+(値は `system` / `light` / `dark`)。クリックで即適用 + 即保存し、モーダルは
+開いたまま。閉じるのは scrim / × / Escape (§8)。storage key は
+`agent-talkd:theme` のまま。
 
 ## 5. Typography
 
@@ -222,20 +222,22 @@ agent-terrace の letter-dock 構造を踏襲する。全幅 launcher バーは�
 - **panel**: tab の下の線から下 → 上へ展開。`max-height: min(62dvh, 420px)`
   で内部 scroll。展開 motion は max-height/transform/opacity 220ms
   `cubic-bezier(0.22,1,0.36,1)` 以下。**閉時は `inert` + `aria-hidden="true"`**。
-- panel 内容 (現行 composer の機能を器ごと移す。機能は削らない):
+- panel 内容:
   - 見出し `{agent.name} へ手紙を出す` + source 表示 + 閉じる quiet icon
-    button (SVG ×)。
-  - source phase: loading (`mailbox を確認中`) / ready (`{source} から`) /
-    empty (`許可された mailbox が無い` 説明, role=alert) /
-    error (説明 + 再試行, role=alert)。empty と error を混同させない。
-  - 宛先は表示中 pane に固定 (選択 UI なし)。
-  - 送信結果は sent (`送信しました #id`) と queued (`受理されました
-    (配達待ち) #id`) を区別し `aria-live` で通知。失敗時は draft を保持。
-  - draft は module scope の Map に `pane_id + agent name` を key として保持
-    (タブ切替の remount を跨ぐ。identity が変わった pane の draft は破棄)。
-  - 開: panel へ展開し ready なら textarea へ focus (不能時は panel 自身)。
-    閉: Escape / 閉じるボタンで閉じ、focus は tab へ復帰。
-- skill menu は API が無いため対象外。
+    button。
+  - source phase: loading / ready / empty / error (混同させない)。
+  - 宛先は表示中 pane に固定。
+  - **actions 行**: 左 skill ボタン + 右送信ボタン (min-height 44px)。
+  - skill: 既定「なし」(trigger 表示も「なし」)。actions 直下に in-flow の
+    menu (`role=menu` / menuitemradio) を展開。開時は現選択へ focus、
+    Arrow/Home/End、Escape/選択後は trigger へ復帰。候補は
+    `GET /api/agents/{pane}/skills` (installed ∩ allowlist、skill_syntax の
+    無い runtime は空)。0 件でも「なし」のみ。draft に skill も保持。
+  - 送信は `POST /api/letters` に optional `skill`。失敗時は body+skill 保持、
+    成功時のみ clear。
+  - 送信結果 sent / queued を `aria-live` で区別。
+  - 開: panel 展開 + focus。閉: Escape / 閉じる → tab 復帰。skill popup 中の
+    Escape は popup のみ閉じる。
 
 ### 7.7 Letters 画面
 

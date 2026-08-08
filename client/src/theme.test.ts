@@ -1,6 +1,6 @@
 import { fireEvent, render, screen } from "@testing-library/svelte";
 import { beforeEach, expect, it, vi } from "vitest";
-import MenuModal from "./MenuModal.svelte";
+import ThemeModal from "./ThemeModal.svelte";
 import { applyTheme, loadTheme, saveTheme, THEME_STORAGE_KEY } from "./theme";
 
 beforeEach(() => {
@@ -36,48 +36,46 @@ it("applies without saving when only the attribute should change", () => {
   expect(window.localStorage.getItem(THEME_STORAGE_KEY)).toBeNull();
 });
 
-it("offers three choices, applies immediately, and stays open", async () => {
+it("offers three icon choices, applies immediately, and stays open", async () => {
   const onclose = vi.fn();
-  render(MenuModal, { onclose });
+  render(ThemeModal, { onclose });
 
   const group = screen.getByRole("radiogroup", { name: "テーマ" });
   const options = Array.from(group.querySelectorAll("[role='radio']"));
   expect(options.map((option) => option.textContent?.trim())).toEqual([
-    "墨 — ダーク",
-    "生成り — ライト",
-    "システムに従う",
+    "自動",
+    "ライト",
+    "ダーク",
   ]);
   // 既定 (未保存) は system。
   expect(
-    screen
-      .getByRole("radio", { name: "システムに従う" })
-      .getAttribute("aria-checked"),
+    screen.getByRole("radio", { name: "自動" }).getAttribute("aria-checked"),
   ).toBe("true");
 
-  await fireEvent.click(screen.getByRole("radio", { name: "生成り — ライト" }));
+  await fireEvent.click(screen.getByRole("radio", { name: "ライト" }));
   expect(document.documentElement.dataset.theme).toBe("light");
   expect(window.localStorage.getItem(THEME_STORAGE_KEY)).toBe("light");
   // 変化を目視確認できるようモーダルは開いたまま。
   expect(onclose).not.toHaveBeenCalled();
   expect(
-    screen
-      .getByRole("radio", { name: "生成り — ライト" })
-      .getAttribute("aria-checked"),
+    screen.getByRole("radio", { name: "ライト" }).getAttribute("aria-checked"),
   ).toBe("true");
 });
 
 it("closes on Escape, the close button, and the scrim", async () => {
   const onclose = vi.fn();
-  const { container } = render(MenuModal, { onclose });
+  const { container } = render(ThemeModal, { onclose });
 
-  await fireEvent.keyDown(screen.getByRole("dialog", { name: "テーマ設定" }), {
-    key: "Escape",
-  });
+  await fireEvent.keyDown(window, { key: "Escape" });
   expect(onclose).toHaveBeenCalledTimes(1);
 
-  await fireEvent.click(screen.getByRole("button", { name: "閉じる" }));
-  expect(onclose).toHaveBeenCalledTimes(2);
+  onclose.mockClear();
+  const closeButtons = screen.getAllByRole("button", { name: "閉じる" });
+  // icon × (modal head) を押す。scrim も同名なので最後ではなく head 側。
+  await fireEvent.click(closeButtons[closeButtons.length - 1]!);
+  expect(onclose).toHaveBeenCalledTimes(1);
 
-  await fireEvent.click(container.querySelector(".modal-scrim")!);
-  expect(onclose).toHaveBeenCalledTimes(3);
+  onclose.mockClear();
+  await fireEvent.click(container.querySelector(".scrim")!);
+  expect(onclose).toHaveBeenCalledTimes(1);
 });

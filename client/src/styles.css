@@ -597,12 +597,46 @@ output.failed,
 .composer-form .compose-actions {
   display: flex;
   align-items: center;
+  justify-content: space-between;
   gap: 12px;
   flex-wrap: wrap;
 }
 
+.composer-form .skill-button {
+  display: inline-flex;
+  min-height: 44px;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--on-surface);
+  background: var(--surface);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.composer-form .skill-button svg {
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.7;
+}
+.composer-form .skill-button.active {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.composer-form .skill-button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
 .letter-compose button[type="submit"],
+.composer-form .send-button,
 .composer-form button[type="submit"] {
+  min-height: 44px;
+  margin-left: auto;
   padding: 8px 20px;
   border: 1px solid var(--on-surface);
   border-radius: 999px;
@@ -613,13 +647,53 @@ output.failed,
 }
 
 .letter-compose button[type="submit"]:disabled,
+.composer-form .send-button:disabled,
 .composer-form button[type="submit"]:disabled {
   opacity: 0.45;
   cursor: not-allowed;
 }
 
+.composer-form .skill-menu {
+  display: flex;
+  max-height: min(40dvh, 240px);
+  flex-direction: column;
+  gap: 4px;
+  overflow-y: auto;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+}
+.composer-form .skill-menu-label {
+  color: var(--muted);
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 10px;
+  letter-spacing: 0.12em;
+}
+.composer-form .skill-menu button[role="menuitemradio"] {
+  min-height: 36px;
+  padding: 6px 10px;
+  border: 0;
+  border-radius: 8px;
+  color: var(--on-surface);
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+.composer-form .skill-menu button[role="menuitemradio"].selected,
+.composer-form .skill-menu button[role="menuitemradio"]:hover {
+  background: var(--accent-subtle);
+}
+.composer-form .skill-menu-note {
+  margin: 0;
+  color: var(--danger);
+  font-size: 12px;
+}
+
 .letter-compose .compose-status,
 .composer-form .compose-status {
+  display: block;
+  min-height: 1.2em;
   font-size: 13px;
   color: var(--muted);
 }

@@ -218,11 +218,16 @@ enum HttpEvent {
         source: String,
         target: String,
         body: String,
+        skill: Option<String>,
         reply: oneshot::Sender<std::result::Result<serde_json::Value, WebError>>,
     },
     Screen {
         pane: String,
         reply: oneshot::Sender<std::result::Result<WebScreen, WebError>>,
+    },
+    Skills {
+        pane: String,
+        reply: oneshot::Sender<std::result::Result<Vec<String>, WebError>>,
     },
     Mailboxes {
         reply: oneshot::Sender<Vec<String>>,
@@ -563,6 +568,13 @@ async fn route_http(
                 request_web_screen(&tx, pane).await
             }
         }
+        HttpRoute::Skills(pane) => {
+            if request.uri().query().is_some() {
+                json_error(StatusCode::BAD_REQUEST, "invalid_query")
+            } else {
+                request_web_skills(&tx, pane).await
+            }
+        }
         HttpRoute::Mailboxes => {
             if request.uri().query().is_some() {
                 json_error(StatusCode::BAD_REQUEST, "invalid_query")
@@ -631,6 +643,8 @@ async fn request_web_letter(
         source: String,
         target: String,
         body: String,
+        #[serde(default)]
+        skill: Option<String>,
     }
 
     let json_content_type = request
@@ -663,6 +677,8 @@ async fn request_web_letter(
             source: letter.source,
             target: letter.target,
             body: letter.body,
+            // 空文字・不正 token は None に正規化せず、既存 SendOptions 検証へ渡す。
+            skill: letter.skill,
             reply,
         }))
         .await
@@ -672,6 +688,22 @@ async fn request_web_letter(
     }
     match receive.await {
         Ok(Ok(accepted)) => json_response(StatusCode::OK, &accepted),
+        Ok(Err(error)) => json_error(error.status, error.code),
+        Err(_) => json_error(StatusCode::SERVICE_UNAVAILABLE, "broker_unavailable"),
+    }
+}
+
+async fn request_web_skills(tx: &mpsc::Sender<Event>, pane: String) -> HttpResponse<Full<Bytes>> {
+    let (reply, receive) = oneshot::channel();
+    if tx
+        .send(Event::Http(HttpEvent::Skills { pane, reply }))
+        .await
+        .is_err()
+    {
+        return json_error(StatusCode::SERVICE_UNAVAILABLE, "broker_unavailable");
+    }
+    match receive.await {
+        Ok(Ok(skills)) => json_response(StatusCode::OK, &serde_json::json!({ "skills": skills })),
         Ok(Err(error)) => json_error(error.status, error.code),
         Err(_) => json_error(StatusCode::SERVICE_UNAVAILABLE, "broker_unavailable"),
     }
@@ -734,6 +766,7 @@ enum HttpRoute {
     Hello,
     Who,
     Screen(String),
+    Skills(String),
     Mailboxes,
     Mailbox(String),
     BadRequest,
@@ -759,6 +792,16 @@ fn classify_http(method: &Method, path: &str) -> HttpRoute {
         "/api/hello" => HttpRoute::Hello,
         "/api/who" => HttpRoute::Who,
         "/api/mailboxes" => HttpRoute::Mailboxes,
+        path if path.starts_with("/api/agents/") && path.ends_with("/skills") => {
+            let encoded = path
+                .strip_prefix("/api/agents/")
+                .and_then(|rest| rest.strip_suffix("/skills"))
+                .unwrap_or_default();
+            match decode_path_segment(encoded) {
+                Some(pane) => HttpRoute::Skills(pane),
+                None => HttpRoute::BadRequest,
+            }
+        }
         path if path.starts_with("/api/agents/") && path.ends_with("/screen") => {
             let encoded = path
                 .strip_prefix("/api/agents/")
@@ -998,12 +1041,16 @@ impl Broker {
                 source,
                 target,
                 body,
+                skill,
                 reply,
             } => {
-                let _ = reply.send(self.web_letter(source, target, body).await);
+                let _ = reply.send(self.web_letter(source, target, body, skill).await);
             }
             HttpEvent::Screen { pane, reply } => {
                 let _ = reply.send(self.web_screen(&pane).await);
+            }
+            HttpEvent::Skills { pane, reply } => {
+                let _ = reply.send(self.web_skills(&pane));
             }
             HttpEvent::Mailboxes { reply } => {
                 let _ = reply.send(self.config.allowed_sources.iter().cloned().collect());
@@ -1048,6 +1095,7 @@ impl Broker {
         source: String,
         target: String,
         body: String,
+        skill: Option<String>,
     ) -> std::result::Result<serde_json::Value, WebError> {
         let request = Request {
             command: "send-v2".into(),
@@ -1056,7 +1104,7 @@ impl Broker {
             pane: None,
             send_options: Some(SendOptions {
                 from: Some(source),
-                skill: None,
+                skill,
                 no_reply: false,
             }),
             peer_pid: None,
@@ -1070,7 +1118,12 @@ impl Broker {
                 .map_err(|_| WebError::new(StatusCode::INTERNAL_SERVER_ERROR, "letter_failed"));
         }
         // 表示は code に落とす (本文の日本語エラーは HTTP へ流さない)。
-        if response.stderr.contains("許可されていません") {
+        if response.stderr.contains("AGENT_TALK_ALLOWED_SKILLS")
+            || response.stderr.contains("skill名は")
+            || response.stderr.contains("skill記法")
+        {
+            Err(WebError::new(StatusCode::BAD_REQUEST, "skill_rejected"))
+        } else if response.stderr.contains("許可されていません") {
             Err(WebError::new(StatusCode::FORBIDDEN, "source_not_allowed"))
         } else if response.stderr.contains("見つかりません") || response.stderr.contains("退出済み")
         {
@@ -1078,6 +1131,24 @@ impl Broker {
         } else {
             Err(WebError::new(StatusCode::BAD_REQUEST, "letter_rejected"))
         }
+    }
+
+    /// 対象 pane の agent に付けられる skill 候補。
+    /// `skill_syntax` が無い runtime は空。一覧は home 上の installed ∩
+    /// `AGENT_TALK_ALLOWED_SKILLS` (設定時) の積。
+    fn web_skills(&self, pane: &str) -> std::result::Result<Vec<String>, WebError> {
+        let Some(agent) = self.state.agents.get(pane) else {
+            return Err(WebError::new(StatusCode::NOT_FOUND, "agent_not_found"));
+        };
+        if !self.config.skill_syntax.contains_key(&agent.name) {
+            return Ok(Vec::new());
+        }
+        let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
+        let mut skills = installed_skills_for_runtime(&home, &agent.name);
+        if let Some(allowed) = &self.config.allowed_skills {
+            skills.retain(|skill| allowed.contains(skill));
+        }
+        Ok(skills)
     }
 
     async fn web_screen(&self, pane: &str) -> std::result::Result<WebScreen, WebError> {
@@ -2399,6 +2470,36 @@ fn format_ids(ids: &[u64]) -> String {
         .join(" ")
 }
 
+/// HOME 上に installed された skill 名 (SKILL.md を持つ dir)。runtime 別 root。
+fn installed_skills_for_runtime(home: &Path, runtime: &str) -> Vec<String> {
+    use std::collections::BTreeSet;
+    let roots: Vec<PathBuf> = match runtime {
+        "claude" => vec![home.join(".claude/skills")],
+        "codex" => vec![
+            home.join(".agents/skills"),
+            home.join(".codex/skills"),
+            home.join(".codex/skills/.system"),
+        ],
+        "grok" => vec![home.join(".grok/skills")],
+        _ => return Vec::new(),
+    };
+    let mut skills = BTreeSet::new();
+    for root in roots {
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if is_safe_token(&name) && entry.path().join("SKILL.md").is_file() {
+                skills.insert(name);
+            }
+        }
+    }
+    skills.into_iter().collect()
+}
+
 fn display_state(status: AgentStatus) -> AgentState {
     if status.accepts_delivery() {
         AgentState::Idle
@@ -2608,8 +2709,8 @@ mod tests {
     use super::{
         Broker, HttpRoute, Journal, MAX_BODY_BYTES, MailboxPageError, Request, SendIntent,
         SendOptions, WebAgent, adopt_legacy_journal, capture_failure, classify_http,
-        decode_path_segment, parse_mailbox_page, parse_mailbox_query, peer_uid_allowed, rfc3339,
-        static_response,
+        decode_path_segment, installed_skills_for_runtime, parse_mailbox_page, parse_mailbox_query,
+        peer_uid_allowed, rfc3339, static_response,
     };
     use crate::{
         backend::Backend,
@@ -3440,7 +3541,7 @@ mod tests {
 
         // 既定 deny: allowlist が空なら 403 で、journal にも state にも痕跡が無い。
         let error = broker
-            .web_letter("mobile".into(), "claude".into(), "letter body".into())
+            .web_letter("mobile".into(), "claude".into(), "letter body".into(), None)
             .await
             .unwrap_err();
         assert_eq!(error.status, StatusCode::FORBIDDEN);
@@ -3450,7 +3551,7 @@ mod tests {
         // 許可すると CLI の send --from と同一経路で受理される (versioned JSON)。
         broker.config.allowed_sources.insert("mobile".into());
         let accepted = broker
-            .web_letter("mobile".into(), "claude".into(), "letter body".into())
+            .web_letter("mobile".into(), "claude".into(), "letter body".into(), None)
             .await
             .unwrap();
         assert_eq!(accepted["version"], 1);
@@ -3466,10 +3567,138 @@ mod tests {
 
         // 実在しない宛先は 404。
         let error = broker
-            .web_letter("mobile".into(), "ghost".into(), "x".into())
+            .web_letter("mobile".into(), "ghost".into(), "x".into(), None)
             .await
             .unwrap_err();
         assert_eq!(error.status, StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn installed_skills_collect_only_safe_skill_md_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".claude/skills");
+        std::fs::create_dir_all(root.join("deliver")).unwrap();
+        std::fs::write(root.join("deliver/SKILL.md"), "# deliver\n").unwrap();
+        std::fs::create_dir_all(root.join("polish")).unwrap();
+        std::fs::write(root.join("polish/SKILL.md"), "# polish\n").unwrap();
+        // SKILL.md が無い dir は無視。
+        std::fs::create_dir_all(root.join("no-md")).unwrap();
+        // unsafe token は無視。
+        std::fs::create_dir_all(root.join("Bad Name")).unwrap();
+        std::fs::write(root.join("Bad Name/SKILL.md"), "# bad\n").unwrap();
+
+        let found = installed_skills_for_runtime(dir.path(), "claude");
+        assert_eq!(found, vec!["deliver".to_owned(), "polish".to_owned()]);
+        assert!(installed_skills_for_runtime(dir.path(), "unknown").is_empty());
+    }
+
+    #[tokio::test]
+    async fn web_skills_filters_by_syntax_allowlist_and_unknown_pane() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_root = dir.path().join(".claude/skills");
+        std::fs::create_dir_all(skill_root.join("deliver")).unwrap();
+        std::fs::write(skill_root.join("deliver/SKILL.md"), "# d\n").unwrap();
+        std::fs::create_dir_all(skill_root.join("polish")).unwrap();
+        std::fs::write(skill_root.join("polish/SKILL.md"), "# p\n").unwrap();
+
+        let mut broker = registered_pair(&dir).await;
+        // 一時 HOME を差し替え、installed 走査を tempdir へ向ける。
+        // SAFETY: 単体テスト内で HOME を差し替える。他テストと並列に HOME を
+        // 読む経路へ影響し得るが、本 file の web_skills テストは直列で十分。
+        let previous_home = std::env::var_os("HOME");
+        // env 変更は process 全体に効く。後始末を確実に。
+        unsafe {
+            std::env::set_var("HOME", dir.path());
+        }
+
+        // skill_syntax が無いと空。
+        assert_eq!(broker.web_skills("w1:p2").unwrap(), Vec::<String>::new());
+
+        broker
+            .config
+            .skill_syntax
+            .insert("claude".into(), crate::config::SkillSyntax::Slash);
+        let listed = broker.web_skills("w1:p2").unwrap();
+        assert_eq!(listed, vec!["deliver".to_owned(), "polish".to_owned()]);
+
+        broker.config.allowed_skills = Some(["deliver".into()].into_iter().collect());
+        assert_eq!(
+            broker.web_skills("w1:p2").unwrap(),
+            vec!["deliver".to_owned()]
+        );
+
+        let err = broker.web_skills("missing:p9").unwrap_err();
+        assert_eq!(err.status, StatusCode::NOT_FOUND);
+
+        if let Some(home) = previous_home {
+            unsafe {
+                std::env::set_var("HOME", home);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("HOME");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn web_letter_skill_uses_send_path_and_rejects_unsafe() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut broker = registered_pair(&dir).await;
+        broker.config.allowed_sources.insert("mobile".into());
+        broker
+            .config
+            .skill_syntax
+            .insert("claude".into(), crate::config::SkillSyntax::Slash);
+        broker.config.allowed_skills = Some(["deliver".into()].into_iter().collect());
+
+        // 許可 skill は sent になり、mailbox event に skill が載る。
+        let accepted = broker
+            .web_letter(
+                "mobile".into(),
+                "claude".into(),
+                "with skill".into(),
+                Some("deliver".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(accepted["path"], "sent");
+        let events = broker.state.mailbox_events("mobile", None, 10);
+        assert_eq!(events[0].skill.as_deref(), Some("deliver"));
+        let bells = bells(&broker);
+        assert!(
+            bells
+                .last()
+                .is_some_and(|(_, text)| text.contains("/deliver ")),
+            "bell に skill prefix が付く: {bells:?}"
+        );
+
+        let before = broker.state.messages.len();
+        // 空 skill は safe-token で拒否。
+        let err = broker
+            .web_letter(
+                "mobile".into(),
+                "claude".into(),
+                "empty skill".into(),
+                Some(String::new()),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, "skill_rejected");
+        assert_eq!(broker.state.messages.len(), before, "拒否は痕跡を残さない");
+
+        // allowlist 外も拒否。
+        let err = broker
+            .web_letter(
+                "mobile".into(),
+                "claude".into(),
+                "bad skill".into(),
+                Some("polish".into()),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, "skill_rejected");
+        assert_eq!(broker.state.messages.len(), before);
     }
 
     #[tokio::test]
@@ -4114,6 +4343,17 @@ mod tests {
         assert_eq!(
             classify_http(&Method::GET, "/api/agents/w2%3Ap4/screen"),
             HttpRoute::Screen("w2:p4".into())
+        );
+        assert_eq!(
+            classify_http(&Method::GET, "/api/agents/w2%3Ap4/skills"),
+            HttpRoute::Skills("w2:p4".into())
+        );
+        assert_eq!(
+            super::installed_skills_for_runtime(
+                std::path::Path::new("/tmp/no-such-home"),
+                "claude"
+            ),
+            Vec::<String>::new()
         );
         // `/` を含む opaque な id も percent encode で screen route に載る。
         assert_eq!(
