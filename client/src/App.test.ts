@@ -235,6 +235,7 @@ it("does not carry a draft to a new occupant of the same pane", async () => {
   });
   // 旧 draft は新しい agent に引き継がれない。
   expect(newTab.textContent).not.toContain("下書きあり");
+  expect(newTab.classList.contains("has-draft")).toBe(false);
   await fireEvent.click(newTab);
   const newBody = await screen.findByRole("textbox", {
     name: "gemini への手紙の本文",

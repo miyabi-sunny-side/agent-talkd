@@ -2,6 +2,7 @@ import { fireEvent, render, screen } from "@testing-library/svelte";
 import { afterEach, expect, it, vi } from "vitest";
 import ScreenPanel from "./ScreenPanel.svelte";
 import type { Agent } from "./api";
+import styles from "./styles.css?inline";
 
 const agent: Agent = {
   name: "codex",
@@ -36,6 +37,23 @@ it("renders captured terminal text without interpreting markup", async () => {
   ).toBeTruthy();
   expect(container.querySelector("b")).toBeNull();
   expect(screen.getByRole("log", { name: "codex terminal" })).toBeTruthy();
+});
+
+it("does not draw an accent top border around the detail terminal", async () => {
+  const style = document.createElement("style");
+  style.textContent = styles;
+  document.head.append(style);
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(capture("terminal")));
+  const { container, unmount } = render(ScreenPanel, { agent });
+  container.classList.add("detail-view");
+
+  const terminal = await screen.findByRole("log", { name: "codex terminal" });
+  // jsdom reports the unused width keyword as `medium`; borderTopStyle is the
+  // observable that distinguishes the removed edge from the three retained ones.
+  expect(getComputedStyle(terminal).borderTopStyle).toBe("none");
+
+  unmount();
+  style.remove();
 });
 
 it("polls every two seconds while visible", async () => {

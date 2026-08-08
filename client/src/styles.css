@@ -411,7 +411,6 @@ output.failed,
   max-height: calc(100dvh - 250px);
   overflow: auto;
   border: 1px solid #48463e;
-  border-top: 2px solid var(--accent);
   /* terminal は両テーマで dark 固定 — capture の忠実性のため (DESIGN.md §4.3) */
   background: var(--terminal-bg);
   box-shadow: inset 0 14px 35px rgba(0, 0, 0, 0.35);
@@ -812,7 +811,6 @@ main.detail-view {
   );
   margin: 0;
   border: 0;
-  border-top: 2px solid var(--accent);
   border-right: 1px solid #48463e;
   border-bottom: 1px solid #48463e;
   border-left: 1px solid #48463e;
@@ -864,7 +862,8 @@ main.detail-view {
   pointer-events: auto;
 }
 .letter-tab:hover,
-.letter-tab[aria-expanded="true"] {
+.letter-tab[aria-expanded="true"],
+.letter-tab.has-draft {
   border-color: var(--accent);
   color: var(--accent);
 }
@@ -937,13 +936,6 @@ main.detail-view {
   margin: 0;
   color: var(--danger);
   font-size: 12px;
-}
-.draft-badge {
-  padding: 2px 7px;
-  border: 1px solid var(--busy);
-  color: var(--busy);
-  font-size: 10px;
-  letter-spacing: 0.08em;
 }
 .composer-form textarea {
   width: 100%;

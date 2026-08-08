@@ -310,11 +310,13 @@ it("keeps a per-pane draft across sibling switches", async () => {
   sibling.unmount();
 
   render(AgentLetterComposer, { agent });
-  // launcher が下書きの存在を示し、開くと本文が戻る。
+  // launcher は寸法を変える可視 badge を足さず、枠用 class と accessible name
+  // だけで下書きの存在を示す。開くと本文が戻る。
   const restored = await screen.findByRole("button", {
-    name: /codex に手紙を出す/,
+    name: "codex に手紙を出す — 下書きあり",
   });
-  expect(restored.textContent).toContain("下書きあり");
+  expect(restored.textContent).not.toContain("下書きあり");
+  expect(restored.classList.contains("has-draft")).toBe(true);
   await fireEvent.click(restored);
   const restoredBody = await screen.findByRole("textbox", {
     name: "codex への手紙の本文",

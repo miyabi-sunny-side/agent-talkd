@@ -204,7 +204,8 @@ terminal 固定 dark (後述) が実用上の問題になった時に選択肢�
 ### 7.5 Screen (terminal)
 
 - 2秒間隔の visible-only poll を継続。手動更新 UI なし。
-- terminal: role=log、mono、固定 dark。詳細では viewport 全幅。上辺 2px accent。
+- terminal: role=log、mono、固定 dark。詳細では viewport 全幅。accent border は
+  付けず、左右・下辺の暗色 border のみ。
 - 失敗・退出時の扱いは従来どおり (dim / 再試行 / タブ更新)。
 
 ### 7.6 Letter dock (ribbon composer) — 詳細画面下部
@@ -217,8 +218,9 @@ agent-terrace の letter-dock 構造を踏襲する。全幅 launcher バーは�
   `min-width: 108px`・`height: 44px`・`border-radius: 9px 9px 0 0`・
   border は下辺なし・地は `--surface-raised`・mono 12px。内容 = 封筒 SVG
   (17px) + `手紙` + chevron SVG (13px、開時 180° 回転)。hover / 開時は
-  accent 色。`aria-expanded` + `aria-controls`。未送信 draft がある時は
-  tab 内に `下書きあり` badge (busy token 色の枠)。
+  accent 色。`aria-expanded` + `aria-controls`。未送信 draft (body または
+  skill) がある時は tab の寸法・可視内容を変えず、枠を `--accent` にする。
+  色だけに依存せず accessible name には `下書きあり` を加える。
 - **panel**: tab の下の線から下 → 上へ展開。`max-height: min(62dvh, 420px)`
   で内部 scroll。展開 motion は max-height/transform/opacity 220ms
   `cubic-bezier(0.22,1,0.36,1)` 以下。**閉時は `inert` + `aria-hidden="true"`**。

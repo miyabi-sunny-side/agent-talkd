@@ -38,10 +38,11 @@
   let skillMenu = $state<HTMLDivElement | undefined>();
 
   const skillLabel = $derived(selectedSkill ?? "なし");
+  const hasDraft = $derived(draft.trim() !== "" || selectedSkill !== null);
 
   $effect(() => {
     // 下書きの保存。成功送信で clear された場合は保持からも消す。
-    if (draft.trim() === "" && selectedSkill === null) {
+    if (!hasDraft) {
       drafts.delete(draftKey);
     } else {
       drafts.set(draftKey, { body: draft, skill: selectedSkill });
@@ -237,18 +238,16 @@
       bind:this={tab}
       type="button"
       class="letter-tab"
+      class:has-draft={hasDraft}
       aria-expanded={expanded}
       aria-controls="letter-dock-panel"
-      aria-label={`${agent.name} に手紙を出す`}
+      aria-label={`${agent.name} に手紙を出す${hasDraft ? " — 下書きあり" : ""}`}
       onclick={togglePanel}
     >
       <svg viewBox="0 0 24 24" aria-hidden="true"
         ><path d="M4 6h16v12H4z" /><path d="m4 7 8 6 8-6" /></svg
       >
       手紙
-      {#if draft.trim() !== "" || selectedSkill !== null}<span
-          class="draft-badge">下書きあり</span
-        >{/if}
       <svg class="dock-chevron" viewBox="0 0 24 24" aria-hidden="true"
         ><path d="m7 15 5-5 5 5" /></svg
       >
