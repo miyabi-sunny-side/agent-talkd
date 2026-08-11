@@ -476,6 +476,50 @@ it("restores menu focus after Escape and overlay close", async () => {
   await vi.waitFor(() => expect(document.activeElement).toBe(menu));
 });
 
+it("keeps app chrome outside main and draws no site footer", async () => {
+  const fetch = vi.fn((input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url === "/api/who") {
+      return Promise.resolve(
+        new Response(JSON.stringify({ agents: [] }), { status: 200 }),
+      );
+    }
+    if (url === "/api/mailboxes") {
+      return Promise.resolve(
+        new Response(JSON.stringify({ mailboxes: ["mobile"] }), {
+          status: 200,
+        }),
+      );
+    }
+    if (url.startsWith("/api/mailbox/")) {
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({
+            version: 1,
+            mailbox: "mobile",
+            events: [],
+          }),
+          { status: 200 },
+        ),
+      );
+    }
+    return Promise.resolve(new Response("{}", { status: 404 }));
+  });
+  vi.stubGlobal("fetch", fetch);
+  render(App);
+  await screen.findByText("静かな待合です。", { exact: false });
+  expect(screen.queryByText("OBSERVE + LETTERS")).toBeNull();
+  expect(document.querySelector(".site-footer")).toBeNull();
+
+  await fireEvent.click(screen.getByRole("button", { name: "メニュー" }));
+  await fireEvent.click(screen.getByRole("button", { name: "Letters" }));
+  expect(await screen.findByRole("heading", { name: "Letters" })).toBeTruthy();
+  expect(screen.queryByText("OBSERVE + LETTERS")).toBeNull();
+  expect(document.querySelector(".site-footer")).toBeNull();
+  const brand = screen.getByRole("button", { name: "agent registry を表示" });
+  expect(brand.closest("main")).toBeNull();
+});
+
 it("restores the same agent from a deep link and explains a missing pane", async () => {
   const who = {
     agents: [

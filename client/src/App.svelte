@@ -274,8 +274,8 @@
 
 <svelte:window onkeydown={onWindowKeydown} />
 
-<main class:detail-view={route.view === "agent"}>
-  {#if route.view === "agent"}
+{#if route.view === "agent"}
+  <main class="detail-view">
     {#if displayAgent}
       <header class="detail-chrome">
         <div class="detail-bar-primary">
@@ -419,58 +419,62 @@
         >
       </div>
     {/if}
-  {:else}
-    <header class="app-header">
+  </main>
+{:else}
+  <!-- app header は main 外の full-bleed chrome (詳細 1 段目と同 gutter)。
+       本文だけ max-width 中央に残す (DESIGN.md §6 / §7.1)。 -->
+  <header class="app-header">
+    <button
+      class="brand-link"
+      type="button"
+      onclick={backToRegistry}
+      aria-label="agent registry を表示"
+    >
+      agent <i>talk</i>
+    </button>
+    <div class="menu-wrapper">
       <button
-        class="brand-link"
+        bind:this={menuButton}
         type="button"
-        onclick={backToRegistry}
-        aria-label="agent registry を表示"
+        class="icon-button menu-button"
+        aria-label="メニュー"
+        aria-expanded={menuOpen}
+        onclick={toggleMenu}
       >
-        agent <i>talk</i>
-      </button>
-      <div class="menu-wrapper">
-        <button
-          bind:this={menuButton}
-          type="button"
-          class="icon-button menu-button"
-          aria-label="メニュー"
-          aria-expanded={menuOpen}
-          onclick={toggleMenu}
+        <svg viewBox="0 0 24 24" aria-hidden="true"
+          ><path d="M4 7h16M4 12h16M4 17h16" /></svg
         >
-          <svg viewBox="0 0 24 24" aria-hidden="true"
-            ><path d="M4 7h16M4 12h16M4 17h16" /></svg
-          >
-        </button>
-        {#if menuOpen}
+      </button>
+      {#if menuOpen}
+        <button
+          class="menu-overlay"
+          type="button"
+          tabindex="-1"
+          aria-label="メニューを閉じる"
+          onclick={() => closeMenu(true)}
+        ></button>
+        <nav class="menu-dropdown" aria-label="メニュー">
           <button
-            class="menu-overlay"
+            class="menu-item"
             type="button"
-            tabindex="-1"
-            aria-label="メニューを閉じる"
-            onclick={() => closeMenu(true)}
-          ></button>
-          <nav class="menu-dropdown" aria-label="メニュー">
-            <button
-              class="menu-item"
-              type="button"
-              class:active={route.view === "registry"}
-              onclick={backToRegistry}>Agents</button
-            >
-            <button
-              class="menu-item"
-              type="button"
-              class:active={route.view === "letters"}
-              onclick={openLetters}>Letters</button
-            >
-            <button class="menu-item" type="button" onclick={openTheme}
-              >テーマ設定</button
-            >
-          </nav>
-        {/if}
-      </div>
-    </header>
+            class:active={route.view === "registry"}
+            onclick={backToRegistry}>Agents</button
+          >
+          <button
+            class="menu-item"
+            type="button"
+            class:active={route.view === "letters"}
+            onclick={openLetters}>Letters</button
+          >
+          <button class="menu-item" type="button" onclick={openTheme}
+            >テーマ設定</button
+          >
+        </nav>
+      {/if}
+    </div>
+  </header>
 
+  <main>
     {#if route.view === "registry"}
       <section class="registry" aria-labelledby="registry-heading">
         <div class="registry-summary">
@@ -543,12 +547,8 @@
       >
       <LettersPanel />
     {/if}
-
-    <footer class="site-footer">
-      <span>OBSERVE + LETTERS</span><span>herdr</span>
-    </footer>
-  {/if}
-</main>
+  </main>
+{/if}
 
 {#if themeOpen}
   <ThemeModal onclose={closeTheme} />

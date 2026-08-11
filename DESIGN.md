@@ -155,8 +155,13 @@ terminal 固定 dark (後述) が実用上の問題になった時に選択肢�
 
 ## 6. Layout と spacing
 
-- 一覧 / Letters の `main`: `width: min(1020px, 100%)`、中央寄せ。
-  横 padding `clamp(16px, 5vw, 56px)`。上は app header (48px) が担う。
+- 一覧 / Letters の **app header** は `main` の sibling として viewport
+  full-bleed (48px sticky)。左右 gutter は詳細 1 段目と同一 token
+  (`--chrome-inline-start` / `--chrome-inline-end` =
+  `max(12px, safe-area-left)` / `max(8px, safe-area-right)`)。
+- 一覧 / Letters の **本文 `main`**: `width: min(1020px, 100%)`、中央寄せ。
+  横 padding `clamp(16px, 5vw, 56px)`。`min-height: calc(100dvh - 48px)`。
+  chrome の端位置と本文列の幅は独立 (header を本文 max-width に閉じ込めない)。
 - 詳細 (`/agent`): `main` は full-bleed。chrome 2 段 48+40 + hairline 1 =
   outer **89px** + letter dock tab を除いた高さを terminal に与える。
 - 横 scroll をページに出さない。最小対応幅 320px。カード内 agent ボタンは wrap。
@@ -165,7 +170,8 @@ terminal 固定 dark (後述) が実用上の問題になった時に選択肢�
 
 ### 7.1 App header (Registry / Letters)
 
-テンプレート Header を copy-then-own した 48px sticky bar。
+テンプレート Header を copy-then-own した 48px sticky bar。`main` 外に置き
+viewport 全幅。左右 gutter は詳細 `.detail-bar-primary` と共通 token。
 
 - 左: brand `agent talk` (`talk` = accent italic)。SPA navigate 用 button。
   full page reload の `<a href="/">` は使わない。
@@ -248,9 +254,9 @@ agent-terrace の letter-dock 構造を踏襲する。全幅 launcher バーは�
 (source = 選択 mailbox、宛先 = 稼働 agent select)。この画面の compose は
 dock 化の対象外。
 
-### 7.8 Footer (Registry / Letters のみ)
+### 7.8 Footer
 
-`OBSERVE + LETTERS` / `herdr`。
+Registry / Letters / 詳細のいずれにも site footer は置かない。
 
 ## 8. モーダル共通規約 (copy-then-own)
 
@@ -283,8 +289,9 @@ registry 画面では aria-live output にのみ失敗を示す。
 - 320px〜: ページ横 scroll なし。agent ボタンは wrap。
 - 390×844 / 412×915 (mobile): app/detail 1 段目 48px、detail 2 段目 40px、
   terminal 高さ ≥55% viewport。
-- ≥1020px: 一覧 main は 1020px で中央固定。詳細 terminal は viewport 全幅。
-  dock の tab は右寄せ、上辺の線は全幅。
+- ≥1020px: 一覧の本文 main は 1020px で中央固定。app header は viewport 全幅
+  のまま (詳細 1 段目と brand/menu の端を揃える)。詳細 terminal は viewport
+  全幅。dock の tab は右寄せ、上辺の線は全幅。
 
 ## 11. Keyboard / focus / touch
 

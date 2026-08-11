@@ -24,6 +24,9 @@
   /* 地の紙目。theme ごとに明暗が反転するので token 化する。 */
   --texture-glow: rgba(233, 228, 216, 0.045);
   --texture-grain: rgba(255, 255, 255, 0.009);
+  /* app header / detail 1 段目の左右 gutter (DESIGN.md §7.1) */
+  --chrome-inline-start: max(12px, env(safe-area-inset-left, 0px));
+  --chrome-inline-end: max(8px, env(safe-area-inset-right, 0px));
   color-scheme: dark;
 }
 
@@ -102,21 +105,23 @@ pre:focus-visible {
 
 main {
   width: min(1020px, 100%);
-  min-height: 100dvh;
+  min-height: calc(100dvh - 48px);
   margin: auto;
   padding: 0 clamp(16px, 5vw, 56px) 18px;
 }
-/* --- app chrome (template Header 相当, DESIGN.md §7.1) --- */
+/* --- app chrome (template Header 相当, DESIGN.md §7.1) ---
+   Registry / Letters では main の sibling。viewport full-bleed で詳細 1 段目と
+   同じ左右 gutter を共有する。本文 max-width 中央とは独立。 */
 .app-header {
   position: sticky;
   top: 0;
   z-index: 10;
   display: flex;
+  width: 100%;
   height: 48px;
   align-items: center;
   justify-content: space-between;
-  margin-inline: calc(-1 * clamp(16px, 5vw, 56px));
-  padding-inline: clamp(16px, 5vw, 56px);
+  padding-inline: var(--chrome-inline-start) var(--chrome-inline-end);
   border-bottom: 1px solid var(--border);
   background: var(--surface);
 }
@@ -185,7 +190,6 @@ main {
   background: var(--accent-subtle);
 }
 output,
-.site-footer,
 .status,
 .screen-status,
 .quiet-button,
@@ -508,14 +512,6 @@ output.failed,
   color: var(--muted);
   font-size: 9px;
 }
-.site-footer {
-  display: flex;
-  justify-content: space-between;
-  margin-top: 18px;
-  color: var(--muted);
-  font-size: 9px;
-  letter-spacing: 0.12em;
-}
 
 @keyframes ink-in {
   from {
@@ -706,6 +702,7 @@ output.failed,
 main.detail-view {
   width: 100%;
   max-width: none;
+  min-height: 100dvh;
   padding: 0;
   padding-bottom: calc(56px + env(safe-area-inset-bottom));
 }
@@ -746,8 +743,7 @@ main.detail-view {
   align-items: center;
   gap: 12px;
   height: 48px;
-  padding-inline: max(12px, env(safe-area-inset-left))
-    max(8px, env(safe-area-inset-right));
+  padding-inline: var(--chrome-inline-start) var(--chrome-inline-end);
 }
 .detail-session {
   overflow: hidden;
