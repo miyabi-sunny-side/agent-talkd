@@ -291,7 +291,8 @@ impl BrokerState {
         }
     }
 
-    /// 呼び出し元 pane 宛で **配達完了済み** かつ未受領の ID。本文は含めない。
+    /// 呼び出し元 pane 宛で未受領の ID（**queue 中 / 未配達も含む**）。本文は含めない。
+    /// 所有者 pull の自己発見経路。push 呼び鈴を待たずに list → read できる。
     pub fn pending_to_me(&self, pane: &str) -> Vec<u64> {
         let current_name = self.agents.get(pane).map(|agent| agent.name.as_str());
         self.messages
@@ -299,7 +300,6 @@ impl BrokerState {
             .filter(|stored| {
                 stored.target_pane == pane
                     && !stored.acked
-                    && stored.delivered
                     && current_name == Some(stored.message.target_name.as_str())
             })
             .map(|stored| stored.message.id)
@@ -383,6 +383,13 @@ impl BrokerState {
         self.agents
             .get(pane)
             .is_some_and(|agent| agent.queue.contains(&id))
+    }
+
+    /// 配送待ち queue の先頭 ID。空なら `None`。
+    pub fn queued_head(&self, pane: &str) -> Option<u64> {
+        self.agents
+            .get(pane)
+            .and_then(|agent| agent.queue.first().copied())
     }
 
     /// `Acked` は削除対象。ただし queue 中なら本文を durable に保持する
@@ -476,7 +483,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_to_me_hides_queued_ids_that_pending_from_me_still_shows() {
+    fn pending_to_me_includes_queued_ids_that_pending_from_me_also_shows() {
         let mut state = BrokerState::default();
         state.register("%1".into(), "claude".into());
         let Dispatch::Deliver(queued) = state
@@ -486,9 +493,10 @@ mod tests {
             panic!("message should attempt delivery");
         };
         state.requeue_after_delivery_failure("%1", queued);
-        assert!(
-            state.pending_to_me("%1").is_empty(),
-            "配達完了前の ID は呼び鈴の前に読めてはならない"
+        assert_eq!(
+            state.pending_to_me("%1"),
+            vec![queued],
+            "所有者 pull のため queue 中の自分宛 ID も見える"
         );
         assert_eq!(state.pending_from_me("%2")["%1"], vec![queued]);
 

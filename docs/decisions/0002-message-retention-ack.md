@@ -4,14 +4,17 @@
 - Independent review: codex (`%6`) — 再判定で **A〜F すべて PASS**
 - Date: 2026-08-01
 - 関連: [0001](0001-conversation-broker-scope.md)。MCP と同時に導入する
+- Amendment (2026-08-12): 宛先本人の **pull 配達**を許可。`pending_to_me` は queue 中を含む。
+  未配達の `read` は journal `Complete` で durable 配達完了してから本文を返す。
+  未配達の `ack` は拒否（先に read）。他 pane 拒否は維持。詳細は下記「Amendment」。
 
 ## 要約（決裁者はここだけ読めば足りる）
 
 **受け取った側が「読んだよ、届いたよ」と報告するまでメッセージは残る。報告したら消える。**
 
-手順は3段階だけ。
+手順は3段階だけ（主経路は push 呼び鈴）。
 
-1. 呼び鈴が鳴る → **読む**（何度でも読める）
+1. 呼び鈴が鳴る（または `pending_to_me` で自己発見する） → **読む**（何度でも読める）
 2. **作業に入る前に受領報告を送る** → ここで消える
 3. 作業する。返信が必要なら**普通の送信機能**で新しい手紙を送り返す
 
@@ -20,10 +23,10 @@
 | いま何が起きているか | 一度 `read` すると、次の journal 圧縮で**本文が完全に消える** |
 | それで何が困るか | 読む前や読んだ直後に中断されると本文ごと失われる。実例: `#714` を後から読もうとして「見つかりません」になり要約を再送した |
 | どう変えるか | **受領報告が来るまで消さない**。報告は agent が明示的に送る |
-| agent は何を覚えるか | 「呼び鈴が鳴ったら、読んで、作業前に受領報告」の1手順だけ |
+| agent は何を覚えるか | 「届いたら読んで、作業前に受領報告」。主 wake は呼び鈴。必要なら `list_peers` → pull read |
 | 報告を忘れたら | メッセージは残る。`list_peers` が**両側から未受領を見せる**ので、受け手は自分で読み直せて、送り手も気づける |
 | 「届いたか分からない」問題は | `list_peers` が**自分が送って未受領の ID**（`pending_from_me`）と**自分宛で未受領の ID**（`pending_to_me`）の両方を返す |
-| 呼び鈴の前に読めてしまわないか | 読めない。`read` も `ack` も**配達完了前は拒否**する |
+| 呼び鈴の前に読めるか | **宛先本人は読める**（pull）。pull は `Complete` を書いて queue から外すので後から同 ID の呼び鈴は鳴らない。他 pane は拒否。未配達の ack は拒否 |
 | 返信は | 専用の仕組みを作らない。**普通の送信**で返す |
 | 30分などの時間制限は | **不要**。前案の TTL は破棄 |
 | user から見て何が変わるか | 中断しても本文が残る。自分の送信が相手に届いたか ID 単位で分かる |
@@ -44,8 +47,9 @@
 - 返信は専用機構を作らず `send_message` で行う（[0001](0001-conversation-broker-scope.md) の
   `reply_message` 不採用の方針を維持）
 - `list_peers` に**両方向の未受領 ID 一覧**を含める
-  （`pending_to_me` = 自分宛で配達済み未受領、`pending_from_me` = 自分が送って未受領）
-- `read_message` と `ack_message` は、**配達完了前のメッセージを拒否する**
+  （`pending_to_me` = 自分宛の未受領。**queue 中を含む**、`pending_from_me` = 自分が送って未受領）
+- `read_message` は宛先本人なら配達前でも許可し、そのとき **pull 配達**（`Complete`）する
+- `ack_message` は**配達完了前を拒否**する（先に read）
 
 ## Decision owner
 
@@ -104,22 +108,24 @@ user 原文（2026-08-01、本 repo の会話ペイン）:
 | 他 pane 宛の `Pending` | **拒否**（既存の `read` と同じ宛先検査） |
 | 存在しない ID | **mutation なしで冪等成功**（`no_pending_message` 等の outcome を返す） |
 
-### `read_message` も配達未完了を拒否する（重要）
+### `read_message` の所有者 pull（Amendment 2026-08-12）
 
-**現行の `read` は配達状態を検査していない。** `src/daemon.rs:346` は `target_pane` と
-`target_name` だけを見て本文を返す。そのため `pending_to_me` が queue 中の ID まで返すと、
-**呼び鈴が鳴る前に本文を読めてしまう**。その後 ack は上記表により拒否されるので、
-「通常の経路では配達完了後にしか読めない」という前提が崩れ、queue の steer-safe な
-配達順序も曖昧になる。
+当初は「配達未完了の read/ack を拒否し、`pending_to_me` は配達完了済みだけ」とした。
+これは push 呼び鈴前の先読みと、配達前 ack による「後から呼び鈴だけが届く」害を
+防ぐためだった。
 
-したがって:
+運用上、**宛先本人**が busy 中に溜まった自分宛を、呼び鈴を待たず自己発見・読む
+必要があることが分かった。他 pane への秘匿は宛先検査で足り、本人に本文を秘匿する
+理由はない。
 
-| 対象 | 契約 |
+| 対象 | 契約（改正後） |
 |---|---|
-| `read_message` | **queue 中／配達未完了は拒否**（`ack_message` と同じ判定を使う） |
-| `pending_to_me` | **配達完了済みの `Pending` だけ**を返す |
-| `pending_from_me` | queue 中を含む**全未受領**を返してよい（送り手は「まだ届いていない」も知りたい） |
-| queue 中の `Acked` 化 | **内部の terminal 処理だけが行える**。明示 ack ではできない |
+| `read_message`（宛先本人・未配達） | **queue 先頭のときだけ** journal に `Complete` を append+fsync → queue から外し `delivered=true` → 本文を返す（`agent.prompt` なし）。後続の先取りは拒否。fsync 失敗時は本文を返さず queue を進めない |
+| `read_message`（他 pane） | **拒否**（従来どおり） |
+| `ack_message`（未配達） | **拒否**（先に read。本文を見ずに消さない／旧害の再発防止） |
+| `pending_to_me` | 自分宛の**全未受領**（queue 中を含む） |
+| `pending_from_me` | queue 中を含む**全未受領**（送り手は「まだ届いていない」も知りたい） |
+| queue 中の `Acked` 化 | pull 後は通常 ack。未 pull の明示 ack は不可。内部 terminal 処理は従来どおり |
 
 **なぜ「存在しない ID」を成功にするか**: 応答が失われた後の再送を安全にするため。
 `Acked` は checkpoint で prune され所有情報ごと消えるので、再送時に
@@ -127,9 +133,10 @@ user 原文（2026-08-01、本 repo の会話ペイン）:
 宛先付き tombstone を永続保持する必要があり、削除を目的とする本決定と矛盾する。
 mutation を伴わないので、他 pane の `Pending` を消す危険もない。
 
-**なぜ queue 中の ack を拒否するか**: ID を推測して配達前に ack されると、
-送り手の未受領一覧からは消えるのに呼び鈴だけ後から届き、`read` が not-found になる。
-通常の経路では配達完了後にしか読めないので、拒否しても実害がない。
+**なぜ queue 中の ack を拒否するか（維持）**: 配達前に ack されると、
+送り手の未受領一覧からは消えるのに呼び鈴だけ後から届き、`read` が not-found になる
+害がある。pull read が先に `Complete` すればこの害は起きない。ack 単独の pull は
+本文を見ずに消せるため許可しない。
 
 `ack_message` は**pane を引数に取らない**。呼び出し元 pane は adapter が導出する
 （[0001](0001-conversation-broker-scope.md)）。登録済み caller pane・target pane・
@@ -149,7 +156,7 @@ agent が `ack_message` を忘れると、メッセージは `Pending` のまま
 
 | 欄 | 内容 |
 |---|---|
-| `pending_to_me`（top-level） | 呼び出し元宛で**配達完了済み**かつ未受領の ID 一覧。**本文は含めない** |
+| `pending_to_me`（top-level） | 呼び出し元宛で未受領の ID 一覧（**queue 中を含む**）。**本文は含めない** |
 | `pending_from_me`（peer ごと） | 呼び出し元が送って未受領の ID 一覧。**queue 中も含む** |
 
 これにより受け手は再起動後も `list_peers` → `read_message` → `ack_message` を再開できる。
@@ -282,16 +289,19 @@ queue から外れた後に checkpoint で prune する。
 
 **受領報告と保持**
 
-- `read_message` を何度呼んでも本文が返り、journal が増えないこと
-- **`read` 後に checkpoint を跨いでも読めること**（現状はここで消える）
+- **配達完了済み** message の再 `read_message` は本文を返し、journal が増えないこと
+  （未配達への初回 pull は `Complete` を1回追記する）
+- **`read` 後に checkpoint を跨いでも読めること**（変更前はここで消えていた）
 - `ack_message` 後に `read` が not-found を返すこと
 - **checkpoint / prune の後に ack を再送しても、mutation なしで冪等成功すること**
   （`no_pending_message` 相当。他 pane の `Pending` を消さないこと）
-- **queue 中／配達未完了のメッセージへの ack が拒否されること**
-- **queue 中／配達未完了のメッセージへの `read` が拒否されること**
-- **`pending_to_me` に queue 中の ID が現れないこと**（呼び鈴前に本文を読めないことの回帰）
+- **`pending_to_me` に queue 中の ID が現れること**（所有者 pull の自己発見）
+- **queue 先頭の所有者 `read_message` は pull 成功し、後続 ID の先取りは journal/state 不変で拒否されること**
+- **未配達の `ack_message` が拒否されること**（先に read。本文を見ずに消さない）
+- **宛先本人の未配達 pull 後、後続の同じ ID の呼び鈴が無いこと**
 - `pending_from_me` には queue 中の ID が現れること
 - queue 中のメッセージを `Acked` にできるのは内部の terminal 処理だけであること
+  （未 pull の明示 ack は不可。pull 後は通常 ack）
 - **他 pane 宛の ID を ack できないこと**（既存の宛先検査と同じ境界）
 - `ack_message` が pane を引数に取らず、caller pane を adapter 側から導出していること
 - **`pending_to_me` により、受け手が再起動後に未受領 ID を再発見し read → ack を再開できること**

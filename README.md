@@ -174,9 +174,9 @@ pending-to-me: #0
 tmux併存期の表形式を維持した固定値`herdr`です。agent-talkd独自のBusy/Idle状態は
 持ちません。
 
-`pending-to-me` は自分宛で配達完了済みかつ未受領のID、`pending-from-me <pane>` は
-自分が送って未受領のIDです。後者には配達待ちqueueの分も含みます。どちらの行も
-未受領が無ければ出ません。
+`pending-to-me` は自分宛で未受領のID（配達待ちqueueの分も含む）、
+`pending-from-me <pane>` は自分が送って未受領のIDです。後者にも配達待ちqueueの分を
+含みます。どちらの行も未受領が無ければ出ません。
 
 ## Observation & letters page
 
@@ -264,8 +264,12 @@ userからの接続を拒む境界であり、同一UID内の人間を識別・�
 （読了済みならackを、未読なら読むことを促し、
 5分間隔より詰めて連打しません）。
 メッセージが消えるのは受信側が受領報告（`ack-message` / MCP の `ack_message`）を
-送った後で、それまでは何度でも読み直せます。配達が完了していないqueue中の
-メッセージは、呼び鈴より先に本文を読ませないため `read` も `ack-message` も拒否します。
+送った後で、それまでは何度でも読み直せます。宛先本人は呼び鈴を待たず、
+`list_peers` の `pending_to_me`（queue 中を含む）から ID を得て `read_message` で
+本文を pull できます。queue 中は**先頭から順に**だけ pull できます（FIFO）。
+pull は journal の配達完了記録を書いて queue から外すので、
+後から同じ ID の呼び鈴は鳴りません。未配達のまま `ack_message` だけ送ることは
+拒否します（先に read してください）。他 pane 宛の本文は引き続き読めません。
 本文、未配達queue、受領状態は既定で
 `$XDG_STATE_HOME/agent-talkd/`（未設定時は `~/.local/state/agent-talkd/`）
 のjournalに保存します。従来の `~/.cache/agent-talk/*.md` は新規作成せず、

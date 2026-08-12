@@ -240,12 +240,13 @@ Pending」と「読了済みのPending」を区別する分岐が全経路に復
 選ぶためだけ**にmemoryへ記録し、journalに残さず、上記のどの判定にも使いません。
 restartで未読へ戻っても、催促文言が保守側（「未読なら読んでくれ」）に倒れるだけです。
 
-daemonは`read`と`ack`で同じ宛先・配達状態の検査を使います。
+daemonは`read`と`ack`で同じ宛先検査を使います。配達状態は read 時の pull と
+ack の前提で扱います。
 
 | 対象 | `read` / `read-message` | `ack-message` |
 | --- | --- | --- |
 | 呼び出し元pane宛・配達完了済み・未受領 | 本文を返し、読了だけをmemoryに記録（受領・削除の状態は変えない） | append＋fsyncの後に`Acked`。`outcome: acked` |
-| 配達未完了（queue中） | 拒否 | 拒否 |
+| 呼び出し元pane宛・配達未完了（queue中） | **pull 配達**: **queue先頭のときだけ** journal に`Complete`をappend+fsyncし、queueから外して`delivered`にしたうえで本文を返す。後続IDの先取りは拒否（FIFO維持）。`agent.prompt`は撃たない | **拒否**（先に read で本文を確認させる。本文を見ずに消さない） |
 | 他pane宛 | 拒否 | 拒否 |
 | 存在しない、または受領報告済み | not-found | mutationなしで冪等成功（`outcome: no_pending_message`） |
 
@@ -253,9 +254,15 @@ daemonは`read`と`ack`で同じ宛先・配達状態の検査を使います。
 場合にだけ適用されます。未登録paneはこの分岐へ入る前に拒否されます（「MCP adapter」を
 参照）。
 
-配達未完了を拒否するのは、IDを推測して呼び鈴の前に本文を読ませないためです。これを
-許すと、送り手の未受領一覧からは消えたのに呼び鈴だけ後から届き、その時点の`read`が
-not-foundになります。
+所有者 pull は、呼び鈴（push）を**唯一の** read 権限付与にしないための経路です。
+pull の `Complete` は push 配達と同じ journal 記録なので、後から drain が同じ ID の
+呼び鈴を鳴らすことはありません。queue 中は先頭以外の pull を拒否し、push と同じ
+FIFO を保ちます。`Complete` の fsync が失敗したときは本文を返さず、
+queue も進めません。他 pane への秘匿は宛先検査が担います（ID 推測で他人の本文は読めない）。
+
+未配達のまま ack だけを許すと、本文を見ずに消せるうえ、旧契約では後から呼び鈴だけが
+届いて `read` が not-found になる害がありました。pull 後は `delivered` なので通常の
+ack 契約に乗り、未 pull の ack は拒否します。
 
 存在しないIDをエラーではなく冪等成功にするのは、応答が失われた後の再送を安全に
 するためです。`Acked`はcheckpointで所有情報ごとpruneされるので、再送時に
@@ -264,10 +271,10 @@ tombstoneを永続保持する必要があり、削除を目的とする本契�
 伴わないため、他paneの`Pending`を消す危険もありません。
 
 未受領IDは両方向から観測できます。`pending_to_me`（`who`では`pending-to-me`）は
-呼び出し元pane宛で**配達完了済み**かつ未受領のID、`pending_from_me`（`who`では
+呼び出し元pane宛で未受領のID（**queue中 / 未配達も含む**）、`pending_from_me`（`who`では
 `pending-from-me <pane>`）は呼び出し元が送って未受領のIDで、**queue中も含みます**。
-どちらも本文と他送信者のIDは含みません。送り手側だけにすると、受け手が中断・再起動して
-IDを失ったとき、本文が残っていても受け手自身が再発見できなくなります。
+どちらも本文と他送信者のIDは含みません。受け手は呼び鈴を待たず `pending_to_me` から
+自己発見して pull できます。push 呼び鈴は引き続き idle/done 時の主 wake 経路です。
 
 受領報告を忘れてもメッセージは残ります（誤削除より安全側）。自動では削除しま
 せんが、放置もしません: 配達済みのまま受領報告が1分間ないメッセージには、宛先が

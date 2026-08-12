@@ -176,13 +176,11 @@ impl SendReport {
 /// `read` / `ack` から見たメッセージの状態。
 #[derive(Debug)]
 enum MessageAccess<'a> {
-    /// 呼び出し元宛・配達完了済み・未受領。
+    /// 呼び出し元宛・未受領。配達済みでも queue 中でもよい（所有者 pull 可）。
     Pending(&'a StoredMessage),
     /// 存在しないか、既に受領報告済み。
     NotFound,
     NotMine,
-    /// queue 中または配達未完了。呼び鈴の前に読ませない。
-    Undelivered,
 }
 
 impl MessageAccess<'_> {
@@ -193,9 +191,6 @@ impl MessageAccess<'_> {
                 format!("message #{id} は見つかりません (受領報告済みの可能性があります)")
             }
             Self::NotMine => format!("message #{id} はこのpane宛ではありません"),
-            Self::Undelivered => {
-                format!("message #{id} はまだ配達されていません (呼び鈴を受けてから読んでください)")
-            }
         }
     }
 }
@@ -1372,17 +1367,32 @@ impl Broker {
             let Some(id) = self.state.take_queued_head(pane) else {
                 break None;
             };
-            if self.state.message(id).is_some() {
-                break Some(id);
-            }
-            error!(%pane, id, "queued message body missing; skipping");
-            if let Err(error) = self.journal.append(&Record::Complete {
-                pane: pane.to_owned(),
-                id,
-            }) {
-                return Err(format!(
-                    "欠損メッセージのskipをjournalへ書き込めません: {error}"
-                ));
+            match self.state.message(id) {
+                // 所有者 pull 済み・既配達が queue に残っても呼び鈴を二重に鳴らさない。
+                Some(stored) if stored.delivered => {}
+                Some(stored) if stored.acked => {
+                    if let Err(error) = self.journal.append(&Record::Complete {
+                        pane: pane.to_owned(),
+                        id,
+                    }) {
+                        return Err(format!(
+                            "acked 残骸のskipをjournalへ書き込めません: {error}"
+                        ));
+                    }
+                    self.state.complete_delivery(pane, id);
+                }
+                Some(_) => break Some(id),
+                None => {
+                    error!(%pane, id, "queued message body missing; skipping");
+                    if let Err(error) = self.journal.append(&Record::Complete {
+                        pane: pane.to_owned(),
+                        id,
+                    }) {
+                        return Err(format!(
+                            "欠損メッセージのskipをjournalへ書き込めません: {error}"
+                        ));
+                    }
+                }
             }
         };
         let Some(id) = message_id else {
@@ -1830,8 +1840,9 @@ impl Broker {
         pane.is_some_and(|pane| self.state.agents.contains_key(pane))
     }
 
-    /// `read` / `ack` が共有する宛先・配達状態の検査
+    /// `read` / `ack` が共有する宛先検査
     /// (docs/decisions/0002-message-retention-ack.md「`ack_message` の契約」)。
+    /// 所有者なら queue 中でも Pending。配達状態は `ensure_pull_delivery` / ack 側で扱う。
     fn access(&self, id: u64, pane: &str) -> MessageAccess<'_> {
         // 受領報告済み (`Acked`) は存在しないものとして扱う。以後 read は not-found、
         // ack は mutation なしで冪等成功になる。
@@ -1842,66 +1853,110 @@ impl Broker {
         if stored.target_pane != pane || current_name != Some(stored.message.target_name.as_str()) {
             return MessageAccess::NotMine;
         }
-        if !stored.delivered {
-            return MessageAccess::Undelivered;
-        }
         MessageAccess::Pending(stored)
     }
 
+    /// 宛先本人の pull 読み: 未配達なら journal `Complete` で durable に配達完了し、
+    /// queue から外す。後から同じ ID の呼び鈴を鳴らさない。fsync 前に本文は返さない。
+    /// queue 中の pull は **先頭 ID のみ**（push 配達と同じ FIFO。後続を追い越さない）。
+    fn ensure_pull_delivery(&mut self, pane: &str, id: u64) -> std::result::Result<(), String> {
+        let Some(stored) = self.state.message(id) else {
+            return Err(format!(
+                "message #{id} は見つかりません (受領報告済みの可能性があります)"
+            ));
+        };
+        if stored.delivered {
+            return Ok(());
+        }
+        if stored.target_pane != pane {
+            return Err(format!("message #{id} はこのpane宛ではありません"));
+        }
+        // queue に載っている間は先頭以外を Complete しない（FIFO 維持）。
+        if self.state.is_queued(pane, id) {
+            match self.state.queued_head(pane) {
+                Some(head) if head == id => {}
+                Some(head) => {
+                    return Err(format!(
+                        "message #{id} は queue 先頭ではありません (先に #{head} を read_message してください)"
+                    ));
+                }
+                None => {}
+            }
+        }
+        self.journal
+            .append(&Record::Complete {
+                pane: pane.to_owned(),
+                id,
+            })
+            .map_err(|error| error.to_string())?;
+        self.state.complete_delivery(pane, id);
+        info!(%pane, id, source = "pull", "delivered");
+        Ok(())
+    }
+
     /// 本文を返し、読了だけを記録する。受領報告が来るまで何度でも読める。
+    /// 未配達の自分宛は pull 配達してから返す（呼び鈴を待たない）。
     fn read(&mut self, request: &Request) -> Response {
         let (id, pane) = match request_target(request, "read") {
             Ok(target) => target,
             Err(response) => return response,
         };
-        let brief = match self.access(id, &pane) {
-            MessageAccess::Pending(stored) => Ok(stored.message.brief.clone()),
-            other => Err(other.reject_reason(id)),
-        };
-        match brief {
-            Ok(brief) => {
-                self.state.mark_read(id);
-                Response::ok(brief)
-            }
-            Err(reason) => Response::error(reason),
+        match self.access(id, &pane) {
+            MessageAccess::Pending(_) => {}
+            other => return Response::error(other.reject_reason(id)),
         }
+        if let Err(reason) = self.ensure_pull_delivery(&pane, id) {
+            return Response::error(reason);
+        }
+        let Some(stored) = self.state.message(id) else {
+            return Response::error(format!(
+                "message #{id} は見つかりません (受領報告済みの可能性があります)"
+            ));
+        };
+        let brief = stored.message.brief.clone();
+        self.state.mark_read(id);
+        Response::ok(brief)
     }
 
     /// 構造化 read。MCP adapter の `read_message` が使う。
+    /// 未配達の自分宛は pull 配達してから返す（呼び鈴を待たない）。
     fn read_json(&mut self, request: &Request) -> Response {
         let (id, pane) = match request_target(request, "read-message") {
             Ok(target) => target,
             Err(response) => return response,
         };
-        let payload = match self.access(id, &pane) {
-            MessageAccess::Pending(stored) => {
-                // 送信時点で捕捉した名前を返す。現在のレジストリを引き直さない。
-                let from = stored.message.sender_label().to_owned();
-                // 返信先は、捕捉時と同じ identity で今も登録中の pane のときだけ。
-                let reply_to = self.state.reply_target(&stored.message);
-                Ok((from, reply_to, stored.message.brief.clone()))
-            }
-            other => Err(other.reject_reason(id)),
-        };
-        match payload {
-            Ok((from, reply_to, body)) => {
-                self.state.mark_read(id);
-                Response::ok(format!(
-                    "{}\n",
-                    serde_json::json!({
-                        "version": 1,
-                        "id": id,
-                        "from": from,
-                        "reply_to": reply_to,
-                        "body": body,
-                    })
-                ))
-            }
-            Err(reason) => Response::error(reason),
+        match self.access(id, &pane) {
+            MessageAccess::Pending(_) => {}
+            other => return Response::error(other.reject_reason(id)),
         }
+        if let Err(reason) = self.ensure_pull_delivery(&pane, id) {
+            return Response::error(reason);
+        }
+        let Some(stored) = self.state.message(id) else {
+            return Response::error(format!(
+                "message #{id} は見つかりません (受領報告済みの可能性があります)"
+            ));
+        };
+        // 送信時点で捕捉した名前を返す。現在のレジストリを引き直さない。
+        let from = stored.message.sender_label().to_owned();
+        // 返信先は、捕捉時と同じ identity で今も登録中の pane のときだけ。
+        let reply_to = self.state.reply_target(&stored.message);
+        let body = stored.message.brief.clone();
+        self.state.mark_read(id);
+        Response::ok(format!(
+            "{}\n",
+            serde_json::json!({
+                "version": 1,
+                "id": id,
+                "from": from,
+                "reply_to": reply_to,
+                "body": body,
+            })
+        ))
     }
 
     /// 受領報告。journal の append + fsync が成功する前に可視性を `Acked` へ進めない。
+    /// 未配達の ack は拒否する（本文を見ずに消さない。先に read で pull 配達する）。
     fn ack(&mut self, request: &Request) -> Result<Response> {
         let (id, pane) = match request_target(request, "ack-message") {
             Ok(target) => target,
@@ -1911,13 +1966,20 @@ impl Broker {
             // 存在しない ID は mutation なしで冪等成功にする。checkpoint / prune 後の
             // 再送を安全にするため (0002「なぜ「存在しない ID」を成功にするか」)。
             MessageAccess::NotFound => "no_pending_message",
+            MessageAccess::Pending(stored) if !stored.delivered => {
+                return Ok(Response::error(format!(
+                    "message #{id} はまだ読んでいません (先に read_message で本文を確認してください)"
+                )));
+            }
             MessageAccess::Pending(_) => {
                 self.journal.append(&Record::Consumed { id })?;
                 self.state.ack(id);
                 info!(%pane, id, source = "ack", "acked");
                 "acked"
             }
-            other => return Ok(Response::error(other.reject_reason(id))),
+            other @ MessageAccess::NotMine => {
+                return Ok(Response::error(other.reject_reason(id)));
+            }
         };
         Ok(Response::ok(format!(
             "{}\n",
@@ -3164,6 +3226,293 @@ mod tests {
         assert_eq!(acked["outcome"], "acked");
         assert!(broker.state.message(id).unwrap().acked);
         assert!(broker.state.pending_to_me("w1:p2").is_empty());
+    }
+
+    #[tokio::test]
+    async fn owner_can_pull_read_a_queued_message_without_a_doorbell() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut broker = registered_pair(&dir).await;
+        set_herdr_panes(
+            &broker,
+            vec![
+                pane_info("w1:p1", Some("codex")),
+                HerdrPane {
+                    status: AgentStatus::Working,
+                    ..pane_info("w1:p2", Some("claude"))
+                },
+            ],
+        );
+        let id = json(
+            &broker
+                .handle(send_request("w1:p1", "claude", "pull me"))
+                .await,
+        )["id"]
+            .as_u64()
+            .unwrap();
+        assert!(!broker.state.message(id).unwrap().delivered);
+        assert!(broker.state.is_queued("w1:p2", id));
+        assert_eq!(
+            broker.state.pending_to_me("w1:p2"),
+            vec![id],
+            "queue 中でも pending_to_me に現れる"
+        );
+        let bells_before = bells(&broker).len();
+
+        // 他 pane は拒否。
+        let denied = broker
+            .handle(request("read-message", Some("w1:p1"), &[&id.to_string()]))
+            .await;
+        assert_eq!(denied.code, 1);
+        assert!(
+            denied.stderr.contains("このpane宛ではありません"),
+            "{}",
+            denied.stderr
+        );
+
+        // 未配達のまま ack だけは拒否（本文を見ずに消さない）。
+        let early_ack = broker
+            .handle(request("ack-message", Some("w1:p2"), &[&id.to_string()]))
+            .await;
+        assert_eq!(early_ack.code, 1, "{early_ack:?}");
+        assert!(
+            early_ack.stderr.contains("まだ読んでいません"),
+            "{}",
+            early_ack.stderr
+        );
+        assert!(!broker.state.message(id).unwrap().acked);
+        assert!(broker.state.is_queued("w1:p2", id));
+
+        // 宛先本人の pull read: Complete が durable になり本文が返る。呼び鈴は増えない。
+        let journal_len = std::fs::metadata(&broker.config.journal).unwrap().len();
+        let read = json(
+            &broker
+                .handle(request("read-message", Some("w1:p2"), &[&id.to_string()]))
+                .await,
+        );
+        assert!(
+            read["body"].as_str().unwrap().contains("pull me"),
+            "{}",
+            read["body"]
+        );
+        assert_eq!(read["from"], "codex");
+        assert!(broker.state.message(id).unwrap().delivered);
+        assert!(broker.state.message(id).unwrap().read);
+        assert!(
+            !broker.state.is_queued("w1:p2", id),
+            "pull で queue から外れる"
+        );
+        assert!(
+            std::fs::metadata(&broker.config.journal).unwrap().len() > journal_len,
+            "Complete が journal に残る"
+        );
+        assert_eq!(
+            bells(&broker).len(),
+            bells_before,
+            "pull は agent.prompt を撃たない"
+        );
+
+        // その後の drain も同じ ID の呼び鈴を鳴らさない。
+        set_herdr_panes(
+            &broker,
+            vec![
+                pane_info("w1:p1", Some("codex")),
+                pane_info("w1:p2", Some("claude")),
+            ],
+        );
+        broker.drain_queued().await;
+        assert_eq!(bells(&broker).len(), bells_before);
+
+        // ack は pull 後に成功し、sender の pending から消える。
+        let acked = json(
+            &broker
+                .handle(request("ack-message", Some("w1:p2"), &[&id.to_string()]))
+                .await,
+        );
+        assert_eq!(acked["outcome"], "acked");
+        assert!(broker.state.pending_to_me("w1:p2").is_empty());
+        assert!(
+            broker
+                .state
+                .pending_from_me("w1:p1")
+                .get("w1:p2")
+                .is_none_or(Vec::is_empty)
+        );
+    }
+
+    #[tokio::test]
+    async fn pull_delivery_survives_restart_and_still_requires_ack() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = {
+            let mut broker = registered_pair(&dir).await;
+            set_herdr_panes(
+                &broker,
+                vec![
+                    pane_info("w1:p1", Some("codex")),
+                    HerdrPane {
+                        status: AgentStatus::Working,
+                        ..pane_info("w1:p2", Some("claude"))
+                    },
+                ],
+            );
+            let id = json(
+                &broker
+                    .handle(send_request("w1:p1", "claude", "durable pull"))
+                    .await,
+            )["id"]
+                .as_u64()
+                .unwrap();
+            let read = broker
+                .handle(request("read-message", Some("w1:p2"), &[&id.to_string()]))
+                .await;
+            assert_eq!(read.code, 0, "{}", read.stderr);
+            id
+        };
+        let mut restarted = broker(
+            &dir,
+            vec![
+                pane_info("w1:p1", Some("codex")),
+                pane_info("w1:p2", Some("claude")),
+            ],
+        );
+        assert!(
+            restarted.state.message(id).unwrap().delivered,
+            "Complete が replay される"
+        );
+        assert!(!restarted.state.is_queued("w1:p2", id));
+        assert_eq!(restarted.state.pending_to_me("w1:p2"), vec![id]);
+        let reread = json(
+            &restarted
+                .handle(request("read-message", Some("w1:p2"), &[&id.to_string()]))
+                .await,
+        );
+        assert!(
+            reread["body"].as_str().unwrap().contains("durable pull"),
+            "{}",
+            reread["body"]
+        );
+        let acked = json(
+            &restarted
+                .handle(request("ack-message", Some("w1:p2"), &[&id.to_string()]))
+                .await,
+        );
+        assert_eq!(acked["outcome"], "acked");
+        let gone = restarted
+            .handle(request("read-message", Some("w1:p2"), &[&id.to_string()]))
+            .await;
+        assert_eq!(gone.code, 1);
+        assert!(gone.stderr.contains("見つかりません"), "{}", gone.stderr);
+    }
+
+    #[tokio::test]
+    async fn pull_read_refuses_to_overtake_an_earlier_queued_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut broker = registered_pair(&dir).await;
+        set_herdr_panes(
+            &broker,
+            vec![
+                pane_info("w1:p1", Some("codex")),
+                HerdrPane {
+                    status: AgentStatus::Working,
+                    ..pane_info("w1:p2", Some("claude"))
+                },
+            ],
+        );
+        let first = json(
+            &broker
+                .handle(send_request("w1:p1", "claude", "first"))
+                .await,
+        )["id"]
+            .as_u64()
+            .unwrap();
+        let second = json(
+            &broker
+                .handle(send_request("w1:p1", "claude", "second"))
+                .await,
+        )["id"]
+            .as_u64()
+            .unwrap();
+        assert_eq!(broker.state.queued_head("w1:p2"), Some(first));
+        assert!(broker.state.is_queued("w1:p2", second));
+        let journal_before = std::fs::read(&broker.config.journal).unwrap();
+
+        // 2件目の先取り pull は拒否。journal / queue は不変。
+        let skipped = broker
+            .handle(request(
+                "read-message",
+                Some("w1:p2"),
+                &[&second.to_string()],
+            ))
+            .await;
+        assert_eq!(skipped.code, 1, "{skipped:?}");
+        assert!(
+            skipped.stderr.contains("queue 先頭ではありません"),
+            "{}",
+            skipped.stderr
+        );
+        assert!(skipped.stderr.contains(&format!("#{first}")));
+        assert!(!broker.state.message(second).unwrap().delivered);
+        assert!(!broker.state.message(second).unwrap().read);
+        assert!(broker.state.is_queued("w1:p2", first));
+        assert!(broker.state.is_queued("w1:p2", second));
+        assert_eq!(
+            std::fs::read(&broker.config.journal).unwrap(),
+            journal_before,
+            "先取り拒否は journal を書かない"
+        );
+
+        // 先頭 → 2件目の順なら成功。
+        let read_first = broker
+            .handle(request(
+                "read-message",
+                Some("w1:p2"),
+                &[&first.to_string()],
+            ))
+            .await;
+        assert_eq!(read_first.code, 0, "{}", read_first.stderr);
+        assert!(broker.state.message(first).unwrap().delivered);
+        assert_eq!(broker.state.queued_head("w1:p2"), Some(second));
+        let read_second = broker
+            .handle(request(
+                "read-message",
+                Some("w1:p2"),
+                &[&second.to_string()],
+            ))
+            .await;
+        assert_eq!(read_second.code, 0, "{}", read_second.stderr);
+        assert!(broker.state.message(second).unwrap().delivered);
+        assert!(!broker.state.is_queued("w1:p2", second));
+    }
+
+    #[tokio::test]
+    async fn pull_read_journal_failure_leaves_queue_and_returns_no_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut broker = registered_pair(&dir).await;
+        set_herdr_panes(
+            &broker,
+            vec![
+                pane_info("w1:p1", Some("codex")),
+                HerdrPane {
+                    status: AgentStatus::Working,
+                    ..pane_info("w1:p2", Some("claude"))
+                },
+            ],
+        );
+        let id = json(&broker.handle(send_request("w1:p1", "claude", "hold")).await)["id"]
+            .as_u64()
+            .unwrap();
+        broker.journal.fail_next_appends(1);
+        let failed = broker
+            .handle(request("read-message", Some("w1:p2"), &[&id.to_string()]))
+            .await;
+        assert_eq!(failed.code, 1, "{failed:?}");
+        assert!(
+            failed.stderr.contains("injected journal append failure"),
+            "{}",
+            failed.stderr
+        );
+        assert!(!broker.state.message(id).unwrap().delivered);
+        assert!(!broker.state.message(id).unwrap().read);
+        assert!(broker.state.is_queued("w1:p2", id));
     }
 
     /// `%1` に届いた、`original` に対する未受領通知の数。

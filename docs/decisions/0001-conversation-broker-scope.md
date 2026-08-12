@@ -77,9 +77,10 @@ doorbell はセッションを跨いで生き続ける必要があり、MCP serv
 peer への返信は `send_message` で足りる。
 
 `list_peers` は未受領の message ID を**両方向**返す（[0002](0002-message-retention-ack.md)）。
-`pending_to_me`（自分宛で**配達完了済み**かつ未受領）と、peer ごとの `pending_from_me`
+`pending_to_me`（自分宛で未受領。**queue 中を含む**）と、peer ごとの `pending_from_me`
 （自分が送って未受領。queue 中を含む）。本文は含めない。
-`read_message` / `ack_message` は配達完了前を拒否する（[0002](0002-message-retention-ack.md)）。
+宛先本人の未配達 `read_message` は pull 配達（[0002](0002-message-retention-ack.md) Amendment）。
+未配達の `ack_message` は拒否する。
 
 schema に `skill` / `from` / `pane` は**存在しない**。存在しない引数は誤用も偽装もできない。
 呼び出し元 identity は adapter が spawn 時の `TMUX_PANE` から導出し、agent は触れない。
