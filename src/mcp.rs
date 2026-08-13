@@ -157,7 +157,7 @@ pub fn tools() -> Value {
         },
         {
             "name": "send_message",
-            "description": "待受中の agent へメッセージを送る。相手が作業中なら順番待ちに入り、手が空いた時に呼び鈴が鳴る。",
+            "description": "待受中の agent へメッセージを送る。作業中の相手にも呼び鈴は届く。承認待ちや検出不能なら順番待ちに入り、手が空いた時に呼び鈴が鳴る。",
             "inputSchema": {
                 "type": "object",
                 "properties": {

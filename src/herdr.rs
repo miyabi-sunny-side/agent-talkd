@@ -6,8 +6,9 @@
 //! 配送には **状態ガード** を必ず挟む。
 //! herdr の入力系 API 自体には steer ガードが無く、working / blocked な
 //! pane にも文字を撃ち込める。承認ダイアログへ Enter を撃ち込む事故を避けるため、
-//! herdr が **積極的に `idle` または `done` と判定した pane にだけ**送る
-//! (README の「herdr backend」節)。`unknown` は安全の証拠にならないので送らない。
+//! `blocked` と `unknown` には一文字も送らない (README の「herdr backend」節)。
+//! 初回配達と queue drain は `idle` / `done` / `working` を許す。`unknown` は
+//! 安全の証拠にならないので送らない。
 
 use std::path::PathBuf;
 
@@ -52,16 +53,25 @@ impl AgentStatus {
         }
     }
 
-    /// 自動配送を許すのは `idle` と `done`。
+    /// 初回配達と queue drain を許すのは `idle` / `done` / `working`。
     ///
-    /// steer-safety が守るのは進行中のターン (`working`) と承認ダイアログ等の
-    /// 入力待ち (`blocked`)。`done` はターンが完了して入力欄が空いた状態で、
-    /// user がその pane を表示するまで保たれる**表示上の**バッジにすぎない —
-    /// これを配送不可と同一視すると、非表示 tab 宛の message が user の巡回まで
-    /// 滞留する。done への配達は未閲覧バッジを消して新ターンを始める。
+    /// steer-safety が守るのは承認ダイアログ等の入力待ち (`blocked`)。
+    /// `working` はターン進行中でも呼び鈴を届ける — 長寿命の裏プロセスで
+    /// herdr が `idle`/`done` に戻らないと、queue が永久に滞留するため。
+    /// `done` はターンが完了して入力欄が空いた状態で、user がその pane を
+    /// 表示するまで保たれる**表示上の**バッジにすぎない — これを配送不可と
+    /// 同一視すると、非表示 tab 宛の message が user の巡回まで滞留する。
+    /// done への配達は未閲覧バッジを消して新ターンを始める。
     /// `Unknown` を許さないのは、herdr の detection manifest に無い画面形状が
     /// idle fallback になり得るため。負の証拠を根拠に入力してはならない。
     pub fn accepts_delivery(self) -> bool {
+        matches!(self, Self::Idle | Self::Done | Self::Working)
+    }
+
+    /// 受領催促を許すのはターンとターンの間 (`idle` / `done`) だけ。
+    ///
+    /// 長ターン中の催促連打を避ける。初回配達とは predicate を共有しない。
+    pub fn accepts_reminder(self) -> bool {
         matches!(self, Self::Idle | Self::Done)
     }
 }
@@ -177,7 +187,7 @@ impl Herdr {
             .collect())
     }
 
-    /// 配達可能 (`idle` / `done`) と確認できた pane の **agent** にだけ
+    /// 初回配達と queue drain: `idle` / `done` / `working` の **agent** に
     /// 呼び鈴を届ける。
     ///
     /// 状態の取得と送信の間には原理的に race があるが、herdr には
@@ -191,9 +201,26 @@ impl Herdr {
     /// タイプされる事故も構造的に起きない (Err は呼び出し側の requeue 経路に乗る)。
     /// `wait` は付けない — 単一 event loop を agent の完了待ちで塞がない。
     pub async fn deliver(&self, pane_id: &str, text: &str) -> Result<Delivery> {
+        self.deliver_gated(pane_id, text, AgentStatus::accepts_delivery)
+            .await
+    }
+
+    /// 受領催促: 送信直前にも `accepts_reminder` (`idle` / `done`) を再確認する。
+    /// daemon 側の候補抽出とは別に、ここが催促の最終ゲートである。
+    pub async fn deliver_reminder(&self, pane_id: &str, text: &str) -> Result<Delivery> {
+        self.deliver_gated(pane_id, text, AgentStatus::accepts_reminder)
+            .await
+    }
+
+    async fn deliver_gated(
+        &self,
+        pane_id: &str,
+        text: &str,
+        allowed: fn(AgentStatus) -> bool,
+    ) -> Result<Delivery> {
         #[cfg(test)]
         if let Some(scripted) = &self.scripted {
-            // 実実装と同じ規則: pane 不在は Err、配達可能以外は Skipped。
+            // 実実装と同じ規則: pane 不在は Err、許可以外は Skipped。
             let status = scripted
                 .lock()
                 .unwrap()
@@ -201,7 +228,7 @@ impl Herdr {
                 .find(|pane| pane.pane_id == pane_id)
                 .map(|pane| pane.status)
                 .with_context(|| format!("herdr pane {pane_id} の状態を取得できません"))?;
-            if !status.accepts_delivery() {
+            if !allowed(status) {
                 return Ok(Delivery::Skipped(status));
             }
             self.delivered
@@ -211,7 +238,7 @@ impl Herdr {
             return Ok(Delivery::Sent);
         }
         let status = self.status_of(pane_id).await?;
-        if !status.accepts_delivery() {
+        if !allowed(status) {
             return Ok(Delivery::Skipped(status));
         }
         self.call("agent.prompt", json!({"target": pane_id, "text": text}))
@@ -475,13 +502,13 @@ mod tests {
         assert_eq!(panes[2].status, AgentStatus::Unknown);
     }
 
-    /// 達成条件 2 の中核: busy な pane には一文字も送らない。
+    /// 達成条件 2 の中核: blocked / unknown な pane には一文字も送らない。
     ///
     /// 「送信を試みて失敗する」ではなく「**そもそも入力系 API を発行しない**」
     /// ことを、偽サーバーが受け取った method 列で証明する。
     #[tokio::test]
     async fn deliver_never_sends_text_to_a_pane_that_is_not_deliverable() {
-        for status in ["working", "blocked", "unknown"] {
+        for status in ["blocked", "unknown"] {
             let owned = status.to_owned();
             let fake = FakeHerdr::start(move |method, _| match method {
                 "pane.get" => pane_get(&pane("w1:p1", "codex", &owned)),
@@ -503,13 +530,14 @@ mod tests {
         }
     }
 
-    /// 達成条件 2 の対: idle / done なら agent へ prompt として届く。
+    /// 達成条件 2 の対: idle / done / working なら agent へ prompt として届く。
     /// 拒否だけして届かないのでは無意味だし、入力欄に置くだけでは turn が始まらない。
     /// done を含めるのは、非表示 tab の完了バッジが user の巡回まで配達を
-    /// 塞がないため。
+    /// 塞がないため。working を含めるのは、長寿命の裏プロセスで herdr が
+    /// idle/done に戻らない相手へ呼び鈴が滞留しないため。
     #[tokio::test]
-    async fn deliver_prompts_the_agent_of_an_idle_or_done_pane() {
-        for status in ["idle", "done"] {
+    async fn deliver_prompts_the_agent_of_an_idle_done_or_working_pane() {
+        for status in ["idle", "done", "working"] {
             let owned = status.to_owned();
             let fake = FakeHerdr::start(move |method, _| match method {
                 "pane.get" => pane_get(&pane("w1:p2", "claude", &owned)),
@@ -531,6 +559,67 @@ mod tests {
             // event loop を塞ぐ wait を仕込まない。
             assert!(sent["params"].get("wait").is_none(), "{sent}");
         }
+    }
+
+    /// 催促の最終ゲート: working でも入力系 API を発行しない。
+    /// daemon の候補抽出をすり抜けても、送信直前の再確認が契約 4 を守る。
+    #[tokio::test]
+    async fn deliver_reminder_never_sends_text_to_a_working_blocked_or_unknown_pane() {
+        for status in ["working", "blocked", "unknown"] {
+            let owned = status.to_owned();
+            let fake = FakeHerdr::start(move |method, _| match method {
+                "pane.get" => pane_get(&pane("w1:p1", "codex", &owned)),
+                _ => ok(&json!({})),
+            });
+
+            let delivery = fake
+                .client()
+                .deliver_reminder("w1:p1", "[agent-talk] nag")
+                .await;
+
+            assert_eq!(
+                delivery.unwrap(),
+                Delivery::Skipped(AgentStatus::parse(status)),
+                "{status} は催促を拒否しなければならない"
+            );
+            assert_eq!(
+                fake.methods(),
+                vec!["pane.get"],
+                "{status} な pane へ催促の入力系 API を発行してはならない"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn deliver_reminder_prompts_an_idle_or_done_pane() {
+        for status in ["idle", "done"] {
+            let owned = status.to_owned();
+            let fake = FakeHerdr::start(move |method, _| match method {
+                "pane.get" => pane_get(&pane("w1:p2", "claude", &owned)),
+                _ => ok(&json!({})),
+            });
+
+            let delivery = fake
+                .client()
+                .deliver_reminder("w1:p2", "[agent-talk] nag")
+                .await
+                .unwrap();
+
+            assert_eq!(delivery, Delivery::Sent, "{status} は催促可能");
+            assert_eq!(fake.methods(), vec!["pane.get", "agent.prompt"], "{status}");
+        }
+    }
+
+    #[test]
+    fn working_accepts_delivery_but_not_reminders() {
+        assert!(AgentStatus::Working.accepts_delivery());
+        assert!(!AgentStatus::Working.accepts_reminder());
+        assert!(AgentStatus::Idle.accepts_delivery() && AgentStatus::Idle.accepts_reminder());
+        assert!(AgentStatus::Done.accepts_delivery() && AgentStatus::Done.accepts_reminder());
+        assert!(!AgentStatus::Blocked.accepts_delivery());
+        assert!(!AgentStatus::Blocked.accepts_reminder());
+        assert!(!AgentStatus::Unknown.accepts_delivery());
+        assert!(!AgentStatus::Unknown.accepts_reminder());
     }
 
     /// agent が pane から消えた race では herdr が `agent_not_running` を返す。

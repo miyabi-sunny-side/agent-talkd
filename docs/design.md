@@ -1,7 +1,7 @@
 # 設計
 
-agent-talkd は、herdr 上の対話エージェントへ作業中の入力を割り込ませずに
-メッセージを渡すための小さなブローカーです。
+agent-talkd は、herdr 上の対話エージェントへ、承認ダイアログや検出不能な
+画面へ入力を撃ち込まずにメッセージを渡すための小さなブローカーです。
 
 ## プロセス構成
 
@@ -175,17 +175,19 @@ pull側の規則:
 1. 依頼ヘッダと本文をID付きでjournalへ永続化します。
 2. 宛先に先行queueがなく、herdrが配達可能なら、`read_message <id>`と
    `ack_message`を案内する呼び鈴をherdrの`agent.prompt`でagent本人へ
-   submitします。herdrが**積極的にidleまたはdoneと判定したpaneにだけ**送り、
-   `working`/`blocked`/`unknown`には一文字も送りません（doneは完了出力の
+   submitします。herdrが**idle / done / working と判定したpaneに**送り、
+   `blocked`/`unknown`には一文字も送りません（workingは長寿命の裏プロセスで
+   idle/doneに戻らない相手へ呼び鈴が滞留しないため。doneは完了出力の
    未閲覧バッジで、配達可能にしないと非表示tab宛がuserの巡回まで滞留する。
-   doneへの配達は未閲覧バッジを消して新ターンを始める）。スキル指定時も
+   doneへの配達は未閲覧バッジを消して新ターンを始める）。表示のidle/busyは
+   配達可否から切り離し、workingはbusy表示のままです。スキル指定時も
    端末へ入るのは、daemonが検証・生成したスキルトークンと固定の呼び鈴だけです。
-3. herdrがworking/blocked/unknown、または先行queueがあれば、配送待ちqueueへ
+3. herdrがblocked/unknown、または先行queueがあれば、配送待ちqueueへ
    入れて`queued (waiting)`を返します。
    **queueが空でない間は宛先がidleでも新規メッセージを直接配達しません**
    （配達失敗でrequeueされた古いメッセージを新規が追い越すFIFOの破れの防止）。
 4. **queueが残っているpaneは2秒間隔のhealth tickが先頭を1件ずつ再配送**します。
-   hookは使わず、毎回herdrの配達可能ガード（idle/done）を通します。検出が
+   hookは使わず、毎回herdrの配達可能ガード（idle/done/working）を通します。検出が
    追いついた次のtickで同じIDがFIFOのまま流れます。
 5. `read`は本文を返し、読了だけを記録します（memoryのみ）。受領報告が来るまで
    何度でも読めます。
@@ -195,7 +197,7 @@ pull側の規則:
    新しいメッセージとして作成します。通知は送信元paneごとに1通へ集約し、
    回収した全メッセージのIDと本文を含めます（呼び鈴も送信元あたり1回）。
 8. 配達済みのまま受領報告が1分間ないメッセージには、受領催促の呼び鈴を
-   送ります。催促が出るのはherdrの観測が配達可能（idle/done）のときだけです。
+   送ります。催促が出るのはherdrの観測がターンとターンの間（idle/done）のときだけです。
    読了済みならack、未読なら読むことを促し、同じメッセージへの催促は5分間隔
    より詰めません。working/blocked/unknownには撃たず、催促の
    状態はmemoryのみで再起動後は配達時刻から数え直します。
@@ -274,11 +276,11 @@ tombstoneを永続保持する必要があり、削除を目的とする本契�
 呼び出し元pane宛で未受領のID（**queue中 / 未配達も含む**）、`pending_from_me`（`who`では
 `pending-from-me <pane>`）は呼び出し元が送って未受領のIDで、**queue中も含みます**。
 どちらも本文と他送信者のIDは含みません。受け手は呼び鈴を待たず `pending_to_me` から
-自己発見して pull できます。push 呼び鈴は引き続き idle/done 時の主 wake 経路です。
+自己発見して pull できます。push 呼び鈴は引き続き idle/done/working 時の主 wake 経路です。
 
 受領報告を忘れてもメッセージは残ります（誤削除より安全側）。自動では削除しま
 せんが、放置もしません: 配達済みのまま受領報告が1分間ないメッセージには、宛先が
-herdrの観測が配達可能（idle/done）のときだけdaemonが
+herdrの観測がターンとターンの間（idle/done）のときだけdaemonが
 受領催促の呼び鈴を送ります。読了済みならack、未読なら読むことを促し、pane単位で
 1回の呼び鈴に集約し、同じメッセージへは5分間隔より詰めません。working/blocked/unknownには撃たず、催促は新しいメッセージを作りません（催促自体が受領報告の
 対象になる再帰を避けるため）。催促タイマーはmemoryのみで、restart後は配達時刻

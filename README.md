@@ -260,9 +260,9 @@ userからの接続を拒む境界であり、同一UID内の人間を識別・�
 `read_message <id>`（MCP。CLI では `agent-talk read <id>`）で依頼本文を
 取得します。`read` は本文を消しません（読了だけを記録します）。配達済みの
 まま受領報告が1分間ないメッセージには、daemonが受領催促の呼び鈴を送ります。
-催促が出るのはherdrの観測が配達可能（idle / done）のときだけです
+催促が出るのはherdrの観測がターンとターンの間（idle / done）のときだけです
 （読了済みならackを、未読なら読むことを促し、
-5分間隔より詰めて連打しません）。
+5分間隔より詰めて連打しません。`working` への初回配達とは別です）。
 メッセージが消えるのは受信側が受領報告（`ack-message` / MCP の `ack_message`）を
 送った後で、それまでは何度でも読み直せます。宛先本人は呼び鈴を待たず、
 `list_peers` の `pending_to_me`（queue 中を含む）から ID を得て `read_message` で
@@ -364,12 +364,14 @@ workspace を暗黙にまたぎません。別 workspace へは `<scope>/<name>`
 します (tmux 併存期の正式名称 `herdr/<scope>/<name>` も互換 alias として
 受理します)。
 
-herdr への配送は、herdr が **idle または done と積極的に判定した pane に
-だけ**、`agent.prompt` で agent 本人へ submit まで行います（agent が居ない
+herdr への配送は、herdr が **idle / done / working と判定した pane に**
+`agent.prompt` で agent 本人へ submit まで行います（agent が居ない
 pane には herdr が拒否を返すため、素の shell へ呼び鈴が入ることはありません）。
-`working` / `blocked` / `unknown` には一文字も送りません。done を配達可能に
-するのは、非表示 tab の完了バッジが user の巡回まで配達を塞がないためです
-（done への配達は未閲覧バッジを消して新ターンを始めます）。
+`blocked` / `unknown` には一文字も送りません。`working` を配達可能にするのは、
+長寿命の裏プロセスで herdr が idle/done に戻らない相手へ呼び鈴が滞留しない
+ためです。done を配達可能にするのは、非表示 tab の完了バッジが user の巡回まで
+配達を塞がないためです（done への配達は未閲覧バッジを消して新ターンを始めます）。
+表示上の idle/busy は配達可否とは別で、`working` は引き続き `busy` と出ます。
 配送が拒否されたメッセージは queue に残り、**宛先が配達可能である正の証拠が
 次に得られた時点（2秒間隔の health tick）で同じ ID のまま自動再試行**
 されます。`queued` は「捨てられた」ではなく「配達可能を待って自動配送される」

@@ -448,19 +448,18 @@ fn a_herdr_agent_appearing_mid_run_becomes_a_peer_without_hooks() {
     let _ = harness.as_herdr_pane("w1:p2", &["internal-daemon-shutdown"]);
 }
 
-/// 検出ラグの回帰: 送信時に herdr が working を返しても、
-/// queue は滞留せず、idle の正の証拠が出た時点の health tick が同じ ID を
-/// FIFO のまま流す。新規 send は queue を追い越さない。
+/// blocked の間は queue に滞留し、idle の正の証拠が出た時点の health tick が
+/// 同じ ID を FIFO のまま流す。新規 send は queue を追い越さない。
 #[test]
 #[ignore = "spawns a background daemon; run explicitly"]
-fn a_lagging_herdr_detection_does_not_strand_queued_messages() {
+fn a_blocked_pane_does_not_strand_queued_messages() {
     let harness = Harness::start();
     harness.ok(&harness.as_herdr_pane("w1:p2", &["register", "claude"]));
     wait_for(|| harness.rpc_socket().exists());
     harness.ok(&harness.as_herdr_pane("w1:p1", &["register", "codex"]));
 
-    // 画面検出のラグを模す: herdr は working を報告し続ける。
-    harness.herdr.report_status("working");
+    // 承認ダイアログ等で配達できない間を模す: herdr は blocked を報告し続ける。
+    harness.herdr.report_status("blocked");
     let first =
         harness.ok(&harness.as_herdr_pane("w1:p2", &["send", "w1:p1", "--", "first letter"]));
     let first_id = trailing_id(&first);
@@ -468,11 +467,11 @@ fn a_lagging_herdr_detection_does_not_strand_queued_messages() {
         harness.ok(&harness.as_herdr_pane("w1:p2", &["send", "w1:p1", "--", "second letter"]));
     let second_id = trailing_id(&second);
     assert!(second.contains("queued"), "{second}");
-    // working の間は何度 tick が回っても prompt は出ない。
+    // blocked の間は何度 tick が回っても prompt は出ない。
     thread::sleep(Duration::from_secs(3));
     assert!(
         harness.herdr.prompts().is_empty(),
-        "working 中に prompt してはならない: {:?}",
+        "blocked 中に prompt してはならない: {:?}",
         harness.herdr.prompts()
     );
 

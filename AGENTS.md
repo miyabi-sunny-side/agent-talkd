@@ -13,7 +13,7 @@
 - `src/main.rs` is the command dispatcher. Keep user-facing command parsing and help consistent with `src/help.rs` and the request handling in `src/client.rs`.
 - `src/daemon.rs` coordinates RPC and health-tick events; `src/state.rs` owns delivery state transitions; `src/journal.rs` owns durable append/recovery/checkpoint behavior; `src/backend.rs` adapts herdr panes to the addressing surface; `src/herdr.rs` isolates the herdr API; `src/lifecycle.rs` manages daemon discovery and replacement.
 - Treat daemon memory as the live source of truth for delivery state. Registration follows herdr's native agent identity through the pull sync; there is no mirror state.
-- Never inject keystrokes into a pane that is not positively known to be idle. herdr reports `blocked` for approval dialogs; a pane whose status is unknown is not idle.
+- Never inject keystrokes into a pane that is `blocked` or `unknown`. herdr reports `blocked` for approval dialogs; a pane whose status is unknown is not idle. First delivery and queue drain may prompt a `working` pane so a long-lived background process cannot strand the doorbell; receipt reminders stay limited to `idle` / `done`.
 - Preserve the delivery durability contract: persist and `fsync` a message before reporting it as sent or queued, recover unread messages and queued deliveries after restart, and never reuse message IDs after checkpointing.
 - Keep terminal injection limited to daemon-generated, validated notification text. Message bodies remain in the journal and are retrieved with `agent-talk read <id>`.
 - Preserve backward-compatibility behavior deliberately. Protocol additions that older daemons cannot interpret must fail explicitly instead of silently degrading to a different command.

@@ -1417,7 +1417,7 @@ impl Broker {
             info!(%pane, id, source, "delivered");
         } else {
             self.state.requeue_after_delivery_failure(pane, id);
-            // 配達失敗は正常系 (相手が working 判定など)。次の契機で再試行される。
+            // 配達失敗は正常系 (相手が blocked / unknown 判定など)。次の契機で再試行される。
             // silent にすると診断できないので debug には残す。
             debug!(%pane, id, source, "queued delivery failed; will retry");
         }
@@ -2399,7 +2399,9 @@ impl Broker {
     }
 
     /// 配達済みのまま受領報告が無い message について、herdr の観測が
-    /// 配達可能 (idle/done) のときだけ受領催促の呼び鈴を送る。
+    /// ターンとターンの間 (idle/done) のときだけ受領催促の呼び鈴を送る。
+    /// ここでの `accepts_reminder` は候補抽出。最終ゲートは
+    /// `backend.deliver_reminder` が送信直前に同じ predicate を再確認する。
     /// 催促は message を新規作成しない
     /// (催促自体が受領報告の対象になる再帰を避ける)。
     /// タイマーは memory のみで、restart 後は配達時刻から数え直す。
@@ -2423,7 +2425,7 @@ impl Broker {
             if !panes.iter().any(|pane| {
                 pane.pane_id == stored.target_pane
                     && pane_backs_registration(pane, &stored.message.target_name)
-                    && pane.status.accepts_delivery()
+                    && pane.status.accepts_reminder()
             }) {
                 continue;
             }
@@ -2444,7 +2446,7 @@ impl Broker {
         }
         for (pane, items) in due {
             let bell = nag_bell(&items);
-            let delivered = self.backend.deliver(&pane, &bell).await.is_ok();
+            let delivered = self.backend.deliver_reminder(&pane, &bell).await.is_ok();
             // 失敗時も cooldown は消費する。2秒ごとの health tick で連打しない。
             for (id, _) in &items {
                 if let Some(stored) = self.state.messages.get_mut(id) {
@@ -2563,10 +2565,9 @@ fn installed_skills_for_runtime(home: &Path, runtime: &str) -> Vec<String> {
 }
 
 fn display_state(status: AgentStatus) -> AgentState {
-    if status.accepts_delivery() {
-        AgentState::Idle
-    } else {
-        AgentState::Busy
+    match status {
+        AgentStatus::Idle | AgentStatus::Done => AgentState::Idle,
+        AgentStatus::Working | AgentStatus::Blocked | AgentStatus::Unknown => AgentState::Busy,
     }
 }
 
@@ -3237,7 +3238,7 @@ mod tests {
             vec![
                 pane_info("w1:p1", Some("codex")),
                 HerdrPane {
-                    status: AgentStatus::Working,
+                    status: AgentStatus::Blocked,
                     ..pane_info("w1:p2", Some("claude"))
                 },
             ],
@@ -3349,7 +3350,7 @@ mod tests {
                 vec![
                     pane_info("w1:p1", Some("codex")),
                     HerdrPane {
-                        status: AgentStatus::Working,
+                        status: AgentStatus::Blocked,
                         ..pane_info("w1:p2", Some("claude"))
                     },
                 ],
@@ -3412,7 +3413,7 @@ mod tests {
             vec![
                 pane_info("w1:p1", Some("codex")),
                 HerdrPane {
-                    status: AgentStatus::Working,
+                    status: AgentStatus::Blocked,
                     ..pane_info("w1:p2", Some("claude"))
                 },
             ],
@@ -3492,7 +3493,7 @@ mod tests {
             vec![
                 pane_info("w1:p1", Some("codex")),
                 HerdrPane {
-                    status: AgentStatus::Working,
+                    status: AgentStatus::Blocked,
                     ..pane_info("w1:p2", Some("claude"))
                 },
             ],
@@ -4245,7 +4246,7 @@ mod tests {
             vec![
                 pane_info("w1:p1", Some("codex")),
                 HerdrPane {
-                    status: AgentStatus::Working,
+                    status: AgentStatus::Blocked,
                     ..pane_info("w1:p2", Some("claude"))
                 },
             ],
@@ -4441,7 +4442,7 @@ mod tests {
 
     /// herdr が `done` (完了出力の未閲覧バッジ) と報告する pane にも、
     /// 直配・queue drain・受領催促のすべてが user の閲覧を待たずに届く。
-    /// steer-safety の拒否対象は working / blocked / unknown のまま。
+    /// steer-safety の拒否対象は blocked / unknown。催促は working にも撃たない。
     #[tokio::test(start_paused = true)]
     async fn a_done_pane_receives_mail_drain_and_reminders_without_being_viewed() {
         let dir = tempfile::tempdir().unwrap();
@@ -4469,7 +4470,7 @@ mod tests {
             vec![
                 pane_info("w1:p1", Some("codex")),
                 HerdrPane {
-                    status: AgentStatus::Working,
+                    status: AgentStatus::Blocked,
                     ..pane_info("w1:p2", Some("claude"))
                 },
             ],
@@ -4502,7 +4503,7 @@ mod tests {
         assert_eq!(nags.len(), 1, "done pane にも催促が届く: {nags:?}");
         assert!(nags[0].1.contains("受領催促"), "{nags:?}");
 
-        // steer-safety: working へは催促も含めて一文字も送らない。
+        // 催促は working には撃たない (初回配達とは predicate が違う)。
         set_herdr_panes(
             &broker,
             vec![
@@ -4528,12 +4529,12 @@ mod tests {
             vec![
                 pane_info("w1:p1", Some("codex")),
                 HerdrPane {
-                    status: AgentStatus::Working,
+                    status: AgentStatus::Blocked,
                     ..pane_info("w1:p2", Some("claude"))
                 },
             ],
         );
-        // working 中はsend1/send2ともqueueに入り、FIFOを作る。
+        // blocked 中はsend1/send2ともqueueに入り、FIFOを作る。
         let first = json(
             &broker
                 .handle(send_request("w1:p1", "claude", "first"))
@@ -4565,10 +4566,13 @@ mod tests {
             &broker,
             vec![
                 pane_info("w1:p1", Some("codex")),
-                pane_info("w1:p2", Some("claude")),
+                HerdrPane {
+                    status: AgentStatus::Working,
+                    ..pane_info("w1:p2", Some("claude"))
+                },
             ],
         );
-        // health tick の drain が queue 先頭から1通ずつ配達する。
+        // health tick の drain は working にも先頭から1通ずつ配達する。
         let before = bells(&broker).len();
         broker.drain_queued().await;
         let after: Vec<_> = bells(&broker)[before..].to_vec();
@@ -4591,6 +4595,70 @@ mod tests {
             "{drained:?}"
         );
         assert_eq!(broker.state.queue_len("w1:p2"), 0, "queue は空になる");
+    }
+
+    #[test]
+    fn working_stays_busy_in_the_display_state() {
+        assert_eq!(super::display_state(AgentStatus::Idle), AgentState::Idle);
+        assert_eq!(super::display_state(AgentStatus::Done), AgentState::Idle);
+        assert_eq!(super::display_state(AgentStatus::Working), AgentState::Busy);
+        assert_eq!(super::display_state(AgentStatus::Blocked), AgentState::Busy);
+        assert_eq!(super::display_state(AgentStatus::Unknown), AgentState::Busy);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_working_pane_receives_mail_immediately_but_is_not_nagged() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut broker = registered_pair(&dir).await;
+        set_herdr_panes(
+            &broker,
+            vec![
+                pane_info("w1:p1", Some("codex")),
+                HerdrPane {
+                    status: AgentStatus::Working,
+                    ..pane_info("w1:p2", Some("claude"))
+                },
+            ],
+        );
+
+        let sent = json(
+            &broker
+                .handle(send_request("w1:p1", "claude", "while working"))
+                .await,
+        );
+        assert_eq!(sent["path"], "sent", "working は初回配達できる");
+        let id = sent["id"].as_u64().unwrap();
+        let delivered = bells(&broker);
+        assert_eq!(delivered.len(), 1, "{delivered:?}");
+        assert!(
+            delivered[0].1.contains(&format!("read_message {id}")),
+            "{delivered:?}"
+        );
+
+        let peers = json(
+            &broker
+                .handle(request("list-peers", Some("w1:p1"), &[]))
+                .await,
+        );
+        let claude = peers["peers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|peer| peer["pane"] == "w1:p2")
+            .unwrap();
+        assert_eq!(claude["state"], "busy", "配達可能でも working は busy 表示");
+
+        let who = broker.handle(request("who", Some("w1:p1"), &[])).await;
+        assert!(
+            who.stdout.contains("busy/working"),
+            "who も working を busy のまま出す: {}",
+            who.stdout
+        );
+
+        tokio::time::advance(std::time::Duration::from_mins(6)).await;
+        let before = bells(&broker).len();
+        broker.nag_unacked().await;
+        assert_eq!(bells(&broker).len(), before, "working には催促を撃たない");
     }
 
     #[tokio::test]

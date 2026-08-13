@@ -67,14 +67,23 @@ impl Backend {
             .collect())
     }
 
-    /// 配達可能 (idle / done) と確認できた pane にだけ配送する。送らなかった
-    /// 場合は `Err` を返し、呼び出し側の「配送できなかったので queue する」
-    /// 経路に載せる。
+    /// 配達可能 (idle / done / working) と確認できた pane にだけ配送する。
+    /// 送らなかった場合は `Err` を返し、呼び出し側の「配送できなかったので
+    /// queue する」経路に載せる。
     ///
     /// pane id は herdr が発行した opaque な文字列で、文法検証はしない —
     /// 未知の id は herdr 自身が拒否する。
     pub async fn deliver(&self, pane: &str, bell: &str) -> Result<()> {
-        match self.herdr.deliver(pane, bell).await? {
+        Self::finish_delivery(self.herdr.deliver(pane, bell).await?, pane)
+    }
+
+    /// 受領催促。送信直前の herdr 再確認も reminder predicate を使う。
+    pub async fn deliver_reminder(&self, pane: &str, bell: &str) -> Result<()> {
+        Self::finish_delivery(self.herdr.deliver_reminder(pane, bell).await?, pane)
+    }
+
+    fn finish_delivery(delivery: Delivery, pane: &str) -> Result<()> {
+        match delivery {
             Delivery::Sent => Ok(()),
             Delivery::Skipped(status) => {
                 bail!(
