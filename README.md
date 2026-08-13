@@ -139,12 +139,11 @@ CLI から送る経路を閉じないためです。
 `reply_to` は同じ名前の agent がその pane に今も登録されている場合だけ pane ID を返し、
 それ以外は `null` です。`null` のときは `list_peers` で現在の宛先を選び直します。
 
-呼び鈴を受けた側の手順は3段階です。
+呼び鈴を受けた側の手順は2段階です。
 
-1. `read_message` で読む。受領報告するまで何度でも読める。
-2. **作業に入る前に** `ack_message` で受領報告する。ここでメッセージが消える。
-3. 作業する。返信が必要なら `send_message` で普通に送り返す。返信専用の tool は
-   ありません。
+1. `read_message` で読む。読んだ時点で受領になり、本文は何度でも読める。
+2. 作業する。返信が必要なら `send_message` で普通に送り返す。返信専用の tool は
+   ありません。`ack_message` は互換の空操作です。
 
 接続先の socket は `XDG_RUNTIME_DIR`（無ければ `HOME`）から導出します。
 `HERDR_SOCKET_PATH` があればデーモンと同じ規則でその herdr 用の path を、
@@ -258,18 +257,16 @@ userからの接続を拒む境界であり、同一UID内の人間を識別・�
 
 `send` は `#<id>` を返し、受信側は呼び鈴に表示された
 `read_message <id>`（MCP。CLI では `agent-talk read <id>`）で依頼本文を
-取得します。`read` は本文を消しません（読了だけを記録します）。配達済みの
-まま受領報告が1分間ないメッセージには、daemonが受領催促の呼び鈴を送ります。
+取得します。受領は `read` / `read_message` が本文を返した時点です。本文は残り、
+同じ ID を何度でも読み直せます。`ack-message` / `ack_message` は互換の空操作です。
+配達済みのまま未読のメッセージには、daemonが受領催促の呼び鈴を送ります。
 催促が出るのはherdrの観測がターンとターンの間（idle / done）のときだけです
-（読了済みならackを、未読なら読むことを促し、
-5分間隔より詰めて連打しません。`working` への初回配達とは別です）。
-メッセージが消えるのは受信側が受領報告（`ack-message` / MCP の `ack_message`）を
-送った後で、それまでは何度でも読み直せます。宛先本人は呼び鈴を待たず、
+（読むことを促し、5分間隔より詰めて連打しません。`working` への初回配達とは別です）。
+宛先本人は呼び鈴を待たず、
 `list_peers` の `pending_to_me`（queue 中を含む）から ID を得て `read_message` で
 本文を pull できます。queue 中は**先頭から順に**だけ pull できます（FIFO）。
 pull は journal の配達完了記録を書いて queue から外すので、
-後から同じ ID の呼び鈴は鳴りません。未配達のまま `ack_message` だけ送ることは
-拒否します（先に read してください）。他 pane 宛の本文は引き続き読めません。
+後から同じ ID の呼び鈴は鳴りません。他 pane 宛の本文は引き続き読めません。
 本文、未配達queue、受領状態は既定で
 `$XDG_STATE_HOME/agent-talkd/`（未設定時は `~/.local/state/agent-talkd/`）
 のjournalに保存します。従来の `~/.cache/agent-talk/*.md` は新規作成せず、

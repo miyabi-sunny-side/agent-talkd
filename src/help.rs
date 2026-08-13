@@ -83,7 +83,7 @@ pub const COMMANDS: &[CommandHelp] = &[
     },
     CommandHelp {
         command: "ack-message",
-        text: "usage: agent-talk ack-message <id>\n\n受領報告を送りmessageを削除対象にします。存在しないIDは冪等成功です。",
+        text: "usage: agent-talk ack-message <id>\n\n互換の空操作です。受領は read / read-message が担います。存在しないIDは冪等成功です。",
     },
     CommandHelp {
         command: "list-peers",

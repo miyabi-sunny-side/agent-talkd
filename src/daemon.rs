@@ -38,13 +38,12 @@ use crate::{
     protocol::{Request, Response, SendOptions},
     state::{
         AgentState, BrokerState, Dispatch, ExternalMailboxEvent, MailboxDirection, Message, Origin,
-        StoredMessage,
     },
 };
 
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 
-/// 配達完了からこの時間 ack が無ければ受領催促を送る
+/// 配達完了からこの時間未読なら受領催促を送る
 /// (docs/design.md「受領報告と保持」の催促契約)。
 const NAG_AFTER: std::time::Duration = std::time::Duration::from_mins(1);
 
@@ -175,19 +174,19 @@ impl SendReport {
 
 /// `read` / `ack` から見たメッセージの状態。
 #[derive(Debug)]
-enum MessageAccess<'a> {
+enum MessageAccess {
     /// 呼び出し元宛・未受領。配達済みでも queue 中でもよい（所有者 pull 可）。
-    Pending(&'a StoredMessage),
+    Pending,
     /// 存在しないか、既に受領報告済み。
     NotFound,
     NotMine,
 }
 
-impl MessageAccess<'_> {
+impl MessageAccess {
     fn reject_reason(&self, id: u64) -> String {
         match self {
             // 呼び出し側が Pending を分岐で処理済みのため到達しない。daemon を落とさない。
-            Self::Pending(_) | Self::NotFound => {
+            Self::Pending | Self::NotFound => {
                 format!("message #{id} は見つかりません (受領報告済みの可能性があります)")
             }
             Self::NotMine => format!("message #{id} はこのpane宛ではありません"),
@@ -1229,7 +1228,7 @@ impl Broker {
             }
             "send-message" => Ok(Response::error("send-message optionsがありません")),
             "read-message" => Ok(self.read_json(&request)),
-            "ack-message" => self.ack(&request),
+            "ack-message" => Ok(self.ack(&request)),
             "list-peers" => self.peers_json(&request).await,
             "reply" => self.reply(request),
             "mailbox-list" => self.mailbox_list(&request),
@@ -1709,11 +1708,11 @@ impl Broker {
             |id| {
                 if intent.no_reply() {
                     format!(
-                        "{skill_prefix}[agent-talk] {from_agent} から連絡が届きました。read_message {id} で本文を確認し、ack_message で受領報告してください。返信は不要です。"
+                        "{skill_prefix}[agent-talk] {from_agent} から連絡が届きました。read_message {id} で本文を確認してください。返信は不要です。"
                     )
                 } else {
                     format!(
-                        "{skill_prefix}[agent-talk] {from_agent} から依頼が届きました。read_message {id} で本文を確認し、作業前に ack_message で受領報告してから対応してください。"
+                        "{skill_prefix}[agent-talk] {from_agent} から依頼が届きました。read_message {id} で本文を確認してから対応してください。"
                     )
                 }
             },
@@ -1843,7 +1842,7 @@ impl Broker {
     /// `read` / `ack` が共有する宛先検査
     /// (docs/decisions/0002-message-retention-ack.md「`ack_message` の契約」)。
     /// 所有者なら queue 中でも Pending。配達状態は `ensure_pull_delivery` / ack 側で扱う。
-    fn access(&self, id: u64, pane: &str) -> MessageAccess<'_> {
+    fn access(&self, id: u64, pane: &str) -> MessageAccess {
         // 受領報告済み (`Acked`) は存在しないものとして扱う。以後 read は not-found、
         // ack は mutation なしで冪等成功になる。
         let Some(stored) = self.state.message(id).filter(|stored| !stored.acked) else {
@@ -1853,7 +1852,7 @@ impl Broker {
         if stored.target_pane != pane || current_name != Some(stored.message.target_name.as_str()) {
             return MessageAccess::NotMine;
         }
-        MessageAccess::Pending(stored)
+        MessageAccess::Pending
     }
 
     /// 宛先本人の pull 読み: 未配達なら journal `Complete` で durable に配達完了し、
@@ -1902,10 +1901,13 @@ impl Broker {
             Err(response) => return response,
         };
         match self.access(id, &pane) {
-            MessageAccess::Pending(_) => {}
+            MessageAccess::Pending => {}
             other => return Response::error(other.reject_reason(id)),
         }
         if let Err(reason) = self.ensure_pull_delivery(&pane, id) {
+            return Response::error(reason);
+        }
+        if let Err(reason) = self.persist_seen(id) {
             return Response::error(reason);
         }
         let Some(stored) = self.state.message(id) else {
@@ -1914,7 +1916,6 @@ impl Broker {
             ));
         };
         let brief = stored.message.brief.clone();
-        self.state.mark_read(id);
         Response::ok(brief)
     }
 
@@ -1926,10 +1927,13 @@ impl Broker {
             Err(response) => return response,
         };
         match self.access(id, &pane) {
-            MessageAccess::Pending(_) => {}
+            MessageAccess::Pending => {}
             other => return Response::error(other.reject_reason(id)),
         }
         if let Err(reason) = self.ensure_pull_delivery(&pane, id) {
+            return Response::error(reason);
+        }
+        if let Err(reason) = self.persist_seen(id) {
             return Response::error(reason);
         }
         let Some(stored) = self.state.message(id) else {
@@ -1942,7 +1946,6 @@ impl Broker {
         // 返信先は、捕捉時と同じ identity で今も登録中の pane のときだけ。
         let reply_to = self.state.reply_target(&stored.message);
         let body = stored.message.brief.clone();
-        self.state.mark_read(id);
         Response::ok(format!(
             "{}\n",
             serde_json::json!({
@@ -1955,36 +1958,40 @@ impl Broker {
         ))
     }
 
-    /// 受領報告。journal の append + fsync が成功する前に可視性を `Acked` へ進めない。
-    /// 未配達の ack は拒否する（本文を見ずに消さない。先に read で pull 配達する）。
-    fn ack(&mut self, request: &Request) -> Result<Response> {
+    /// 互換 no-op。受領は `read` が担う。状態・journal は変えない。
+    fn ack(&self, request: &Request) -> Response {
         let (id, pane) = match request_target(request, "ack-message") {
             Ok(target) => target,
-            Err(response) => return Ok(response),
+            Err(response) => return response,
         };
         let outcome = match self.access(id, &pane) {
-            // 存在しない ID は mutation なしで冪等成功にする。checkpoint / prune 後の
-            // 再送を安全にするため (0002「なぜ「存在しない ID」を成功にするか」)。
             MessageAccess::NotFound => "no_pending_message",
-            MessageAccess::Pending(stored) if !stored.delivered => {
-                return Ok(Response::error(format!(
-                    "message #{id} はまだ読んでいません (先に read_message で本文を確認してください)"
-                )));
-            }
-            MessageAccess::Pending(_) => {
-                self.journal.append(&Record::Consumed { id })?;
-                self.state.ack(id);
-                info!(%pane, id, source = "ack", "acked");
-                "acked"
-            }
+            MessageAccess::Pending => "acked",
             other @ MessageAccess::NotMine => {
-                return Ok(Response::error(other.reject_reason(id)));
+                return Response::error(other.reject_reason(id));
             }
         };
-        Ok(Response::ok(format!(
+        Response::ok(format!(
             "{}\n",
             serde_json::json!({ "version": 1, "id": id, "outcome": outcome })
-        )))
+        ))
+    }
+
+    /// 未 Seen なら journal に `Seen` を fsync してから印を立てる。失敗時は本文を返さない。
+    fn persist_seen(&mut self, id: u64) -> std::result::Result<(), String> {
+        let Some(stored) = self.state.message(id) else {
+            return Err(format!(
+                "message #{id} は見つかりません (受領報告済みの可能性があります)"
+            ));
+        };
+        if stored.seen {
+            return Ok(());
+        }
+        self.journal
+            .append(&Record::Seen { id })
+            .map_err(|error| error.to_string())?;
+        self.state.mark_seen(id);
+        Ok(())
     }
 
     /// 登録 agent 一覧と両方向の未受領 ID。MCP adapter の `list_peers` が使う。
@@ -2410,10 +2417,10 @@ impl Broker {
         let Ok(panes) = self.backend.panes().await else {
             return;
         };
-        // pane ごとに1回の呼び鈴へ集約する: (id, 読了済みか) の列。
-        let mut due: BTreeMap<String, Vec<(u64, bool)>> = BTreeMap::new();
+        // pane ごとに1回の呼び鈴へ集約する。
+        let mut due: BTreeMap<String, Vec<u64>> = BTreeMap::new();
         for stored in self.state.messages.values() {
-            if stored.acked || !stored.delivered {
+            if stored.acked || stored.seen || !stored.delivered {
                 continue;
             }
             let Some(agent) = self.state.agents.get(&stored.target_pane) else {
@@ -2442,19 +2449,18 @@ impl Broker {
             }
             due.entry(stored.target_pane.clone())
                 .or_default()
-                .push((stored.message.id, stored.read));
+                .push(stored.message.id);
         }
-        for (pane, items) in due {
-            let bell = nag_bell(&items);
+        for (pane, ids) in due {
+            let bell = nag_bell(&ids);
             let delivered = self.backend.deliver_reminder(&pane, &bell).await.is_ok();
             // 失敗時も cooldown は消費する。2秒ごとの health tick で連打しない。
-            for (id, _) in &items {
+            for id in &ids {
                 if let Some(stored) = self.state.messages.get_mut(id) {
                     stored.last_nag_at = Some(now);
                 }
             }
             if delivered {
-                let ids: Vec<u64> = items.iter().map(|(id, _)| *id).collect();
                 info!(%pane, ?ids, source = "nag", "receipt reminder delivered");
             }
         }
@@ -2675,32 +2681,16 @@ fn canonical_command(command: &str) -> &str {
     }
 }
 
-/// 受領催促の呼び鈴文言。読了済みと未読で促す操作を変える
-/// (user 原文「読んだんじゃないの？早くackしてくれ、読んでないなら読んでくれ」)。
-fn nag_bell(items: &[(u64, bool)]) -> String {
-    let list = |read: bool| {
-        items
-            .iter()
-            .filter(|(_, item_read)| *item_read == read)
-            .map(|(id, _)| format!("#{id}"))
-            .collect::<Vec<_>>()
-            .join(" ")
-    };
-    let read_ids = list(true);
-    let unread_ids = list(false);
-    if unread_ids.is_empty() {
-        format!(
-            "[agent-talk] 受領催促: message {read_ids} は読まれたまま受領報告がありません。ack_message で受領報告してください。"
-        )
-    } else if read_ids.is_empty() {
-        format!(
-            "[agent-talk] 受領催促: message {unread_ids} が未読のままです。read_message で本文を確認し、ack_message で受領報告してください。"
-        )
-    } else {
-        format!(
-            "[agent-talk] 受領催促: message {read_ids} は未 ack、{unread_ids} は未読です。read_message / ack_message で処理してください。"
-        )
-    }
+/// 未読（未 Seen）向けの受領催促。
+fn nag_bell(ids: &[u64]) -> String {
+    let unread_ids = ids
+        .iter()
+        .map(|id| format!("#{id}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "[agent-talk] 受領催促: message {unread_ids} が未読のままです。read_message で本文を確認してください。"
+    )
 }
 
 fn build_brief(
@@ -3187,7 +3177,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_ack_whose_journal_append_fails_stays_pending_and_can_be_retried() {
+    async fn a_seen_journal_append_failure_stays_unseen_and_can_be_retried() {
         let dir = tempfile::tempdir().unwrap();
         let mut broker = registered_pair(&dir).await;
         let id = json(&broker.handle(send_request("w1:p1", "claude", "body")).await)["id"]
@@ -3195,37 +3185,25 @@ mod tests {
             .unwrap();
         let journal_len = std::fs::metadata(&broker.config.journal).unwrap().len();
 
-        // (a) append 失敗は error 応答になる。
         broker.journal.fail_next_appends(1);
         let failed = broker
-            .handle(request("ack-message", Some("w1:p2"), &[&id.to_string()]))
+            .handle(request("read-message", Some("w1:p2"), &[&id.to_string()]))
             .await;
         assert_eq!(failed.code, 1, "{failed:?}");
         assert!(failed.stderr.contains("injected journal append failure"));
-
-        // (b) message は Pending のまま可視。journal も1バイトも伸びていない。
-        assert!(!broker.state.message(id).unwrap().acked);
+        assert!(!broker.state.message(id).unwrap().seen);
         assert_eq!(broker.state.pending_to_me("w1:p2"), vec![id]);
         assert_eq!(
             std::fs::metadata(&broker.config.journal).unwrap().len(),
             journal_len
         );
 
-        // (c) 再 read が成功する。
         let reread = broker
             .handle(request("read-message", Some("w1:p2"), &[&id.to_string()]))
             .await;
         assert_eq!(reread.code, 0, "{}", reread.stderr);
         assert!(json(&reread)["body"].as_str().unwrap().contains("body"));
-
-        // (d) 後から ack すると成功する。
-        let acked = json(
-            &broker
-                .handle(request("ack-message", Some("w1:p2"), &[&id.to_string()]))
-                .await,
-        );
-        assert_eq!(acked["outcome"], "acked");
-        assert!(broker.state.message(id).unwrap().acked);
+        assert!(broker.state.message(id).unwrap().seen);
         assert!(broker.state.pending_to_me("w1:p2").is_empty());
     }
 
@@ -3270,18 +3248,16 @@ mod tests {
             denied.stderr
         );
 
-        // 未配達のまま ack だけは拒否（本文を見ずに消さない）。
-        let early_ack = broker
-            .handle(request("ack-message", Some("w1:p2"), &[&id.to_string()]))
-            .await;
-        assert_eq!(early_ack.code, 1, "{early_ack:?}");
-        assert!(
-            early_ack.stderr.contains("まだ読んでいません"),
-            "{}",
-            early_ack.stderr
+        // 未読の ack は空操作。queue も pending も動かない。
+        let early_ack = json(
+            &broker
+                .handle(request("ack-message", Some("w1:p2"), &[&id.to_string()]))
+                .await,
         );
-        assert!(!broker.state.message(id).unwrap().acked);
+        assert_eq!(early_ack["outcome"], "acked");
+        assert!(!broker.state.message(id).unwrap().seen);
         assert!(broker.state.is_queued("w1:p2", id));
+        assert_eq!(broker.state.pending_to_me("w1:p2"), vec![id]);
 
         // 宛先本人の pull read: Complete が durable になり本文が返る。呼び鈴は増えない。
         let journal_len = std::fs::metadata(&broker.config.journal).unwrap().len();
@@ -3297,7 +3273,7 @@ mod tests {
         );
         assert_eq!(read["from"], "codex");
         assert!(broker.state.message(id).unwrap().delivered);
-        assert!(broker.state.message(id).unwrap().read);
+        assert!(broker.state.message(id).unwrap().seen);
         assert!(
             !broker.state.is_queued("w1:p2", id),
             "pull で queue から外れる"
@@ -3380,7 +3356,10 @@ mod tests {
             "Complete が replay される"
         );
         assert!(!restarted.state.is_queued("w1:p2", id));
-        assert_eq!(restarted.state.pending_to_me("w1:p2"), vec![id]);
+        assert!(
+            restarted.state.pending_to_me("w1:p2").is_empty(),
+            "pull read の Seen は restart 後も残る"
+        );
         let reread = json(
             &restarted
                 .handle(request("read-message", Some("w1:p2"), &[&id.to_string()]))
@@ -3397,11 +3376,15 @@ mod tests {
                 .await,
         );
         assert_eq!(acked["outcome"], "acked");
-        let gone = restarted
-            .handle(request("read-message", Some("w1:p2"), &[&id.to_string()]))
-            .await;
-        assert_eq!(gone.code, 1);
-        assert!(gone.stderr.contains("見つかりません"), "{}", gone.stderr);
+        let still = json(
+            &restarted
+                .handle(request("read-message", Some("w1:p2"), &[&id.to_string()]))
+                .await,
+        );
+        assert!(
+            still["body"].as_str().unwrap().contains("durable pull"),
+            "ack しても本文は残る"
+        );
     }
 
     #[tokio::test]
@@ -3452,7 +3435,7 @@ mod tests {
         );
         assert!(skipped.stderr.contains(&format!("#{first}")));
         assert!(!broker.state.message(second).unwrap().delivered);
-        assert!(!broker.state.message(second).unwrap().read);
+        assert!(!broker.state.message(second).unwrap().seen);
         assert!(broker.state.is_queued("w1:p2", first));
         assert!(broker.state.is_queued("w1:p2", second));
         assert_eq!(
@@ -3512,7 +3495,7 @@ mod tests {
             failed.stderr
         );
         assert!(!broker.state.message(id).unwrap().delivered);
-        assert!(!broker.state.message(id).unwrap().read);
+        assert!(!broker.state.message(id).unwrap().seen);
         assert!(broker.state.is_queued("w1:p2", id));
     }
 
@@ -3785,17 +3768,12 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_read_but_unacked_message_draws_an_ack_reminder_after_a_minute() {
+    async fn an_unread_message_respects_nag_delay_and_cooldown_then_stops_on_read() {
         let dir = tempfile::tempdir().unwrap();
         let mut broker = registered_pair(&dir).await;
         let id = json(&broker.handle(send_request("w1:p1", "claude", "body")).await)["id"]
             .as_u64()
             .unwrap();
-        // 配達済み → %2 が読んだが ack しない。
-        let read = broker
-            .handle(request("read-message", Some("w1:p2"), &[&id.to_string()]))
-            .await;
-        assert_eq!(read.code, 0, "{}", read.stderr);
 
         let before = bells(&broker).len();
         broker.nag_unacked().await;
@@ -3805,17 +3783,15 @@ mod tests {
         broker.nag_unacked().await;
         let after: Vec<_> = bells(&broker)[before..].to_vec();
         assert_eq!(after.len(), 1, "催促はちょうど1回");
-        let (pane, bell) = &after[0];
-        assert_eq!(pane, "w1:p2", "催促は受信者へ送る");
+        assert_eq!(after[0].0, "w1:p2");
         assert!(
-            bell.contains("受領催促") && bell.contains(&format!("#{id}")),
-            "{bell}"
+            after[0].1.contains("受領催促")
+                && after[0].1.contains(&format!("#{id}"))
+                && after[0].1.contains("read_message"),
+            "{}",
+            after[0].1
         );
-        assert!(
-            bell.contains("読まれたまま") && bell.contains("ack_message"),
-            "読了済みには ack を促す: {bell}"
-        );
-        // cooldown 中は追い討ちしない。
+
         tokio::time::advance(std::time::Duration::from_secs(61)).await;
         broker.nag_unacked().await;
         broker.nag_unacked().await;
@@ -3825,19 +3801,17 @@ mod tests {
             "cooldown 中は再催促しない"
         );
 
-        // cooldown が明ければもう一度だけ催促する。
         tokio::time::advance(std::time::Duration::from_mins(5)).await;
         broker.nag_unacked().await;
-        assert_eq!(bells(&broker).len(), before + 2);
+        assert_eq!(bells(&broker).len(), before + 2, "cooldown 明けに1回");
 
-        // ack すれば止まる。
-        let acked = broker
-            .handle(request("ack-message", Some("w1:p2"), &[&id.to_string()]))
+        let read = broker
+            .handle(request("read-message", Some("w1:p2"), &[&id.to_string()]))
             .await;
-        assert_eq!(acked.code, 0, "{}", acked.stderr);
+        assert_eq!(read.code, 0, "{}", read.stderr);
         tokio::time::advance(std::time::Duration::from_mins(10)).await;
         broker.nag_unacked().await;
-        assert_eq!(bells(&broker).len(), before + 2, "ack 後は催促しない");
+        assert_eq!(bells(&broker).len(), before + 2, "read 後は催促しない");
     }
 
     #[tokio::test(start_paused = true)]
@@ -4661,6 +4635,176 @@ mod tests {
         assert_eq!(bells(&broker).len(), before, "working には催促を撃たない");
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn a_successful_read_is_receipt_and_the_body_stays() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut broker = registered_pair(&dir).await;
+        let id = json(
+            &broker
+                .handle(send_request("w1:p1", "claude", "keep this body"))
+                .await,
+        )["id"]
+            .as_u64()
+            .unwrap();
+
+        let first = json(
+            &broker
+                .handle(request("read-message", Some("w1:p2"), &[&id.to_string()]))
+                .await,
+        );
+        assert!(
+            first["body"].as_str().unwrap().contains("keep this body"),
+            "{}",
+            first["body"]
+        );
+
+        let recipient = json(
+            &broker
+                .handle(request("list-peers", Some("w1:p2"), &[]))
+                .await,
+        );
+        assert!(
+            recipient["pending_to_me"].as_array().unwrap().is_empty(),
+            "read で自分宛 pending が消える: {recipient}"
+        );
+        let sender = json(
+            &broker
+                .handle(request("list-peers", Some("w1:p1"), &[]))
+                .await,
+        );
+        let from_me = sender["peers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|peer| peer["pane"] == "w1:p2")
+            .unwrap();
+        assert!(
+            from_me["pending_from_me"].as_array().unwrap().is_empty(),
+            "read で送り手 pending も消える: {from_me}"
+        );
+
+        let again = json(
+            &broker
+                .handle(request("read-message", Some("w1:p2"), &[&id.to_string()]))
+                .await,
+        );
+        assert!(
+            again["body"].as_str().unwrap().contains("keep this body"),
+            "本文は残る: {}",
+            again["body"]
+        );
+
+        tokio::time::advance(std::time::Duration::from_mins(6)).await;
+        let before = bells(&broker).len();
+        broker.nag_unacked().await;
+        assert_eq!(bells(&broker).len(), before, "read 後は催促しない");
+    }
+
+    #[tokio::test]
+    async fn ack_is_a_mutation_free_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut broker = registered_pair(&dir).await;
+        let id = json(
+            &broker
+                .handle(send_request("w1:p1", "claude", "unread"))
+                .await,
+        )["id"]
+            .as_u64()
+            .unwrap();
+        let journal_before = std::fs::read(&broker.config.journal).unwrap();
+
+        let early = json(
+            &broker
+                .handle(request("ack-message", Some("w1:p2"), &[&id.to_string()]))
+                .await,
+        );
+        assert_eq!(early["outcome"], "acked");
+        assert_eq!(
+            std::fs::read(&broker.config.journal).unwrap(),
+            journal_before,
+            "read 前の ack は journal を書かない"
+        );
+        assert_eq!(broker.state.pending_to_me("w1:p2"), vec![id]);
+
+        let read = json(
+            &broker
+                .handle(request("read-message", Some("w1:p2"), &[&id.to_string()]))
+                .await,
+        );
+        assert!(read["body"].as_str().unwrap().contains("unread"));
+        let journal_after_read = std::fs::read(&broker.config.journal).unwrap();
+
+        let late = json(
+            &broker
+                .handle(request("ack-message", Some("w1:p2"), &[&id.to_string()]))
+                .await,
+        );
+        assert_eq!(late["outcome"], "acked");
+        assert_eq!(
+            std::fs::read(&broker.config.journal).unwrap(),
+            journal_after_read,
+            "read 後の ack も journal を書かない"
+        );
+        let reread = json(
+            &broker
+                .handle(request("read-message", Some("w1:p2"), &[&id.to_string()]))
+                .await,
+        );
+        assert!(reread["body"].as_str().unwrap().contains("unread"));
+
+        let missing = json(
+            &broker
+                .handle(request("ack-message", Some("w1:p2"), &["99"]))
+                .await,
+        );
+        assert_eq!(missing["outcome"], "no_pending_message");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_seen_receipt_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = {
+            let mut broker = registered_pair(&dir).await;
+            let id = json(
+                &broker
+                    .handle(send_request("w1:p1", "claude", "survive restart"))
+                    .await,
+            )["id"]
+                .as_u64()
+                .unwrap();
+            let read = broker
+                .handle(request("read-message", Some("w1:p2"), &[&id.to_string()]))
+                .await;
+            assert_eq!(read.code, 0, "{}", read.stderr);
+            id
+        };
+        let mut restarted = broker(
+            &dir,
+            vec![
+                pane_info("w1:p1", Some("codex")),
+                pane_info("w1:p2", Some("claude")),
+            ],
+        );
+        assert!(
+            restarted.state.pending_to_me("w1:p2").is_empty(),
+            "Seen は restart 後も pending に戻らない"
+        );
+        let reread = json(
+            &restarted
+                .handle(request("read-message", Some("w1:p2"), &[&id.to_string()]))
+                .await,
+        );
+        assert!(
+            reread["body"].as_str().unwrap().contains("survive restart"),
+            "{}",
+            reread["body"]
+        );
+        tokio::time::advance(std::time::Duration::from_mins(6)).await;
+        let before = bells(&restarted).len();
+        restarted.nag_unacked().await;
+        assert_eq!(bells(&restarted).len(), before, "restart 後も催促しない");
+    }
+
     #[tokio::test]
     async fn legacy_wire_names_still_reach_the_same_operations() {
         let dir = tempfile::tempdir().unwrap();
@@ -4681,7 +4825,10 @@ mod tests {
         assert!(read["body"].as_str().unwrap().contains("legacy body"));
 
         let peers = json(&broker.handle(request("peers-v1", Some("w1:p2"), &[])).await);
-        assert_eq!(peers["pending_to_me"][0], id);
+        assert!(
+            peers["pending_to_me"].as_array().unwrap().is_empty(),
+            "read-v1 で受領になる: {peers}"
+        );
 
         let acked = json(
             &broker

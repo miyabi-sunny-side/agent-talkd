@@ -1,14 +1,36 @@
-# 0002. メッセージは受領報告で消す
+# 0002. メッセージの保持と受領
 
-- Status: accepted
-- Independent review: codex (`%6`) — 再判定で **A〜F すべて PASS**
+- Status: accepted (amended)
+- Independent review: codex (`%6`) — 再判定で **A〜F すべて PASS**（2026-08-01 初版）
 - Date: 2026-08-01
 - 関連: [0001](0001-conversation-broker-scope.md)。MCP と同時に導入する
 - Amendment (2026-08-12): 宛先本人の **pull 配達**を許可。`pending_to_me` は queue 中を含む。
   未配達の `read` は journal `Complete` で durable 配達完了してから本文を返す。
-  未配達の `ack` は拒否（先に read）。他 pane 拒否は維持。詳細は下記「Amendment」。
+  他 pane 拒否は維持。
+- Amendment (2026-08-14): 受領印は成功した `read` の durable `Seen`。本文は残す。
+  `ack_message` は互換の空操作。旧 `Consumed` は削除対象のまま。
+  新 tag `seen` は旧 daemon が読めない（downgrade 非互換。spike で許容）。
 
-## 要約（決裁者はここだけ読めば足りる）
+## 現行（2026-08-14。決裁者はここだけ読めば足りる）
+
+**読んだ時点で受領になる。本文は残る。明示 ack は空操作。**
+
+1. 呼び鈴が鳴る（または `pending_to_me` で自己発見する） → **読む**
+2. 成功した `read` が journal に `Seen` を fsync する。pending と催促は止まる
+3. 同じ ID の本文は何度でも読める。作業後の返信は普通の `send_message`
+
+| 問い | 答え |
+|---|---|
+| いま何が起きているか | `read` 成功 = 受領。本文は checkpoint でも消えない |
+| 明示 ack は | 状態も journal も変えない。他 pane は拒否。欠番は冪等成功 |
+| 催促は | 配達済み・未 Seen だけ。1分後に1回、以後5分間隔 |
+| 旧 `consumed` | pane 消滅などの terminal 削除。replay は従来どおり Acked |
+| 新 journal | `seen` tag。旧 daemon では開けない |
+
+以下「2026-08-01 採択時」の要約・Decision・状態表・当時の Verification は
+**superseded / historical**。現行の検証は末尾「現行 Verification」を使う。
+
+## 2026-08-01 採択時の要約（historical）
 
 **受け取った側が「読んだよ、届いたよ」と報告するまでメッセージは残る。報告したら消える。**
 
@@ -37,7 +59,7 @@
 「受け取ったと言われたから消す」なら、必要な間だけ正確に残り、しかも**送達確認が副産物として
 手に入る**。
 
-## Decision
+## Decision（2026-08-01 historical）
 
 メッセージの削除条件を「次の checkpoint」から「**受信側からの明示的な受領報告**」へ変更する。
 
@@ -285,9 +307,22 @@ queue から外れた後に checkpoint で prune する。
 - journal のサイズや圧縮頻度が実測で問題になった
 - 権限範囲外の変更が必要になった
 
-## Verification
+## 現行 Verification（2026-08-14）
 
-**受領報告と保持**
+**受領と保持**
+
+- 成功した owner `read` のあと、両側 pending から消え、再 read で本文が返り、催促が鳴らないこと
+- `Seen` の append/fsync 失敗時は本文を返さず pending を進めないこと。再試行で成功すること
+- restart / checkpoint のあと Seen 本文が読め、pending に戻らないこと
+- `ack_message` は read 前・後・欠番で journal/state を変えず冪等成功すること。read 前 ack は受領にならないこと
+- 他 pane 宛の ack / read は拒否すること
+- 未読の催促は 1 分未満では鳴らず、発火後 cooldown 中は増えず、5 分明けに1回、read で止まること
+- 旧 `Consumed` の replay は従来どおり削除対象であること
+- `pending_to_me` / `pending_from_me` が本文を含まないこと
+
+## Verification（2026-08-01 historical）
+
+**受領報告と保持（当時）**
 
 - **配達完了済み** message の再 `read_message` は本文を返し、journal が増えないこと
   （未配達への初回 pull は `Complete` を1回追記する）

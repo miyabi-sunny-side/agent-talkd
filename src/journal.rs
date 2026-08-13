@@ -59,6 +59,11 @@ pub enum Record {
     Consumed {
         id: u64,
     },
+    /// 本文取得済みの受領印。本文は残し、pending / 催促だけ止める。
+    /// 旧 `consumed` とは別 tag。旧 daemon は新 journal を読めない。
+    Seen {
+        id: u64,
+    },
     /// checkpoint の **末尾** に書かれる境界マーカー。`Journal::open` はこれを見て
     /// 「前回 checkpoint 以降の追記数」を 0 に戻す。
     Sequence {
@@ -250,6 +255,14 @@ impl Journal {
                     },
                 )?;
             }
+            if stored.seen {
+                write_record(
+                    &mut output,
+                    &Record::Seen {
+                        id: stored.message.id,
+                    },
+                )?;
+            }
         }
         for events in state.mailboxes.values() {
             for event in events {
@@ -328,6 +341,7 @@ fn replay(state: &mut BrokerState, record: Record) {
         // 旧 journal の `Consumed`（読了）も新意味の `Acked`（受領済み = 即削除対象）
         // として replay される。
         Record::Consumed { id } => state.ack(id),
+        Record::Seen { id } => state.mark_seen(id),
         Record::Sequence { next_id } => state.restore_next_id(next_id),
         Record::ExternalMailbox { event } => state.add_mailbox_event(event),
     }
@@ -344,7 +358,7 @@ fn migrate_legacy_brief(message: &mut Message) {
             )
         });
         message.bell = format!(
-            "[agent-talk] 依頼が届きました。read_message {} で本文を確認し、作業前に ack_message で受領報告してから対応してください。",
+            "[agent-talk] 依頼が届きました。read_message {} で本文を確認してください。",
             message.id
         );
     }
@@ -449,7 +463,7 @@ mod tests {
         assert_eq!(state.message(7).unwrap().message.brief, "# legacy body\n");
         let bell = &state.message(7).unwrap().message.bell;
         assert!(
-            bell.contains("read_message 7") && bell.contains("ack_message"),
+            bell.contains("read_message 7"),
             "旧 journal からの復元も MCP 文言の呼び鈴になる: {bell}"
         );
     }

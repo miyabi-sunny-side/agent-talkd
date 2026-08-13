@@ -173,8 +173,8 @@ pull側の規則:
 配送入口は1つです。
 
 1. 依頼ヘッダと本文をID付きでjournalへ永続化します。
-2. 宛先に先行queueがなく、herdrが配達可能なら、`read_message <id>`と
-   `ack_message`を案内する呼び鈴をherdrの`agent.prompt`でagent本人へ
+2. 宛先に先行queueがなく、herdrが配達可能なら、`read_message <id>`を
+   案内する呼び鈴をherdrの`agent.prompt`でagent本人へ
    submitします。herdrが**idle / done / working と判定したpaneに**送り、
    `blocked`/`unknown`には一文字も送りません（workingは長寿命の裏プロセスで
    idle/doneに戻らない相手へ呼び鈴が滞留しないため。doneは完了出力の
@@ -189,17 +189,18 @@ pull側の規則:
 4. **queueが残っているpaneは2秒間隔のhealth tickが先頭を1件ずつ再配送**します。
    hookは使わず、毎回herdrの配達可能ガード（idle/done/working）を通します。検出が
    追いついた次のtickで同じIDがFIFOのまま流れます。
-5. `read`は本文を返し、読了だけを記録します（memoryのみ）。受領報告が来るまで
-   何度でも読めます。
-6. `ack`は受領報告をjournalへ追記・fsyncしてから、そのメッセージを削除対象に
-   します。以後の`read`はnot-foundです。
+5. `read`は本文を返し、未 Seen なら journal に`Seen`をappend+fsyncしてから
+   受領にする。本文は残し、同じIDを何度でも読める。`Seen`のfsyncに失敗したら
+   本文を返さない。
+6. `ack`は互換の空操作で、journalも状態も変えない。削除対象にするのは旧
+   `Consumed`（pane消滅時の回収など）だけです。
 7. 未受領のまま宛先が消滅した場合、元本文を含む未受領通知を送信元用の
    新しいメッセージとして作成します。通知は送信元paneごとに1通へ集約し、
    回収した全メッセージのIDと本文を含めます（呼び鈴も送信元あたり1回）。
-8. 配達済みのまま受領報告が1分間ないメッセージには、受領催促の呼び鈴を
+8. 配達済みのまま未読（未 Seen）のメッセージには、受領催促の呼び鈴を
    送ります。催促が出るのはherdrの観測がターンとターンの間（idle/done）のときだけです。
-   読了済みならack、未読なら読むことを促し、同じメッセージへの催促は5分間隔
-   より詰めません。working/blocked/unknownには撃たず、催促の
+   読むことを促し、同じメッセージへの催促は5分間隔より詰めません。
+   working/blocked/unknownには撃たず、催促の
    状態はmemoryのみで再起動後は配達時刻から数え直します。
 
 ## 永続化の不変条件
@@ -215,8 +216,8 @@ journal（tmux socket名で命名）がちょうど1つ残っていて新名の 
 - `sent`または`queued (waiting)`を返す前に本文のappendと`fsync`を完了する。
 - journal書き込みに失敗したメッセージを配達済み・queuedとして報告しない。
 - daemon再起動時に未受領本文と未配達queueを復元する。
-- 受領報告済み（Acked）かつ配送待ちqueueにない本文だけをcheckpointで圧縮消滅させる。
-  読んだだけの本文は消さない。queue内の本文はAckedでも、後続のtick配送まで
+- 旧 `Consumed`（Acked）かつ配送待ちqueueにない本文だけをcheckpointで圧縮消滅させる。
+  `Seen`（読んだ）本文は消さない。queue内の本文はAckedでも、後続のtick配送まで
   保持する。保持と可視性を同じ1つの真偽値で判定しない。
 - checkpointの発火は、総レコード数ではなく**前回checkpoint以降に追記した
   レコード数**（256件）で判定する。総数で判定すると、圧縮後のsnapshot自体が
@@ -234,23 +235,19 @@ queue投入のlost wake-up、同一メッセージの同時二重配送を構造
 
 ## 受領報告と保持
 
-メッセージの削除条件は「受信側からの明示的な受領報告（ack）」ただ1つです。状態も
-`Pending`（未受領）と`Acked`（受領報告済み＝削除対象）の1軸しかありません。
-**読了は削除・掃除・失敗通知の判定軸にしません。** 読了を判定軸にすると「未読の
-Pending」と「読了済みのPending」を区別する分岐が全経路に復活し、判定軸が2つに
-増えるためです（0002の「読了を記録しない」はこの趣旨）。読了は**受領催促の文言を
-選ぶためだけ**にmemoryへ記録し、journalに残さず、上記のどの判定にも使いません。
-restartで未読へ戻っても、催促文言が保守側（「未読なら読んでくれ」）に倒れるだけです。
+受領印は成功した `read` の durable `Seen` です。本文は残します。旧 `Consumed`
+（`Acked`）だけが削除対象です。checkpoint は Seen を圧縮しません（成長は follow-up）。
+催促と pending は未 Seen だけを見ます。
 
 daemonは`read`と`ack`で同じ宛先検査を使います。配達状態は read 時の pull と
 ack の前提で扱います。
 
 | 対象 | `read` / `read-message` | `ack-message` |
 | --- | --- | --- |
-| 呼び出し元pane宛・配達完了済み・未受領 | 本文を返し、読了だけをmemoryに記録（受領・削除の状態は変えない） | append＋fsyncの後に`Acked`。`outcome: acked` |
-| 呼び出し元pane宛・配達未完了（queue中） | **pull 配達**: **queue先頭のときだけ** journal に`Complete`をappend+fsyncし、queueから外して`delivered`にしたうえで本文を返す。後続IDの先取りは拒否（FIFO維持）。`agent.prompt`は撃たない | **拒否**（先に read で本文を確認させる。本文を見ずに消さない） |
+| 呼び出し元pane宛・配達完了済み・未受領 | 本文を返し、未 Seen なら `Seen` を append+fsync。pending / 催促は止まる。本文は残る | 空操作。`outcome: acked` |
+| 呼び出し元pane宛・配達未完了（queue中） | **pull 配達**: **queue先頭のときだけ** journal に`Complete`をappend+fsyncし、queueから外して`delivered`にしたうえで本文を返し、`Seen`する。後続IDの先取りは拒否（FIFO維持）。`agent.prompt`は撃たない | 空操作。受領にも削除にもならない |
 | 他pane宛 | 拒否 | 拒否 |
-| 存在しない、または受領報告済み | not-found | mutationなしで冪等成功（`outcome: no_pending_message`） |
+| 存在しない、または旧 `Consumed` | not-found | mutationなしで冪等成功（`outcome: no_pending_message`） |
 
 この表はMCP adapter用RPC（`read-message` / `ack-message`）では、呼び出し元paneが登録済みagentである
 場合にだけ適用されます。未登録paneはこの分岐へ入る前に拒否されます（「MCP adapter」を
@@ -262,9 +259,7 @@ pull の `Complete` は push 配達と同じ journal 記録なので、後から
 FIFO を保ちます。`Complete` の fsync が失敗したときは本文を返さず、
 queue も進めません。他 pane への秘匿は宛先検査が担います（ID 推測で他人の本文は読めない）。
 
-未配達のまま ack だけを許すと、本文を見ずに消せるうえ、旧契約では後から呼び鈴だけが
-届いて `read` が not-found になる害がありました。pull 後は `delivered` なので通常の
-ack 契約に乗り、未 pull の ack は拒否します。
+受領は成功した `read` の `Seen` だけが担います。`ack` は互換の空操作です。
 
 存在しないIDをエラーではなく冪等成功にするのは、応答が失われた後の再送を安全に
 するためです。`Acked`はcheckpointで所有情報ごとpruneされるので、再送時に
@@ -278,11 +273,11 @@ tombstoneを永続保持する必要があり、削除を目的とする本契�
 どちらも本文と他送信者のIDは含みません。受け手は呼び鈴を待たず `pending_to_me` から
 自己発見して pull できます。push 呼び鈴は引き続き idle/done/working 時の主 wake 経路です。
 
-受領報告を忘れてもメッセージは残ります（誤削除より安全側）。自動では削除しま
-せんが、放置もしません: 配達済みのまま受領報告が1分間ないメッセージには、宛先が
+未読のまま放置しても本文は残ります。自動では削除しませんが、放置もしません:
+配達済みのまま未 Seen のメッセージには、宛先が
 herdrの観測がターンとターンの間（idle/done）のときだけdaemonが
-受領催促の呼び鈴を送ります。読了済みならack、未読なら読むことを促し、pane単位で
-1回の呼び鈴に集約し、同じメッセージへは5分間隔より詰めません。working/blocked/unknownには撃たず、催促は新しいメッセージを作りません（催促自体が受領報告の
+受領催促の呼び鈴を送ります。読むことを促し、pane単位で
+1回の呼び鈴に集約し、同じメッセージへは5分間隔より詰めません。working/blocked/unknownには撃たず、催促は新しいメッセージを作りません（催促自体が受領の
 対象になる再帰を避けるため）。催促タイマーはmemoryのみで、restart後は配達時刻
 から数え直します。
 
@@ -299,9 +294,9 @@ herdrの観測がターンとターンの間（idle/done）のときだけdaemon
 
 ### pane消滅時の掃除
 
-読了は削除判定に使わないため、掃除と失敗通知の対象は**未受領の`Pending`全件**とし、
-通知も「配達されなかった」ではなく「受領報告されないまま宛先が退出した」を表す
-文言にします。読んだがack前に落ちた場合も未受領として扱う、ackを正とする意味論です。
+掃除と失敗通知の対象は**未 Seen かつ未 Acked の全件**とし、
+通知も「配達されなかった」ではなく「受領されないまま宛先が退出した」を表す
+文言にします。`read` 済み（Seen）は受領済みなので回収しません。
 通知は送信元paneごとに1通へ集約し、回収した全メッセージのIDと本文を含めます
 （呼び鈴も送信元あたり1回）。集約通知に収録する元本文の合計は送信本文と同じ1MiBを
 上限とし、超過する分はIDを残して本文を明示的に省略します（journalの単発肥大の防止は
@@ -355,7 +350,7 @@ subprocess実行・shell経由の呼び出しをtoolにも実装にも持ち込�
 agentが自分のsandboxを迂回する経路になります。
 
 initializeで返すserver instructionsは短い操作契約に限定し、「呼び鈴を受けたら
-`read_message`で読み、作業に入る前に`ack_message`で受領報告する」を含めます。toolが
+`read_message`で読む。読んだ時点で受領になる」を含めます。toolが
 context にあるだけでは横展開は起きない一方、判断そのものを縛る大きな文にすると
 skillを消した意味が失われます。
 

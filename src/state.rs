@@ -69,10 +69,9 @@ pub struct StoredMessage {
     /// (docs/decisions/0002-message-retention-ack.md「journal 形式と旧データの移行」)。
     /// `false` が `Pending`。
     pub acked: bool,
-    /// 読了 (`read` / `read-message` が本文を返した)。受領催促の文言分岐にだけ使う。
-    /// **memory のみ**で journal には残さない。restart 後は未読へ戻るが、
-    /// 催促文言が保守側 (「未読なら読んでくれ」) に倒れるだけで害がない。
-    pub read: bool,
+    /// 本文取得済みの受領印。journal の `Record::Seen` で復元する。
+    /// pending / 催促の停止条件。本文は残す (`acked` とは別軸)。
+    pub seen: bool,
     /// 配達完了時刻。受領催促のタイマー起点 (memory のみ。restart で今から数え直す)。
     pub delivered_at: Option<tokio::time::Instant>,
     /// 最後に受領催促を送った時刻 (memory のみ)。
@@ -192,7 +191,7 @@ impl BrokerState {
                 target_pane: pane.to_owned(),
                 delivered: false,
                 acked: false,
-                read: false,
+                seen: false,
                 delivered_at: None,
                 last_nag_at: None,
             },
@@ -277,10 +276,10 @@ impl BrokerState {
         }
     }
 
-    /// 読了を記録する (`read` / `read-message` が本文を返したとき)。
-    pub fn mark_read(&mut self, id: u64) {
+    /// 受領印 (`Seen`)。journal への追記が成功した後にだけ呼ぶこと。
+    pub fn mark_seen(&mut self, id: u64) {
         if let Some(stored) = self.messages.get_mut(&id) {
-            stored.read = true;
+            stored.seen = true;
         }
     }
 
@@ -300,6 +299,7 @@ impl BrokerState {
             .filter(|stored| {
                 stored.target_pane == pane
                     && !stored.acked
+                    && !stored.seen
                     && current_name == Some(stored.message.target_name.as_str())
             })
             .map(|stored| stored.message.id)
@@ -310,7 +310,7 @@ impl BrokerState {
     pub fn pending_from_me(&self, pane: &str) -> BTreeMap<String, Vec<u64>> {
         let mut pending: BTreeMap<String, Vec<u64>> = BTreeMap::new();
         for stored in self.messages.values() {
-            if stored.acked || stored.message.sender != pane {
+            if stored.acked || stored.seen || stored.message.sender != pane {
                 continue;
             }
             pending
@@ -340,7 +340,7 @@ impl BrokerState {
                 target_pane: pane,
                 delivered: false,
                 acked: false,
-                read: false,
+                seen: false,
                 delivered_at: None,
                 last_nag_at: None,
             },
@@ -374,7 +374,7 @@ impl BrokerState {
     pub fn messages_for_target(&self, pane: &str) -> Vec<Message> {
         self.messages
             .values()
-            .filter(|stored| stored.target_pane == pane && !stored.acked)
+            .filter(|stored| stored.target_pane == pane && !stored.acked && !stored.seen)
             .map(|stored| stored.message.clone())
             .collect()
     }
