@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, tick } from "svelte";
-  import { fetchAgents, type Agent } from "./api";
+  import { agentsFetchReason, fetchAgents, type Agent } from "./api";
   import { currentRoute, navigate, onPopstate, type Route } from "./router";
   import AgentLetterComposer from "./AgentLetterComposer.svelte";
   import LettersPanel from "./LettersPanel.svelte";
@@ -20,6 +20,7 @@
   let agents = $state<Agent[]>([]);
   let registryPhase = $state<"loading" | "error" | "ready">("loading");
   let message = $state("");
+  let registryReason = $state("");
   // URL が唯一の画面情報源 (DESIGN.md §2)。view を別 state に持たない。
   let route = $state<Route>(currentRoute());
   let menuOpen = $state(false);
@@ -139,14 +140,16 @@
       if (current !== registryGeneration) return;
       agents = found;
       registryPhase = "ready";
+      registryReason = "";
       message =
         found.length === 0
           ? "登録中の agent はありません"
           : `${found.length} agent`;
-    } catch {
+    } catch (error) {
       if (current !== registryGeneration) return;
       // poll 失敗は表示中の内容を消さない (DESIGN.md §9)。
       if (registryPhase !== "ready") registryPhase = "error";
+      registryReason = agentsFetchReason(error);
       message = "agent registry を取得できませんでした";
     }
   }
@@ -390,7 +393,7 @@
         <span class="error-mark" aria-hidden="true">!</span>
         <div>
           <strong>一覧を読み込めません</strong>
-          <p>daemon の状態を確認して、もう一度お試しください。</p>
+          <p>{registryReason}</p>
         </div>
         <button type="button" onclick={() => refresh(true)}>再試行</button>
       </div>
@@ -496,7 +499,7 @@
             <span class="error-mark" aria-hidden="true">!</span>
             <div>
               <strong>一覧を読み込めません</strong>
-              <p>daemon の状態を確認して、もう一度お試しください。</p>
+              <p>{registryReason}</p>
             </div>
             <button type="button" onclick={() => refresh(true)}>再試行</button>
           </div>

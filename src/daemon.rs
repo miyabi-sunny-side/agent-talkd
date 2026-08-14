@@ -595,11 +595,14 @@ async fn request_web_agents(tx: &mpsc::Sender<Event>) -> HttpResponse<Full<Bytes
         .await
         .is_err()
     {
-        return json_error(StatusCode::SERVICE_UNAVAILABLE, "broker_unavailable");
+        return json_error(StatusCode::SERVICE_UNAVAILABLE, "broker_unavailable")
+            .with_header(CACHE_CONTROL, "no-store");
     }
     match receive.await {
-        Ok(Ok(agents)) => json_response(StatusCode::OK, &serde_json::json!({ "agents": agents })),
-        _ => json_error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable"),
+        Ok(Ok(agents)) => json_response(StatusCode::OK, &serde_json::json!({ "agents": agents }))
+            .with_header(CACHE_CONTROL, "no-store"),
+        _ => json_error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable")
+            .with_header(CACHE_CONTROL, "no-store"),
     }
 }
 
@@ -2756,14 +2759,17 @@ fn init_logging(path: &Path, configured_level: &str) -> Result<()> {
 mod tests {
     use std::{collections::BTreeMap, path::PathBuf};
 
-    use hyper::{Method, StatusCode};
+    use hyper::{
+        Method, StatusCode,
+        header::{CACHE_CONTROL, CONTENT_TYPE},
+    };
     use tempfile::TempDir;
 
     use super::{
-        Broker, HttpRoute, Journal, MAX_BODY_BYTES, MailboxPageError, Request, SendIntent,
-        SendOptions, WebAgent, adopt_legacy_journal, capture_failure, classify_http,
+        Broker, Event, HttpEvent, HttpRoute, Journal, MAX_BODY_BYTES, MailboxPageError, Request,
+        SendIntent, SendOptions, WebAgent, adopt_legacy_journal, capture_failure, classify_http,
         decode_path_segment, installed_skills_for_runtime, parse_mailbox_page, parse_mailbox_query,
-        peer_uid_allowed, rfc3339, static_response,
+        peer_uid_allowed, request_web_agents, rfc3339, static_response,
     };
     use crate::{
         backend::Backend,
@@ -4976,6 +4982,48 @@ mod tests {
         for path in ["/api/mailbox/Bad", "/api/mailbox/bad%2Fname"] {
             assert_eq!(classify_http(&Method::GET, path), HttpRoute::NotFound);
         }
+    }
+
+    fn assert_who_http_headers(response: &hyper::Response<http_body_util::Full<bytes::Bytes>>) {
+        assert_eq!(
+            response
+                .headers()
+                .get(CACHE_CONTROL)
+                .map(hyper::header::HeaderValue::as_bytes),
+            Some(b"no-store".as_slice())
+        );
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .expect("who responses set Content-Type")
+            .to_str()
+            .expect("Content-Type is visible ASCII");
+        assert!(
+            content_type.starts_with("application/json"),
+            "{content_type}"
+        );
+    }
+
+    #[tokio::test]
+    async fn who_http_sets_no_store_json_on_200_and_broker_unavailable() {
+        let (closed_tx, closed_rx) = tokio::sync::mpsc::channel(1);
+        drop(closed_rx);
+        let unavailable = request_web_agents(&closed_tx).await;
+        assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_who_http_headers(&unavailable);
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let respond = async {
+            match rx.recv().await {
+                Some(Event::Http(HttpEvent::Who { reply })) => {
+                    let _ = reply.send(Ok(Vec::new()));
+                }
+                _ => panic!("expected HttpEvent::Who"),
+            }
+        };
+        let (ok, ()) = tokio::join!(request_web_agents(&tx), respond);
+        assert_eq!(ok.status(), StatusCode::OK);
+        assert_who_http_headers(&ok);
     }
 
     #[test]

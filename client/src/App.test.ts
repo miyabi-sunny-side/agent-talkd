@@ -289,12 +289,62 @@ it("offers retry after an error and supports the empty state", async () => {
     .mockResolvedValueOnce(new Response('{"agents":[]}', { status: 200 }));
   vi.stubGlobal("fetch", fetch);
   render(App);
+  expect(await screen.findByText("一覧を読み込めません")).toBeTruthy();
+  expect(screen.getByText("接続できません")).toBeTruthy();
+  expect(
+    screen.queryByText("daemon の状態を確認して、もう一度お試しください。"),
+  ).toBeNull();
   const retry = await screen.findByRole("button", { name: "再試行" });
   await fireEvent.click(retry);
   expect(
     await screen.findByText("静かな待合です。", { exact: false }),
   ).toBeTruthy();
   expect(fetch).toHaveBeenCalledTimes(2);
+});
+
+it("recovers from a first-load 503 on the next registry poll", async () => {
+  vi.useFakeTimers();
+  const agent = {
+    name: "codex",
+    state: "idle",
+    pane_id: "w1:p4",
+    session: "work",
+    location: "work:0.0",
+    cwd: "/tmp/work",
+    backend: "herdr",
+  };
+  const fetch = vi
+    .fn()
+    .mockResolvedValueOnce(
+      new Response(JSON.stringify({ error: "registry_unavailable" }), {
+        status: 503,
+        headers: { "Content-Type": "application/json" },
+      }),
+    )
+    .mockResolvedValue(
+      new Response(JSON.stringify({ agents: [agent] }), { status: 200 }),
+    );
+  vi.stubGlobal("fetch", fetch);
+  try {
+    render(App);
+    expect(await screen.findByText("一覧を読み込めません")).toBeTruthy();
+    expect(screen.getByText("HTTP 503")).toBeTruthy();
+    expect(screen.queryByText("registry_unavailable")).toBeNull();
+    expect(screen.queryByText("/api/who")).toBeNull();
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(await screen.findByText("codex")).toBeTruthy();
+    expect(screen.queryByText("一覧を読み込めません")).toBeNull();
+    expect(screen.queryByText("HTTP 503")).toBeNull();
+    const whoCalls = fetch.mock.calls.filter(
+      ([input]) => String(input) === "/api/who",
+    );
+    expect(whoCalls.length).toBeGreaterThanOrEqual(2);
+    for (const [, init] of whoCalls) {
+      expect((init as RequestInit | undefined)?.cache).toBe("no-store");
+    }
+  } finally {
+    vi.useRealTimers();
+  }
 });
 
 it("groups agents by session and hops between same-backend siblings only", async () => {

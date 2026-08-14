@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  AgentsFetchError,
   fetchAgents,
   fetchMailbox,
   fetchMailboxes,
@@ -39,6 +40,9 @@ describe("HTTP API", () => {
       screen: "safe text",
     });
     expect(fetch.mock.calls[1]?.[0]).toBe("/api/agents/w1%3Ap1/screen");
+    const [, whoInit] = fetch.mock.calls[0] as [string, RequestInit];
+    expect(fetch.mock.calls[0]?.[0]).toBe("/api/who");
+    expect(whoInit.cache).toBe("no-store");
   });
 
   it("builds incremental mailbox queries and validates event fields", async () => {
@@ -81,7 +85,70 @@ describe("HTTP API", () => {
 
   it("rejects unsuccessful, mismatched, and malformed responses", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(json({}, 503)));
-    await expect(fetchAgents()).rejects.toThrow("503");
+    const unavailable = await fetchAgents().catch((error: unknown) => error);
+    expect(unavailable).toBeInstanceOf(AgentsFetchError);
+    expect(unavailable).toMatchObject({ kind: "status", status: 503 });
+    expect(String(unavailable)).toContain("503");
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response("<!doctype html>", {
+          status: 200,
+          headers: { "Content-Type": "text/html" },
+        }),
+      ),
+    );
+    const html = await fetchAgents().catch((error: unknown) => error);
+    expect(html).toBeInstanceOf(AgentsFetchError);
+    expect(["content-type", "schema"]).toContain(
+      (html as AgentsFetchError).kind,
+    );
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        json({
+          agents: [
+            {
+              name: "codex",
+              state: "idle",
+              pane_id: "w1:p1",
+              session: "dev",
+              location: "dev:0.1",
+              cwd: "/tmp",
+            },
+          ],
+        }),
+      ),
+    );
+    await expect(fetchAgents()).rejects.toMatchObject({ kind: "schema" });
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        json({
+          agents: [
+            {
+              name: "codex",
+              state: "working",
+              pane_id: "w1:p1",
+              session: "dev",
+              location: "dev:0.1",
+              cwd: "/tmp",
+              backend: "herdr",
+            },
+          ],
+        }),
+      ),
+    );
+    await expect(fetchAgents()).rejects.toMatchObject({ kind: "schema" });
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockRejectedValue(new TypeError("Failed to fetch")),
+    );
+    await expect(fetchAgents()).rejects.toMatchObject({ kind: "network" });
 
     vi.stubGlobal(
       "fetch",

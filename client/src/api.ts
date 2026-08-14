@@ -46,6 +46,47 @@ export interface MailboxResponse {
   events: MailboxEvent[];
 }
 
+export type AgentsFetchKind = "status" | "content-type" | "schema" | "network";
+
+export class AgentsFetchError extends Error {
+  readonly kind: AgentsFetchKind;
+  readonly status?: number;
+
+  constructor(
+    kind: AgentsFetchKind,
+    options: { status?: number; cause?: unknown } = {},
+  ) {
+    super(agentsFetchReasonFrom(kind, options.status), {
+      cause: options.cause,
+    });
+    this.name = "AgentsFetchError";
+    this.kind = kind;
+    this.status = options.status;
+  }
+}
+
+export function agentsFetchReason(error: unknown): string {
+  return error instanceof AgentsFetchError
+    ? error.message
+    : agentsFetchReasonFrom("network");
+}
+
+function agentsFetchReasonFrom(kind: AgentsFetchKind, status?: number): string {
+  switch (kind) {
+    case "status":
+      return `HTTP ${status}`;
+    case "content-type":
+    case "schema":
+      return "応答形式が不正です";
+    case "network":
+      return "接続できません";
+  }
+}
+
+function isJsonContentType(value: string | null): boolean {
+  return (value ?? "").toLowerCase().includes("application/json");
+}
+
 async function getJson(path: string, signal?: AbortSignal): Promise<unknown> {
   const response = await fetch(path, {
     headers: { Accept: "application/json" },
@@ -56,9 +97,30 @@ async function getJson(path: string, signal?: AbortSignal): Promise<unknown> {
 }
 
 export async function fetchAgents(signal?: AbortSignal): Promise<Agent[]> {
-  const body = await getJson("/api/who", signal);
-  if (!isWhoResponse(body))
-    throw new Error("registry returned an invalid response");
+  let response: Response;
+  try {
+    response = await fetch("/api/who", {
+      headers: { Accept: "application/json" },
+      cache: "no-store",
+      signal,
+    });
+  } catch (cause) {
+    throw new AgentsFetchError("network", { cause });
+  }
+  if (!response.ok) {
+    throw new AgentsFetchError("status", { status: response.status });
+  }
+  const contentType = response.headers.get("content-type");
+  let body: unknown;
+  try {
+    body = await response.json();
+  } catch (cause) {
+    throw new AgentsFetchError(
+      isJsonContentType(contentType) ? "schema" : "content-type",
+      { cause },
+    );
+  }
+  if (!isWhoResponse(body)) throw new AgentsFetchError("schema");
   return body.agents;
 }
 
