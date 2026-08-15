@@ -138,25 +138,47 @@ pane idはherdrが発行する**opaqueな文字列**で、brokerは文法を定�
 採番規則の推測が実採番より狭くて配達とMCPが全停止した事故（65c83bbで拡張）の
 構造的な再発防止である。宛先文字列がregistryのpane idに**完全一致**すれば
 pane直指定として最優先で解決し、しなければ`scope/name`文法の名前として解釈
-する（bare名は近接解決。tmux併存期の正式名称`herdr/scope/name`は互換alias）。
+する（tmux併存期の正式名称`herdr/scope/name`は互換alias）。bare名は送信者と
+同じworkspace内（送信者自身を除く）だけを見て、候補が1件のときだけ解決する。
+同名候補が2件以上残ったら、同一タブの近接でも自動選択せず、候補のpane idを
+案内する曖昧エラーにする — 近接選択はもう一方の同名paneを黙って落として
+誤配する。pane id直指定なら重複名でも届き、送信者自身が重複名の一方なら
+self除外後の候補は1件なので他方へ一意配送される。
 
 paneの表示・解決上のsession名は、herdr自身が持つworkspace **label**
 （`workspace.list`）を使い、labelが無い・宛先構文と衝突する場合は
 workspace_idへfallbackする。workspace_idは互換aliasとして解決だけに残す。
 brokerはlabelをread-onlyで消費し、`workspace.rename`を呼ばない。
 
+agentの**name**（宛先・表示・journalのfrom/to）は、herdrのタブ**label**
+（`tab.list`）から導出する。宛先に使える純数字でないlabelがあればそれ、
+無ければruntime検出名（`pane.list`のagent列。claude / codex等）へfallback
+する — custom名の無いタブはherdrが番号文字列をlabelに入れるため、純数字
+labelは無名と同じ扱いにする。runtimeはnameとは別にidentityの一部として
+保持し、skill記法・installed skillの解決と、herdr検出との生存照合に使う。
+agentのidentityは（name, runtime）の組で、生存判定（返信先・pending・
+受領催促・未受領通知の宛先確認）は必ずこの組で比較する — nameだけの比較は、
+タブ名を保ったままruntimeが交代したpaneの新しい住人を旧identityと誤認する。
+tab labelのjoinはworkspace labelと同型の後付けjoinだが、取得失敗の扱いは
+逆で**fail-closed**: `tab.list`の失敗はpane列挙全体の失敗として伝播し、
+そのtickはsnapshotを適用しない。labelなしへ黙って劣化させると、タブ名で
+登録したagentがruntime名へ一時交代し、identity交代（takeover）として
+誤処理される。tab labelもread-onlyで消費し、`tab.rename`を呼ばない。
+
 herdrの成功snapshotをagentの存在・identity・稼働状態・pane位置の唯一の真実とします。
 daemonのメモリとjournalはmessage本文・未配達queue・受領状態だけを所有します。
 sendとmessage RPCの受信時に即時snapshotを読み、待機中はhealth tickごとに同期します。
-互換の`register` commandはherdrの検出と一致する名前だけを受理し（不一致・
-agent不在・snapshot取得不能は拒否）、daemon起動時はsnapshotの取得に成功する
+互換の`register` commandはpull同期と同じ規則で導出した名前（tab label由来、
+無ければruntime検出名）と一致するものだけを受理し（不一致・agent不在・
+snapshot取得不能は拒否）、daemon起動時はsnapshotの取得に成功する
 まで要求を受け付けません。
 herdrのpane一覧はagent列をnativeに持つため、hookを挟むよりdaemonが観測する
 ほうが正確で、登録hookを持たないagent（grok CLI等）もそのままpeerになれます。
 pull側の規則:
 
-- 同じpaneのagent名が変わったら旧登録を即座に外して引き継ぐ（native identityに
-  猶予は不要。旧登録の残骸は誤配先になる）。
+- 同じpaneのidentity（タブ名由来のname / runtime検出名）のどちらかが変わったら
+  旧登録を即座に外して引き継ぐ（native identityに猶予は不要。旧登録の残骸は
+  誤配先になる。タブのrenameもruntimeの交代も同じtakeover経路に乗る）。
 - 成功snapshotから消えたpaneは即evictし、未受領を回収する。API取得失敗は
   成功snapshot上の欠落ではないため、登録もmessageも変更せず次回へ持ち越す。
 - snapshot取得に失敗した間は判定を進めない（不完全な証拠で消さない）。
@@ -228,6 +250,11 @@ journal（tmux socket名で命名）がちょうど1つ残っていて新名の 
   なる。checkpointが成功したときだけカウンタを0にする。
 - checkpoint後もメッセージIDのhigh-water markを保持し、IDを再利用しない。
 - pane IDが再利用されても、起動時と各tickでherdrのnative identityを照合して誤配しない。
+- `Register` recordは`{pane, name, runtime, state}`で、messageも送信時点の
+  sender/target双方のruntimeを持つ。journal replay（restart）後もidentityの
+  （name, runtime）の組を失わない。runtimeフィールドの無い旧recordは、name=
+  runtime検出名だった時代の記録としてruntime=nameで読む（旧daemonは未知
+  フィールドを黙って無視するため読み出し互換も保たれる）。
 - 本文は1MiBを上限とし、journalの無制限な単発肥大を防ぐ。
 
 単一イベントループにCLI要求とhealth tickを合流させることで、busy判定と
@@ -371,9 +398,10 @@ legacyの`send` / `send-v2`は従来どおり未登録paneからも受理しま�
 ### `read_message`が返すidentityは送信時点で捕捉したもの
 
 `from`は送信時点で捕捉した送信者名（`Message::sender_name`）で、読み出し時にregistryを
-引き直しません。`reply_to`は、捕捉時と同じ名前のagentがその paneに今も登録されている
-場合だけpane IDを返し、それ以外は`null`です。送信者の退出・改名と、pane IDが別のagentへ
-再利用された場合が`null`に当たります。
+引き直しません。`reply_to`は、捕捉時と同じidentity（nameとruntimeの両方）のagentが
+その paneに今も登録されている場合だけpane IDを返し、それ以外は`null`です。送信者の
+退出・改名と、pane IDが別のagentへ再利用された場合に加え、タブ名を保ったまま
+runtimeだけが交代した場合も`null`に当たります。
 
 `from`を現在のregistryから引き直すと、pane再利用後に別人の名前で本文が提示されます。
 逆に`reply_to`を捕捉したpane IDのまま返すと、そのpaneの新しい住人へ返信を誤配します。
@@ -444,8 +472,9 @@ allowlistから外したmailboxのeventは削除せず閲覧だけ拒否しま�
 されなかった `direction=out` event が履歴に残る場合がありますが、pane配達は取り消されます。
 
 スキル名は小文字ASCII英数字と `:`、`_`、`-` に限定し、64 bytesを上限とします。
-agentごとの記法は自由文字列ではなく `slash` または `dollar` として設定し、daemonが
-固定prefixを生成します。オプション付き送信は内部 `send-v2` protocolを使用するため、
+記法は宛先名（タブ名）ではなくruntime検出名ごとに、自由文字列ではなく
+`slash` または `dollar` として設定し、daemonが固定prefixを生成します
+（タブ名`fable`のclaudeにも `/skill` 形で届きます）。オプション付き送信は内部 `send-v2` protocolを使用するため、
 未対応の旧daemonでは通常送信へ降格せず `unknown command` で失敗します。
 
 ## 既知の境界

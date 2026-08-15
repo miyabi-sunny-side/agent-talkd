@@ -16,6 +16,12 @@ pub enum Record {
     Register {
         pane: String,
         name: String,
+        /// herdr の runtime 検出名。tab label が name になったとき、skill 記法の
+        /// 解決に使う runtime を保つ。旧形式 journal (field 無し) は
+        /// runtime = name として読む。旧 daemon は未知フィールドを黙って
+        /// 無視するため読み出し互換も保たれる。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        runtime: Option<String>,
         state: AgentState,
     },
     Remove {
@@ -217,6 +223,7 @@ impl Journal {
                 &Record::Register {
                     pane: pane.clone(),
                     name: agent.name.clone(),
+                    runtime: Some(agent.runtime.clone()),
                     // 旧 daemon が checkpoint を読めるよう field は残す。
                     // live state の正は herdr であり、この値は復元に使わない。
                     state: AgentState::Idle,
@@ -315,10 +322,13 @@ fn replay(state: &mut BrokerState, record: Record) {
         Record::Register {
             pane,
             name,
+            runtime,
             state: agent_state,
         } => {
             state.remove(&pane);
-            state.restore_agent(pane, name, agent_state);
+            // 旧形式 (runtime 無し) は name = runtime 検出名の時代なので同一視する。
+            let runtime = runtime.unwrap_or_else(|| name.clone());
+            state.restore_agent(pane, name, runtime, agent_state);
         }
         Record::Remove { pane } => state.remove(&pane),
         // 旧 journal の hook 由来 state は読み込み互換のため parse するが、
@@ -376,9 +386,11 @@ mod tests {
             id,
             sender: "%2".into(),
             sender_name: Some("codex".into()),
+            sender_runtime: None,
             brief: brief.into(),
             bell: format!("read {id}"),
             target_name: "claude".into(),
+            target_runtime: None,
         }
     }
 
@@ -386,7 +398,7 @@ mod tests {
         let dispatch = state
             .dispatch(
                 pane,
-                Origin::new("%2", "codex"),
+                Origin::new("%2", "codex", "codex"),
                 body.into(),
                 "claude",
                 |id| format!("read {id}"),
@@ -411,6 +423,7 @@ mod tests {
                 .append(&Record::Register {
                     pane: "%1".into(),
                     name: "claude".into(),
+                    runtime: None,
                     state: AgentState::Busy,
                 })
                 .unwrap();
@@ -435,6 +448,59 @@ mod tests {
         assert!(state.message(7).unwrap().delivered);
     }
 
+    /// 旧形式 journal (runtime フィールド無しの Register) は runtime = name と
+    /// して読める。tab 名導入前の journal は name が runtime 検出名そのもの。
+    #[test]
+    fn a_legacy_register_without_runtime_replays_runtime_as_name() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("queue.journal");
+        fs::write(
+            &path,
+            "{\"type\":\"register\",\"pane\":\"%1\",\"name\":\"claude\",\"state\":\"idle\"}\n",
+        )
+        .unwrap();
+        let (_, state) = Journal::open(path).unwrap();
+        assert_eq!(state.agents["%1"].name, "claude");
+        assert_eq!(state.agents["%1"].runtime, "claude");
+    }
+
+    /// 新形式の Register は runtime を保ち、checkpoint 後も失わない。
+    #[test]
+    fn a_register_with_runtime_survives_replay_and_checkpoint() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("queue.journal");
+        {
+            let (mut journal, _) = Journal::open(path.clone()).unwrap();
+            journal
+                .append(&Record::Register {
+                    pane: "%1".into(),
+                    name: "fable".into(),
+                    runtime: Some("claude".into()),
+                    state: AgentState::Idle,
+                })
+                .unwrap();
+        }
+        let (mut journal, mut state) = Journal::open(path.clone()).unwrap();
+        assert_eq!(state.agents["%1"].name, "fable");
+        assert_eq!(state.agents["%1"].runtime, "claude");
+        for _ in 0..256 {
+            journal
+                .append(&Record::State {
+                    pane: "%1".into(),
+                    state: AgentState::Busy,
+                })
+                .unwrap();
+        }
+        journal.checkpoint_if_needed(&mut state).unwrap();
+        drop(journal);
+        let (_, replayed) = Journal::open(path).unwrap();
+        assert_eq!(replayed.agents["%1"].name, "fable");
+        assert_eq!(
+            replayed.agents["%1"].runtime, "claude",
+            "checkpoint の再書き出しでも runtime を失わない"
+        );
+    }
+
     #[test]
     fn migrates_legacy_markdown_payload() {
         let dir = tempdir().unwrap();
@@ -447,6 +513,7 @@ mod tests {
                 .append(&Record::Register {
                     pane: "%1".into(),
                     name: "claude".into(),
+                    runtime: None,
                     state: AgentState::Busy,
                 })
                 .unwrap();
@@ -496,6 +563,7 @@ mod tests {
             .append(&Record::Register {
                 pane: "%1".into(),
                 name: "claude".into(),
+                runtime: None,
                 state: AgentState::Busy,
             })
             .unwrap();
@@ -553,6 +621,7 @@ mod tests {
             .append(&Record::Register {
                 pane: "%1".into(),
                 name: "claude".into(),
+                runtime: None,
                 state: AgentState::Busy,
             })
             .unwrap();
@@ -560,6 +629,7 @@ mod tests {
             .append(&Record::Register {
                 pane: "%2".into(),
                 name: "codex".into(),
+                runtime: None,
                 state: AgentState::Idle,
             })
             .unwrap();
@@ -594,7 +664,7 @@ mod tests {
         let Dispatch::Deliver(failure_id) = state
             .dispatch(
                 "%2",
-                Origin::new("system", "system"),
+                Origin::new("system", "system", "system"),
                 "failure notification".into(),
                 "codex",
                 |id| format!("read {id}"),

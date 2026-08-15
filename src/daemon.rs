@@ -30,14 +30,15 @@ use tokio::{
 use tracing::{debug, error, info, warn};
 
 use crate::{
-    backend::{Backend, PaneInfo},
+    backend::{Backend, PaneInfo, usable_agent_name},
     config::{Config, is_safe_token},
     help,
     herdr::{AgentStatus, Herdr},
     journal::{Journal, Record},
     protocol::{Request, Response, SendOptions},
     state::{
-        AgentState, BrokerState, Dispatch, ExternalMailboxEvent, MailboxDirection, Message, Origin,
+        Agent, AgentState, BrokerState, Dispatch, ExternalMailboxEvent, Identity, MailboxDirection,
+        Message, Origin,
     },
 };
 
@@ -863,16 +864,6 @@ fn hex_value(byte: u8) -> Option<u8> {
     }
 }
 
-/// `register` command と同じ文字種で agent 名を検証する。herdr の native 名や
-/// `@agent` mirror をそのまま登録すると、CLI では拒否される `bad/name` 等が
-/// pull/startup 経由でだけ登録され、宛先文法 (`scope/name`) が壊れる。
-fn usable_agent_name(name: &str) -> bool {
-    !name.is_empty()
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-}
-
 fn parse_mailbox_query(
     query: Option<&str>,
 ) -> std::result::Result<(Option<u64>, usize), &'static str> {
@@ -1137,11 +1128,13 @@ impl Broker {
         let Some(agent) = self.state.agents.get(pane) else {
             return Err(WebError::new(StatusCode::NOT_FOUND, "agent_not_found"));
         };
-        if !self.config.skill_syntax.contains_key(&agent.name) {
+        // skill 記法・installed の走査はどちらも runtime 検出名で引く
+        // (tab 名は宛先であって runtime ではない)。
+        if !self.config.skill_syntax.contains_key(&agent.runtime) {
             return Ok(Vec::new());
         }
         let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
-        let mut skills = installed_skills_for_runtime(&home, &agent.name);
+        let mut skills = installed_skills_for_runtime(&home, &agent.runtime);
         if let Some(allowed) = &self.config.allowed_skills {
             skills.retain(|skill| allowed.contains(skill));
         }
@@ -1298,9 +1291,10 @@ impl Broker {
     }
 
     /// 登録の正は herdr の native identity (pull 同期)。`register` は互換 command
-    /// として残すが、**herdr の検出と一致する名前しか受理しない** — 一致しない
-    /// 登録を許すと、次の tick で pull が是正するまでの間、実際の占有者と違う
-    /// 名前が宛先として解決・配達されてしまう。
+    /// として残すが、**pull 同期と同じ規則で導出した名前 (tab label 由来、無ければ
+    /// runtime 検出名) しか受理しない** — 一致しない登録を許すと、次の tick で
+    /// pull が是正するまでの間、実際の占有者と違う名前が宛先として解決・
+    /// 配達されてしまう。
     async fn register(&mut self, request: Request) -> Result<Response> {
         let Some(pane) = request.pane else {
             return Ok(Response::ok(""));
@@ -1315,30 +1309,30 @@ impl Broker {
         }
         // snapshot が取れない間は受理も拒否もできない (fail closed)。
         let panes = self.backend.panes().await?;
-        let native = panes
+        let identity = panes
             .iter()
             .find(|candidate| candidate.pane_id == pane)
-            .and_then(|candidate| candidate.agent.as_deref());
-        if native != Some(name.as_str()) {
+            .and_then(|candidate| candidate.name.as_deref().zip(candidate.agent.as_deref()));
+        let Some((derived, runtime)) = identity.filter(|(derived, _)| derived == name) else {
             return Ok(Response::error(format!(
-                "pane {pane} の herdr 検出 ({}) と一致しないため登録できません",
-                native.unwrap_or("agent なし")
+                "pane {pane} の識別名 ({}) と一致しないため登録できません",
+                identity.map_or("agent なし", |(derived, _)| derived)
             )));
-        }
+        };
         match self.state.agents.get(&pane) {
-            Some(agent) if agent.name == *name => {}
+            Some(agent) if agent.name == derived && agent.runtime == runtime => {}
             Some(_) => {
                 // 交代: pull 同期の takeover と同じ経路 (回収が durable になってから登録)。
                 if !self
                     .remove_agent(&pane, "宛先エージェントが入れ替わった")
                     .await
-                    || !self.register_observed(&pane, name, "register")
+                    || !self.register_observed(&pane, derived, runtime, "register")
                 {
                     return Ok(Response::error("登録を永続化できないため中止しました"));
                 }
             }
             None => {
-                if !self.register_observed(&pane, name, "register") {
+                if !self.register_observed(&pane, derived, runtime, "register") {
                     return Ok(Response::error("登録を永続化できないため中止しました"));
                 }
             }
@@ -1429,7 +1423,13 @@ impl Broker {
     /// 観測に基づく登録の共通経路 (herdr snapshot / 起動時 mirror)。
     ///
     /// journal が durable になった時だけ memory を更新して true を返す。
-    fn register_observed(&mut self, pane: &str, name: &str, source: &'static str) -> bool {
+    fn register_observed(
+        &mut self,
+        pane: &str,
+        name: &str,
+        runtime: &str,
+        source: &'static str,
+    ) -> bool {
         if !usable_agent_name(name) {
             warn!(%pane, %name, source, "observed agent name is not addressable; skipped");
             return false;
@@ -1439,15 +1439,20 @@ impl Broker {
             .append(&Record::Register {
                 pane: pane.to_owned(),
                 name: name.to_owned(),
+                runtime: Some(runtime.to_owned()),
                 state: AgentState::Idle,
             })
             .is_err()
         {
             return false;
         }
-        self.state
-            .restore_agent(pane.to_owned(), name.to_owned(), AgentState::Idle);
-        info!(%pane, %name, source, "registered");
+        self.state.restore_agent(
+            pane.to_owned(),
+            name.to_owned(),
+            runtime.to_owned(),
+            AgentState::Idle,
+        );
+        info!(%pane, %name, %runtime, source, "registered");
         true
     }
 
@@ -1472,22 +1477,29 @@ impl Broker {
     }
 
     async fn apply_herdr_snapshot(&mut self, panes: Vec<PaneInfo>) {
-        // 宛先文法に載らない名前は identity 無しとして扱う。
-        let detected: std::collections::HashMap<String, Option<String>> = panes
+        // identity は (name, runtime)。name は tab label 由来 (無ければ runtime
+        // 検出名) で、宛先文法に載らない名前は identity 無しとして扱う。
+        let detected: std::collections::HashMap<String, Option<(String, String)>> = panes
             .into_iter()
             .map(|pane| {
-                let agent = pane.agent.filter(|name| usable_agent_name(name));
-                (pane.pane_id, agent)
+                let identity = pane
+                    .name
+                    .filter(|name| usable_agent_name(name))
+                    .zip(pane.agent);
+                (pane.pane_id, identity)
             })
             .collect();
         // 出現・確認・交代。
         for (pane_id, identity) in &detected {
-            let Some(name) = identity else { continue };
+            let Some((name, runtime)) = identity else {
+                continue;
+            };
             match self.state.agents.get(pane_id) {
                 None => {
-                    self.register_observed(pane_id, name, "herdr-pull");
+                    self.register_observed(pane_id, name, runtime, "herdr-pull");
                 }
-                Some(agent) if agent.name == *name => {}
+                // tab rename も runtime 交代も takeover 経路に乗せる。
+                Some(agent) if agent.name == *name && agent.runtime == *runtime => {}
                 Some(_) => {
                     // 交代: 旧登録の回収が durable になった後にだけ新 identity を登録。
                     // Register の append に失敗しても旧登録は既に消えており、
@@ -1496,7 +1508,7 @@ impl Broker {
                         .remove_agent(pane_id, "宛先エージェントが入れ替わった")
                         .await
                     {
-                        self.register_observed(pane_id, name, "herdr-pull");
+                        self.register_observed(pane_id, name, runtime, "herdr-pull");
                     }
                 }
             }
@@ -1592,7 +1604,7 @@ impl Broker {
             self.state
                 .agents
                 .get(pane)
-                .map(|agent| (pane.to_owned(), agent.name.clone()))
+                .map(|agent| (pane.to_owned(), agent.name.clone(), agent.runtime.clone()))
         });
         let intent = match SendIntent::classify(
             request.send_options.unwrap_or_default(),
@@ -1643,9 +1655,16 @@ impl Broker {
             Err(response) => return Ok(response),
         };
         let skill_prefix = if let Some(skill) = intent.skill() {
-            let Some(syntax) = self.config.skill_syntax.get(&expected) else {
+            // skill 記法は宛先名 (tab 名) ではなく runtime 検出名で引く。
+            // tab 名 fable の claude にも /skill が届くように。
+            let runtime = self
+                .state
+                .agents
+                .get(&pane)
+                .map_or_else(|| expected.clone(), |agent| agent.runtime.clone());
+            let Some(syntax) = self.config.skill_syntax.get(&runtime) else {
                 return Ok(Response::error(format!(
-                    "agent '{expected}' のskill記法が AGENT_TALK_SKILL_SYNTAX にありません"
+                    "agent '{expected}' (runtime '{runtime}') のskill記法が AGENT_TALK_SKILL_SYNTAX にありません"
                 )));
             };
             format!("{}{skill} ", syntax.prefix())
@@ -1686,7 +1705,7 @@ impl Broker {
             .and_then(|id| panes.iter().find(|p| p.pane_id == id));
         let from_agent = registered_sender
             .as_ref()
-            .map(|(_, name)| name.clone())
+            .map(|(_, name, _)| name.clone())
             .or_else(|| intent.source().map(str::to_owned))
             .unwrap_or_else(|| "human".into());
         let reply_info = registered_sender.as_ref().and(from_info);
@@ -1699,9 +1718,10 @@ impl Broker {
         };
         let brief = build_brief(addr, &from_agent, from_info, reply_info, &body, brief_mode);
         // 送信時点の identity を捕捉する。後からレジストリを引き直さない。
+        // pane 由来でない送信者 (`human` / 外部 source) は name を runtime として扱う。
         let origin = registered_sender.map_or_else(
-            || Origin::new("human", from_agent.clone()),
-            |(pane, name)| Origin::new(pane, name),
+            || Origin::new("human", from_agent.clone(), from_agent.clone()),
+            |(pane, name, runtime)| Origin::new(pane, name, runtime),
         );
         let dispatch = self.state.dispatch(
             &pane,
@@ -1851,8 +1871,10 @@ impl Broker {
         let Some(stored) = self.state.message(id).filter(|stored| !stored.acked) else {
             return MessageAccess::NotFound;
         };
-        let current_name = self.state.agents.get(pane).map(|agent| agent.name.as_str());
-        if stored.target_pane != pane || current_name != Some(stored.message.target_name.as_str()) {
+        // 生存判定は (name, runtime) の組。タブ名を保ったまま runtime だけ
+        // 交代した pane の新しい住人に旧宛の本文を見せない。
+        let current = self.state.agents.get(pane).map(Agent::identity);
+        if stored.target_pane != pane || current != Some(stored.message.target_identity()) {
             return MessageAccess::NotMine;
         }
         MessageAccess::Pending
@@ -2216,16 +2238,11 @@ impl Broker {
         } else if let Some(self_pane) = self_pane
             && let Some(origin) = panes.iter().find(|pane| pane.pane_id == self_pane)
         {
-            let same_window: Vec<_> = candidates
-                .iter()
-                .copied()
-                .filter(|(pane, _)| pane.window_id == origin.window_id)
-                .collect();
-            if same_window.is_empty() {
-                candidates.retain(|(pane, _)| pane.session == origin.session);
-            } else {
-                candidates = same_window;
-            }
+            // bare 名は自分の workspace 内 (self 除外後) だけを見る。同名候補が
+            // 2件以上残ったら同一タブの近接でも自動選択せず、下の曖昧エラーで
+            // 候補の pane id を案内する — 近接選択は、もう一方の同名 pane を
+            // 黙って落として誤配する。
+            candidates.retain(|(pane, _)| pane.session == origin.session);
         }
         match candidates.as_slice() {
             [(pane, agent)] => Ok((pane.pane_id.clone(), agent.name.clone())),
@@ -2241,7 +2258,7 @@ impl Broker {
             }
             _ => {
                 let mut stderr = format!(
-                    "agent-talk: 宛先 '{addr}' の候補が複数あります。<scope>/<name> で指定してください:\n"
+                    "agent-talk: 宛先 '{addr}' の候補が複数あります。<scope>/<name> か pane id の直指定 (括弧内) で指定してください:\n"
                 );
                 for (pane, agent) in candidates {
                     stderr.push_str(&pretty(agent.name.as_str(), pane));
@@ -2309,16 +2326,17 @@ impl Broker {
                 .state
                 .agents
                 .get(&sender)
-                .map(|agent| agent.name.clone())
-                .filter(|expected| {
-                    // 生存判定は native identity の一致まで要求する
+                .filter(|agent| {
+                    // 生存判定は native identity (name, runtime) の一致まで要求する
                     // (`pane_backs_registration`) — 占有者が入れ替わった pane へ
                     // 旧名宛て通知を送らない。
                     Some(sender.as_str()) != excluded_pane
                         && panes.iter().any(|pane| {
-                            pane.pane_id == sender && pane_backs_registration(pane, expected)
+                            pane.pane_id == sender
+                                && pane_backs_registration(pane, agent.identity())
                         })
-                });
+                })
+                .map(|agent| agent.name.clone());
             let Some(expected) = sender_target else {
                 // 通知先が居ない場合も、残った `Pending` を terminal `Acked` にする。
                 for original in &originals {
@@ -2362,7 +2380,7 @@ impl Broker {
             }
             let dispatch = self.state.dispatch(
                 &sender,
-                Origin::new("system", "system"),
+                Origin::new("system", "system", "system"),
                 failure_brief,
                 &expected,
                 |id| {
@@ -2429,12 +2447,12 @@ impl Broker {
             let Some(agent) = self.state.agents.get(&stored.target_pane) else {
                 continue;
             };
-            if agent.name != stored.message.target_name {
+            if agent.identity() != stored.message.target_identity() {
                 continue;
             }
             if !panes.iter().any(|pane| {
                 pane.pane_id == stored.target_pane
-                    && pane_backs_registration(pane, &stored.message.target_name)
+                    && pane_backs_registration(pane, stored.message.target_identity())
                     && pane.status.accepts_reminder()
             }) {
                 continue;
@@ -2663,11 +2681,14 @@ enum BriefMode {
 
 /// pane がその登録の生存根拠になるか。
 ///
-/// `PaneInfo.agent` は herdr が返す **native identity** で、pane ID は
-/// 位置依存のため占有者が入れ替わりうる。identity の一致まで要求しないと、
-/// 旧名宛ての通知を新しい占有者へ送り続けることになる。
-fn pane_backs_registration(pane: &PaneInfo, registered_name: &str) -> bool {
-    pane.agent.as_deref() == Some(registered_name)
+/// `PaneInfo.name` は herdr の native 検出 (tab label 由来、無ければ runtime
+/// 検出名) から導出した identity で、pane ID は位置依存のため占有者が
+/// 入れ替わりうる。identity は (name, runtime) の組で一致まで要求する —
+/// name だけでは、タブ名を保ったまま runtime が交代した新しい占有者へ
+/// 旧名宛ての通知を送り続けることになる。
+fn pane_backs_registration(pane: &PaneInfo, registered: Identity<'_>) -> bool {
+    pane.name.as_deref() == Some(registered.name)
+        && pane.agent.as_deref() == Some(registered.runtime)
 }
 
 /// 先受け版号時代の旧 wire 名を canonical 名へ正規化する互換 alias。
@@ -2786,9 +2807,19 @@ mod tests {
             workspace_id: workspace.into(),
             workspace_label: Some("test".into()),
             tab_id: format!("{workspace}:t1"),
+            tab_label: None,
             cwd: "/tmp".into(),
             agent: agent.map(str::to_owned),
             status: AgentStatus::Idle,
+        }
+    }
+
+    /// tab label 付きの pane。tab ごとの識別を検証するために `tab_id` も指定する。
+    fn tabbed_pane(pane_id: &str, agent: &str, tab_id: &str, label: Option<&str>) -> HerdrPane {
+        HerdrPane {
+            tab_id: tab_id.into(),
+            tab_label: label.map(str::to_owned),
+            ..pane_info(pane_id, Some(agent))
         }
     }
 
@@ -4083,14 +4114,14 @@ mod tests {
             .unwrap_err();
         assert!(error.stderr.contains("不明"), "{}", error.stderr);
 
-        // bare 名は同 window → 同 session の近接で解決する。
+        // bare 名は同一 workspace 内で一意なら解決する。
         let resolved = broker.resolve("claude", Some("w1:p1")).await.unwrap();
         assert_eq!(resolved.0, "w1:p2");
         // scope 外の bare 名は不在エラー (暗黙に workspace を跨がない)。
         let error = broker.resolve("codex", Some("w2:p1")).await.unwrap_err();
         assert!(error.stderr.contains("見つかりません"), "{}", error.stderr);
 
-        // 同 window に候補が複数並ぶ bare 名は曖昧エラーで scope 指定を案内する。
+        // 同一 workspace に候補が複数並ぶ bare 名は曖昧エラーで指定方法を案内する。
         set_herdr_panes(
             &broker,
             vec![
@@ -4404,6 +4435,381 @@ mod tests {
             !broker.state.agents.contains_key("w1:p7"),
             "宛先文法に載らない native 名は登録しない (CLI の register と同じ検証)"
         );
+    }
+
+    /// 受け入れ T1: 同一 workspace・同一 runtime (claude) の 2 pane が tab 名
+    /// (fable / opus) で別 identity として登録され、bare 名・`<workspace>/<タブ名>`・
+    /// pane id 直指定のどの宛先でも正しい pane へ届く。純数字 label は custom 名
+    /// なしとして runtime 名へ fallback する。
+    #[tokio::test]
+    async fn tab_labels_identify_same_runtime_panes_and_resolve_everywhere() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut broker = broker(
+            &dir,
+            vec![
+                tabbed_pane("w1:p1", "claude", "w1:t1", Some("fable")),
+                tabbed_pane("w1:p2", "claude", "w1:t2", Some("opus")),
+                tabbed_pane("w1:p3", "claude", "w1:t3", Some("4")),
+                tabbed_pane("w1:p4", "codex", "w1:t4", None),
+            ],
+        );
+        broker.sync_herdr_registry().await;
+        assert_eq!(broker.state.agents["w1:p1"].name, "fable");
+        assert_eq!(broker.state.agents["w1:p1"].runtime, "claude");
+        assert_eq!(broker.state.agents["w1:p2"].name, "opus");
+        assert_eq!(broker.state.agents["w1:p2"].runtime, "claude");
+        assert_eq!(
+            broker.state.agents["w1:p3"].name, "claude",
+            "純数字 label は custom 名なしなので runtime 名で登録する"
+        );
+        assert_eq!(
+            broker.state.agents["w1:p4"].name, "codex",
+            "tab label の無い pane は従来どおり runtime 名"
+        );
+
+        // peers_json の name も tab 名になる。
+        let peers = json(
+            &broker
+                .handle(request("list-peers", Some("w1:p4"), &[]))
+                .await,
+        );
+        let names: Vec<&str> = peers["peers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|peer| peer["name"].as_str())
+            .collect();
+        assert!(
+            names.contains(&"fable") && names.contains(&"opus"),
+            "{names:?}"
+        );
+
+        // bare 名は同一 runtime の同居があっても tab 名で一意に解決する。
+        let sent = json(&broker.handle(send_request("w1:p4", "fable", "hi")).await);
+        assert_eq!(sent["to"], "w1:p1", "{sent}");
+        assert_eq!(sent["name"], "fable");
+        // `<workspace>/<タブ名>` (workspace label は "test")。
+        let sent = json(
+            &broker
+                .handle(send_request("w1:p4", "test/opus", "hi"))
+                .await,
+        );
+        assert_eq!(sent["to"], "w1:p2", "{sent}");
+        assert_eq!(sent["name"], "opus");
+        // pane id 直指定。
+        let sent = json(&broker.handle(send_request("w1:p4", "w1:p3", "hi")).await);
+        assert_eq!(sent["name"], "claude", "{sent}");
+    }
+
+    /// 受け入れ T2: 同一 workspace で tab 名が重複したら bare / scoped とも
+    /// 自動近接選択せず曖昧エラーにし、候補の pane id を案内する。pane id
+    /// 直指定なら届く。tab.list 相当の取得に失敗した tick は snapshot を
+    /// 適用せず、既存の identity を保つ。
+    #[tokio::test]
+    async fn duplicate_tab_names_error_with_pane_ids_and_failed_snapshots_freeze() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut broker = broker(
+            &dir,
+            vec![
+                tabbed_pane("w1:p1", "claude", "w1:t1", Some("fable")),
+                tabbed_pane("w1:p2", "claude", "w1:t2", Some("fable")),
+                tabbed_pane("w1:p3", "codex", "w1:t3", None),
+            ],
+        );
+        broker.sync_herdr_registry().await;
+
+        for addr in ["fable", "test/fable"] {
+            let error = broker.resolve(addr, Some("w1:p3")).await.unwrap_err();
+            assert!(
+                error.stderr.contains("候補が複数"),
+                "{addr}: {}",
+                error.stderr
+            );
+            assert!(error.stderr.contains("pane id"), "{addr}: {}", error.stderr);
+            assert!(
+                error.stderr.contains("w1:p1") && error.stderr.contains("w1:p2"),
+                "{addr}: 候補の pane id を案内する: {}",
+                error.stderr
+            );
+        }
+
+        // pane id 直指定は曖昧にならず配送できる。
+        let sent = json(
+            &broker
+                .handle(send_request("w1:p3", "w1:p2", "direct"))
+                .await,
+        );
+        assert_eq!(sent["to"], "w1:p2", "{sent}");
+        assert_eq!(sent["name"], "fable");
+
+        // 取得失敗 tick は snapshot を適用しない (登録の追加・交代・回収なし)。
+        *broker.backend.herdr().scripted_fail.lock().unwrap() = true;
+        set_herdr_panes(&broker, vec![]);
+        broker.sync_herdr_registry().await;
+        assert_eq!(broker.state.agents.len(), 3, "既存 identity を保つ");
+        assert_eq!(broker.state.agents["w1:p1"].name, "fable");
+        assert_eq!(broker.state.agents["w1:p2"].name, "fable");
+    }
+
+    /// 受け入れ T3: 宛先名が tab 名になっても runtime 結合は保たれる —
+    /// skill 記法は runtime (claude) 側で解決されて送信拒否にならず、手動
+    /// register は導出名 (tab 名) だけを受理し、journal の Register は
+    /// {name, runtime} で書かれる。
+    #[tokio::test]
+    async fn tab_named_agents_keep_their_runtime_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut broker = broker(
+            &dir,
+            vec![tabbed_pane("w1:p1", "claude", "w1:t1", Some("fable"))],
+        );
+        broker.config.allowed_sources.insert("mobile".into());
+        // config.rs の既定 mapping と同じ: claude は slash 記法。
+        broker
+            .config
+            .skill_syntax
+            .insert("claude".into(), crate::config::SkillSyntax::Slash);
+        broker.sync_herdr_registry().await;
+
+        let accepted = broker
+            .web_letter(
+                "mobile".into(),
+                "fable".into(),
+                "please deliver".into(),
+                Some("deliver".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(accepted["name"], "fable", "{accepted}");
+        let delivered = bells(&broker);
+        assert!(
+            delivered
+                .last()
+                .is_some_and(|(pane, text)| pane == "w1:p1" && text.starts_with("/deliver ")),
+            "skill 記法は runtime 側で解決される: {delivered:?}"
+        );
+
+        // 手動 register は導出名 (tab 名) だけを受理する。
+        let ok = broker
+            .handle(request("register", Some("w1:p1"), &["fable"]))
+            .await;
+        assert_eq!(ok.code, 0, "{}", ok.stderr);
+        let refused = broker
+            .handle(request("register", Some("w1:p1"), &["claude"]))
+            .await;
+        assert_eq!(refused.code, 1, "{refused:?}");
+        assert!(refused.stderr.contains("一致しない"), "{}", refused.stderr);
+        assert_eq!(broker.state.agents["w1:p1"].name, "fable");
+        assert_eq!(broker.state.agents["w1:p1"].runtime, "claude");
+
+        // journal の Register は {name, runtime} で書かれる。
+        let journal = std::fs::read_to_string(&broker.config.journal).unwrap();
+        assert!(
+            journal.lines().any(|line| {
+                line.contains("\"type\":\"register\"")
+                    && line.contains("\"name\":\"fable\"")
+                    && line.contains("\"runtime\":\"claude\"")
+            }),
+            "{journal}"
+        );
+    }
+
+    /// identity takeover 回帰: タブ名 fable のまま runtime だけ claude → codex に
+    /// 交代した pane へ、旧 runtime 時代の message の `reply_to` を返さない。
+    /// 捕捉した (name, runtime) は journal replay (restart) 後も保たれる —
+    /// identity が変わっていなければ `reply_to` は返り続ける。
+    #[tokio::test]
+    async fn a_runtime_swap_behind_the_same_tab_name_never_offers_a_reply_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = {
+            let mut broker = broker(
+                &dir,
+                vec![
+                    tabbed_pane("w1:p1", "claude", "w1:t1", Some("fable")),
+                    tabbed_pane("w1:p2", "claude", "w1:t2", Some("opus")),
+                ],
+            );
+            broker.sync_herdr_registry().await;
+            json(
+                &broker
+                    .handle(send_request("w1:p1", "opus", "question"))
+                    .await,
+            )["id"]
+                .as_u64()
+                .unwrap()
+        };
+
+        // 再起動 (journal replay): identity 不変なら reply_to は保たれる。
+        // 捕捉 runtime が durable でないとここで既に返信先を失う。
+        let mut broker = broker(
+            &dir,
+            vec![
+                tabbed_pane("w1:p1", "claude", "w1:t1", Some("fable")),
+                tabbed_pane("w1:p2", "claude", "w1:t2", Some("opus")),
+            ],
+        );
+        broker.startup().await.unwrap();
+        let read = json(
+            &broker
+                .handle(request("read-message", Some("w1:p2"), &[&id.to_string()]))
+                .await,
+        );
+        assert_eq!(read["from"], "fable");
+        assert_eq!(read["reply_to"], "w1:p1", "identity 不変なら返信できる");
+
+        // 同じ pane がタブ名 fable のまま runtime だけ codex に交代 → sync。
+        set_herdr_panes(
+            &broker,
+            vec![
+                tabbed_pane("w1:p1", "codex", "w1:t1", Some("fable")),
+                tabbed_pane("w1:p2", "claude", "w1:t2", Some("opus")),
+            ],
+        );
+        broker.sync_herdr_registry().await;
+        assert_eq!(
+            broker.state.agents["w1:p1"].runtime, "codex",
+            "takeover 済み"
+        );
+        let read = json(
+            &broker
+                .handle(request("read-message", Some("w1:p2"), &[&id.to_string()]))
+                .await,
+        );
+        assert_eq!(read["from"], "fable", "捕捉した表示名は変わらない");
+        assert!(
+            read["reply_to"].is_null(),
+            "runtime だけ交代した pane へ返信させてはならない: {read}"
+        );
+    }
+
+    /// 重複タブ名は同一タブの近接でも自動選択しない: sender と同じタブに片方が
+    /// 居ても bare 名は曖昧エラーになり、候補の pane id を案内する。
+    #[tokio::test]
+    async fn duplicate_tab_names_stay_ambiguous_even_from_an_adjacent_tab() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut broker = broker(
+            &dir,
+            vec![
+                tabbed_pane("w1:p1", "claude", "w1:t1", Some("fable")),
+                tabbed_pane("w1:p2", "claude", "w1:t2", Some("fable")),
+                // sender は p1 と同一タブに居る。
+                tabbed_pane("w1:p3", "codex", "w1:t1", None),
+            ],
+        );
+        broker.sync_herdr_registry().await;
+        let error = broker.resolve("fable", Some("w1:p3")).await.unwrap_err();
+        assert!(error.stderr.contains("候補が複数"), "{}", error.stderr);
+        assert!(
+            error.stderr.contains("w1:p1") && error.stderr.contains("w1:p2"),
+            "候補の pane id を案内する: {}",
+            error.stderr
+        );
+    }
+
+    /// sender 自身が重複名の一方のとき、self 除外後の候補は1件なので bare 名は
+    /// 他方へ一意配送される (この挙動を契約として固定する)。
+    #[tokio::test]
+    async fn a_duplicate_named_sender_resolves_bare_to_the_other_pane() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut broker = broker(
+            &dir,
+            vec![
+                tabbed_pane("w1:p1", "claude", "w1:t1", Some("fable")),
+                tabbed_pane("w1:p2", "claude", "w1:t2", Some("fable")),
+            ],
+        );
+        broker.sync_herdr_registry().await;
+        let resolved = broker.resolve("fable", Some("w1:p1")).await.unwrap();
+        assert_eq!(resolved.0, "w1:p2");
+        let sent = json(&broker.handle(send_request("w1:p1", "fable", "hi")).await);
+        assert_eq!(sent["to"], "w1:p2", "{sent}");
+    }
+
+    /// 呼び鈴・依頼書・journal の from/to がタブ名 (fable / opus) に追随し、
+    /// journal replay (restart) 後も保たれる。
+    #[tokio::test]
+    async fn bells_briefs_and_journal_carry_tab_names_for_custom_named_agents() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = {
+            let mut broker = broker(
+                &dir,
+                vec![
+                    tabbed_pane("w1:p1", "claude", "w1:t1", Some("fable")),
+                    tabbed_pane("w1:p2", "claude", "w1:t2", Some("opus")),
+                ],
+            );
+            broker.sync_herdr_registry().await;
+            let sent = json(
+                &broker
+                    .handle(send_request("w1:p1", "opus", "question"))
+                    .await,
+            );
+            let id = sent["id"].as_u64().unwrap();
+            assert_eq!(sent["name"], "opus");
+            // 呼び鈴 (agent.prompt で配送されるテキスト) の sender 表記はタブ名。
+            let delivered = bells(&broker);
+            assert!(
+                delivered.last().is_some_and(|(pane, bell)| {
+                    pane == "w1:p2" && bell.contains("fable から依頼が届きました")
+                }),
+                "{delivered:?}"
+            );
+            // Message の sender_name / target_name はタブ名。
+            let stored = broker.state.message(id).unwrap();
+            assert_eq!(stored.message.sender_label(), "fable");
+            assert_eq!(stored.message.target_name, "opus");
+            // 依頼書テンプレートの from/to header。
+            assert!(
+                stored.message.brief.contains("- from: fable"),
+                "{}",
+                stored.message.brief
+            );
+            assert!(
+                stored.message.brief.contains("- to: opus"),
+                "{}",
+                stored.message.brief
+            );
+            // journal の Enqueue も同じ from/to を持つ。
+            let journal = std::fs::read_to_string(&broker.config.journal).unwrap();
+            assert!(
+                journal.lines().any(|line| {
+                    line.contains("\"type\":\"enqueue\"")
+                        && line.contains("\"sender_name\":\"fable\"")
+                        && line.contains("\"target_name\":\"opus\"")
+                }),
+                "{journal}"
+            );
+            // read_message の from もタブ名。
+            let read = json(
+                &broker
+                    .handle(request("read-message", Some("w1:p2"), &[&id.to_string()]))
+                    .await,
+            );
+            assert_eq!(read["from"], "fable");
+            id
+        };
+        // journal replay (restart) 後も保たれる。
+        let mut restarted = broker(
+            &dir,
+            vec![
+                tabbed_pane("w1:p1", "claude", "w1:t1", Some("fable")),
+                tabbed_pane("w1:p2", "claude", "w1:t2", Some("opus")),
+            ],
+        );
+        restarted.startup().await.unwrap();
+        let read = json(
+            &restarted
+                .handle(request("read-message", Some("w1:p2"), &[&id.to_string()]))
+                .await,
+        );
+        assert_eq!(read["from"], "fable");
+        assert_eq!(read["reply_to"], "w1:p1");
+        let stored = restarted.state.message(id).unwrap();
+        assert!(
+            stored.message.brief.contains("- from: fable"),
+            "{}",
+            stored.message.brief
+        );
+        assert_eq!(stored.message.target_name, "opus");
     }
 
     #[tokio::test]

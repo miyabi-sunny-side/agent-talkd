@@ -155,6 +155,16 @@ fn serve_one(
                 {"workspace_id": "w1", "number": 1, "label": "knowledge", "focused": true},
             ],
         }),
+        // 実機封筒 (2026-08-14 採取): tab の label は required で、custom 名の
+        // 無い tab は番号文字列が入る (→ 名前は runtime 検出名へ fallback)。
+        // daemon は tab.list が取れない snapshot を fail-closed で捨てるため、
+        // この分岐が無いと登録が一切進まない。
+        "tab.list" => json!({
+            "type": "tab_list",
+            "tabs": [
+                {"tab_id": "w1:t1", "workspace_id": "w1", "number": 1, "label": "1", "focused": true, "pane_count": 2, "agent_status": "idle"},
+            ],
+        }),
         // 実 herdr は method 別の封筒を持つ (2026-08-03 実機採取)。
         // pane.get の中身は result.pane にネストする。
         "pane.get" => json!({"type": "pane", "pane": pane}),

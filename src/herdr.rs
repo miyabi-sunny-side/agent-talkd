@@ -93,6 +93,10 @@ pub struct HerdrPane {
     /// 主名になる。未設定・宛先構文と衝突する文字を含む場合は `None`。
     pub workspace_label: Option<String>,
     pub tab_id: String,
+    /// tab の人間向け名 (`tab.list` の label)。宛先・表示の主名の源になる。
+    /// 宛先構文と衝突する文字を含む label は `None` (workspace label と同じ規則)。
+    /// custom 名の無い tab は番号文字列 (例 `"4"`) が入る。
+    pub tab_label: Option<String>,
     pub cwd: String,
     pub agent: Option<String>,
     pub status: AgentStatus,
@@ -105,6 +109,11 @@ pub struct Herdr {
     /// clone 間で共有されるので、テストが tick の合間に中身を差し替えられる。
     #[cfg(test)]
     pub(crate) scripted: Option<std::sync::Arc<std::sync::Mutex<Vec<HerdrPane>>>>,
+    /// scripted モードで `panes()` を失敗させる test 専用 failpoint。
+    /// 実装では `tab.list` の取得失敗が pane 列挙ごと失敗する (fail-closed) ため、
+    /// その tick を daemon 側テストから再現するために使う。
+    #[cfg(test)]
+    pub(crate) scripted_fail: std::sync::Arc<std::sync::Mutex<bool>>,
     /// scripted モードで `deliver` された (pane, text) の記録 (test 専用)。
     /// clone 間で共有されるので、broker へ渡した後からでも観測できる。
     #[cfg(test)]
@@ -118,6 +127,8 @@ impl Herdr {
             #[cfg(test)]
             scripted: None,
             #[cfg(test)]
+            scripted_fail: std::sync::Arc::default(),
+            #[cfg(test)]
             delivered: std::sync::Arc::default(),
         }
     }
@@ -128,6 +139,7 @@ impl Herdr {
         Self {
             socket: PathBuf::new(),
             scripted: Some(std::sync::Arc::new(std::sync::Mutex::new(panes))),
+            scripted_fail: std::sync::Arc::default(),
             delivered: std::sync::Arc::default(),
         }
     }
@@ -148,6 +160,9 @@ impl Herdr {
     pub async fn panes(&self) -> Result<Vec<HerdrPane>> {
         #[cfg(test)]
         if let Some(scripted) = &self.scripted {
+            if *self.scripted_fail.lock().unwrap() {
+                bail!("scripted snapshot failure (tab.list)");
+            }
             return Ok(scripted.lock().unwrap().clone());
         }
         let result = self.call("pane.list", json!({})).await?;
@@ -159,11 +174,17 @@ impl Herdr {
         // 失敗させず、label なし (workspace_id 表示) へ劣化させる。
         // rename は次回の取得で自然に追従する (bridge は read-only 消費のみ)。
         let labels = self.workspace_labels().await.unwrap_or_default();
+        // tab の label (タブ名) を引く。こちらは agent の **identity の源** なので、
+        // 取得失敗を label なしへ劣化させると runtime 名への一時交代 (identity
+        // 交代・誤配) が起きる。fail-closed: この tick の pane 列挙ごと失敗させ、
+        // 呼び出し側 (pull 同期) は snapshot を適用しない。
+        let tab_labels = self.tab_labels().await?;
         Ok(panes
             .iter()
             .filter_map(parse_pane)
             .map(|mut pane| {
                 pane.workspace_label = labels.get(&pane.workspace_id).cloned();
+                pane.tab_label = tab_labels.get(&pane.tab_id).cloned();
                 pane
             })
             .collect())
@@ -182,6 +203,26 @@ impl Herdr {
             .filter_map(|workspace| {
                 let id = workspace.get("workspace_id")?.as_str()?;
                 let label = workspace.get("label")?.as_str()?;
+                usable_label(label).then(|| (id.to_owned(), label.to_owned()))
+            })
+            .collect())
+    }
+
+    /// `tab.list` から `tab_id` → label の対応を作る (`workspace_labels` と同型)。
+    /// params の `workspace_id` を省略して全 workspace を 1 回で引く。
+    /// 宛先構文と衝突する文字を含む label は捨てる。純数字 label (custom 名の
+    /// 無い tab) の解釈は名前決定側 (`backend::pane_info`) が行う。
+    async fn tab_labels(&self) -> Result<std::collections::HashMap<String, String>> {
+        let result = self.call("tab.list", json!({})).await?;
+        let tabs = result
+            .get("tabs")
+            .and_then(Value::as_array)
+            .context("herdr tab.list に tabs がありません")?;
+        Ok(tabs
+            .iter()
+            .filter_map(|tab| {
+                let id = tab.get("tab_id")?.as_str()?;
+                let label = tab.get("label")?.as_str()?;
                 usable_label(label).then(|| (id.to_owned(), label.to_owned()))
             })
             .collect())
@@ -350,6 +391,7 @@ fn parse_pane(value: &Value) -> Option<HerdrPane> {
         workspace_id: field("workspace_id").unwrap_or_default(),
         workspace_label: None,
         tab_id: field("tab_id").unwrap_or_default(),
+        tab_label: None,
         cwd: field("cwd").unwrap_or_default(),
         agent: field("agent").filter(|agent| !agent.is_empty()),
         status: status_from(value),
@@ -456,6 +498,11 @@ mod tests {
         json!({"id": "agent-talkd", "result": result})
     }
 
+    /// tab の無い `tab.list` 応答。tab 名を使わないテストの共通応答。
+    fn empty_tab_list() -> Value {
+        ok(&json!({"type": "tab_list", "tabs": []}))
+    }
+
     /// 実 herdr の `pane.get` 封筒 (2026-08-03 実機採取): 中身は `result.pane`。
     fn pane_get(pane: &Value) -> Value {
         ok(&json!({"type": "pane", "pane": pane}))
@@ -485,6 +532,7 @@ mod tests {
                     json!({"pane_id": "w1:p6", "agent_status": "unknown"}),
                 ],
             })),
+            "tab.list" => empty_tab_list(),
             _ => ok(&json!({})),
         });
 
@@ -725,6 +773,7 @@ mod tests {
                     {"workspace_id": "w5", "number": 5, "label": "label:colon"},
                 ],
             })),
+            "tab.list" => empty_tab_list(),
             _ => ok(&json!({})),
         });
         let panes = fake.client().panes().await.unwrap();
@@ -746,11 +795,92 @@ mod tests {
                 "id": "agent-talkd",
                 "error": {"code": "internal", "message": "boom"},
             }),
+            "tab.list" => empty_tab_list(),
             _ => ok(&json!({})),
         });
         let panes = degraded.client().panes().await.unwrap();
         assert_eq!(panes.len(), 1);
         assert_eq!(panes[0].workspace_label, None);
+    }
+
+    /// `tab.list` の label が `tab_id` で pane に結び付く。宛先構文と衝突する
+    /// label は捨てる (workspace label と同じ規則)。純数字 label はこの層では
+    /// 保持し、名前決定 (`backend::pane_info`) が runtime 名へ落とす。
+    /// wire 形式: params の `workspace_id` を省略して全 workspace を 1 回で引く。
+    #[tokio::test]
+    async fn tab_labels_join_panes_by_tab_id() {
+        let tabbed_pane = |pane_id: &str, tab_id: &str| {
+            json!({
+                "pane_id": pane_id,
+                "terminal_id": format!("term_{pane_id}"),
+                "workspace_id": "w1",
+                "tab_id": tab_id,
+                "cwd": "/home/miyabi/projects",
+                "agent": "claude",
+                "agent_status": "idle",
+            })
+        };
+        let fake = FakeHerdr::start(move |method, _| match method {
+            "pane.list" => ok(&json!({
+                "type": "pane_list",
+                "panes": [
+                    tabbed_pane("w1:p1", "w1:t1"),
+                    tabbed_pane("w1:p2", "w1:t2"),
+                    tabbed_pane("w1:p3", "w1:t3"),
+                    tabbed_pane("w1:p4", "w1:t4"),
+                ],
+            })),
+            // 実機封筒 (2026-08-14 採取): result.tabs[] に TabInfo が入り、
+            // label は required。custom 名の無い tab は番号文字列が label になる。
+            "tab.list" => ok(&json!({
+                "type": "tab_list",
+                "tabs": [
+                    {"tab_id": "w1:t1", "workspace_id": "w1", "number": 1, "label": "fable", "focused": false, "pane_count": 1, "agent_status": "idle"},
+                    {"tab_id": "w1:t2", "workspace_id": "w1", "number": 2, "label": "4", "focused": false, "pane_count": 1, "agent_status": "idle"},
+                    {"tab_id": "w1:t3", "workspace_id": "w1", "number": 3, "label": "has space", "focused": false, "pane_count": 1, "agent_status": "idle"},
+                ],
+            })),
+            _ => ok(&json!({})),
+        });
+        let panes = fake.client().panes().await.unwrap();
+        assert_eq!(panes[0].tab_label.as_deref(), Some("fable"));
+        assert_eq!(panes[1].tab_label.as_deref(), Some("4"));
+        assert_eq!(panes[2].tab_label, None, "空白入り label は採用しない");
+        assert_eq!(
+            panes[3].tab_label, None,
+            "tab.list に無い tab は label なし"
+        );
+
+        // wire 形式: workspace_id を送らず全 workspace を引く。
+        let request = fake
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|request| request["method"] == "tab.list")
+            .cloned()
+            .expect("tab.list が発行される");
+        assert!(request["params"].get("workspace_id").is_none(), "{request}");
+    }
+
+    /// `tab.list` の取得失敗は pane 列挙ごと失敗する (fail-closed)。
+    /// workspace.list の劣化継続と違い、tab 名は identity の源なので
+    /// label なしへ黙って劣化させると runtime 名への一時交代 (誤配) が起きる。
+    #[tokio::test]
+    async fn a_failed_tab_list_fails_the_pane_listing_instead_of_degrading() {
+        let fake = FakeHerdr::start(|method, _| match method {
+            "pane.list" => ok(&json!({
+                "type": "pane_list",
+                "panes": [pane("w1:p1", "claude", "idle")],
+            })),
+            "tab.list" => json!({
+                "id": "agent-talkd",
+                "error": {"code": "internal", "message": "boom"},
+            }),
+            _ => ok(&json!({})),
+        });
+        let error = fake.client().panes().await.unwrap_err().to_string();
+        assert!(error.contains("tab.list"), "{error}");
     }
 
     /// herdr の error 応答を握り潰さない。

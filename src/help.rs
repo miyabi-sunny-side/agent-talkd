@@ -43,7 +43,7 @@ pub const COMMANDS: &[CommandHelp] = &[
     },
     CommandHelp {
         command: "register",
-        text: "usage: agent-talk register <name>\n\n現在のpaneをagent名で登録します。",
+        text: "usage: agent-talk register <name>\n\n現在のpaneを登録します。名前はherdrから導出されるタブ名 (無ければruntime検出名) と一致が必要です。",
     },
     CommandHelp {
         command: "unregister",

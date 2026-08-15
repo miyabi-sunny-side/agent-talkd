@@ -17,14 +17,28 @@ pub struct PaneInfo {
     /// scope 解決の互換 alias。label を主名にしたときの `workspace_id`。
     /// 旧来の `w2/codex` 形を壊さないために解決だけに使い、表示には使わない。
     pub scope_alias: Option<String>,
-    pub window_id: String,
     pub pane_id: String,
     pub cwd: String,
     pub window_index: String,
     pub pane_index: String,
+    /// 宛先・表示・journal に使う識別名。usable な非数字 tab label があれば
+    /// それ、無ければ runtime 検出名 (`agent`)。agent の居ない pane は `None`。
+    pub name: Option<String>,
+    /// herdr の runtime 検出名 (claude / codex / grok)。skill 記法と
+    /// installed skill の解決はこちらを使う。
     pub agent: Option<String>,
     /// herdr 自身が持つ agent 状態。
     pub status: AgentStatus,
+}
+
+/// `register` command と同じ文字種で agent 名を検証する。herdr の native 名や
+/// tab label をそのまま登録すると、CLI では拒否される `bad/name` 等が
+/// pull/startup 経由でだけ登録され、宛先文法 (`scope/name`) が壊れる。
+pub fn usable_agent_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 /// 自分が居る pane の id を環境から求める。
@@ -125,6 +139,17 @@ fn pane_info(pane: crate::herdr::HerdrPane) -> PaneInfo {
         .workspace_label
         .is_some()
         .then(|| pane.workspace_id.clone());
+    // 識別名の決定規則: agent の居る pane に、宛先として使えて **純数字でない**
+    // tab label があればそれを name にする。純数字 label は custom 名の無い tab
+    // (herdr は番号文字列を label に入れる)、宛先に使えない label は無名と同じ
+    // なので、どちらも従来どおり runtime 検出名へ fallback する。
+    let name = pane.agent.as_ref().map(|runtime| {
+        pane.tab_label
+            .as_deref()
+            .filter(|label| usable_agent_name(label))
+            .filter(|label| !label.chars().all(|c| c.is_ascii_digit()))
+            .map_or_else(|| runtime.clone(), str::to_owned)
+    });
     PaneInfo {
         // 人間が知っている名前 (workspace label) を主名にする。
         // label が無い workspace は従来どおり workspace_id。
@@ -132,11 +157,11 @@ fn pane_info(pane: crate::herdr::HerdrPane) -> PaneInfo {
             .workspace_label
             .unwrap_or_else(|| pane.workspace_id.clone()),
         scope_alias,
-        window_id: pane.tab_id,
         pane_id: pane.pane_id,
         cwd: pane.cwd,
         window_index,
         pane_index,
+        name,
         agent: pane.agent,
         status: pane.status,
     }
@@ -154,6 +179,7 @@ mod tests {
             workspace_id: "w2".into(),
             workspace_label: Some("knowledge".into()),
             tab_id: "w2:t1".into(),
+            tab_label: None,
             cwd: "/home/miyabi/projects/agent-talkd".into(),
             agent: Some("codex".into()),
             status: AgentStatus::Blocked,
@@ -167,17 +193,62 @@ mod tests {
             workspace_id: "w9".into(),
             workspace_label: None,
             tab_id: "w9:t1".into(),
+            tab_label: None,
             cwd: "/tmp".into(),
             agent: None,
             status: AgentStatus::Unknown,
         });
         assert_eq!(unlabeled.session, "w9");
         assert_eq!(unlabeled.scope_alias, None);
-        assert_eq!(info.window_id, "w2:t1");
         assert_eq!(info.window_index, "1");
         assert_eq!(info.pane_index, "3");
         assert_eq!(info.agent.as_deref(), Some("codex"));
         assert_eq!(info.status, AgentStatus::Blocked);
+    }
+
+    /// 識別名の決定規則: usable な非数字 tab label > runtime 検出名。
+    /// agent の居ない pane は tab label があっても無名 (登録対象にしない)。
+    #[test]
+    fn the_pane_name_prefers_a_custom_tab_label_over_the_runtime() {
+        let base = crate::herdr::HerdrPane {
+            pane_id: "w1:p1".into(),
+            terminal_id: "term".into(),
+            workspace_id: "w1".into(),
+            workspace_label: None,
+            tab_id: "w1:t1".into(),
+            tab_label: None,
+            cwd: "/tmp".into(),
+            agent: Some("claude".into()),
+            status: AgentStatus::Idle,
+        };
+        let named = |label: Option<&str>, agent: Option<&str>| {
+            pane_info(crate::herdr::HerdrPane {
+                tab_label: label.map(str::to_owned),
+                agent: agent.map(str::to_owned),
+                ..base.clone()
+            })
+            .name
+        };
+        assert_eq!(
+            named(Some("fable"), Some("claude")).as_deref(),
+            Some("fable")
+        );
+        assert_eq!(
+            named(Some("4"), Some("claude")).as_deref(),
+            Some("claude"),
+            "純数字 label は custom 名なし (番号) なので runtime 名"
+        );
+        assert_eq!(named(None, Some("claude")).as_deref(), Some("claude"));
+        assert_eq!(
+            named(Some("日本語"), Some("claude")).as_deref(),
+            Some("claude"),
+            "宛先に使えない label は無名と同じ扱いで runtime 名へ fallback"
+        );
+        assert_eq!(
+            named(Some("fable"), None),
+            None,
+            "agent の居ない pane は無名"
+        );
     }
 
     #[tokio::test]

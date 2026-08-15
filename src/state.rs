@@ -18,23 +18,43 @@ impl AgentState {
     }
 }
 
+/// agent の identity。name (tab label 由来の宛先・表示名) と runtime
+/// (herdr の検出名) の組。takeover は (name, runtime) のどちらの変化でも起きる
+/// ため、生存判定 (reply / access / notification) は必ずこの組で比較する —
+/// name だけの比較は、タブ名を保ったまま runtime が交代した pane の新しい
+/// 住人を旧 identity と誤認する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Identity<'a> {
+    pub name: &'a str,
+    pub runtime: &'a str,
+}
+
 /// 送信時点で捕捉した送信者 identity。
 ///
 /// **後からレジストリを引き直さない。** 送信者が退出・改名・pane ID 再利用されると
-/// 現在のレジストリからは誤った名前が引けるため、送信時の名前を message へ永続化する。
+/// 現在のレジストリからは誤った名前が引けるため、送信時の identity を message へ
+/// 永続化する。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Origin {
     /// 送信元 pane。外部 CLI / 内部通知では `human` / `system` などの label。
     pub pane: String,
     /// 送信時点の送信者名。
     pub name: String,
+    /// 送信時点の送信者 runtime。pane 由来でない送信者 (`human` / `system` /
+    /// 外部 source) は name をそのまま使う。
+    pub runtime: String,
 }
 
 impl Origin {
-    pub fn new(pane: impl Into<String>, name: impl Into<String>) -> Self {
+    pub fn new(
+        pane: impl Into<String>,
+        name: impl Into<String>,
+        runtime: impl Into<String>,
+    ) -> Self {
         Self {
             pane: pane.into(),
             name: name.into(),
+            runtime: runtime.into(),
         }
     }
 }
@@ -47,15 +67,40 @@ pub struct Message {
     /// (`None` は「捕捉されていない」であって「名前が無い」ではない)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sender_name: Option<String>,
+    /// 送信時点で捕捉した送信者 runtime。runtime 無しの旧 record は
+    /// name = runtime 検出名の時代なので、`None` は `sender_name` を runtime と
+    /// して読む。旧 daemon は未知フィールドを黙って無視するため読み出し互換。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_runtime: Option<String>,
     pub brief: String,
     pub bell: String,
     pub target_name: String,
+    /// 送信時点で捕捉した宛先 runtime。`None` の互換規則は `sender_runtime` と同じ。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_runtime: Option<String>,
 }
 
 impl Message {
     /// 表示用の送信者名。捕捉済みならそれを、旧 journal 由来なら生の sender を返す。
     pub fn sender_label(&self) -> &str {
         self.sender_name.as_deref().unwrap_or(&self.sender)
+    }
+
+    /// 送信時点で捕捉した送信者 identity。旧 journal 由来 (未捕捉) は `None`。
+    pub fn sender_identity(&self) -> Option<Identity<'_>> {
+        let name = self.sender_name.as_deref()?;
+        Some(Identity {
+            name,
+            runtime: self.sender_runtime.as_deref().unwrap_or(name),
+        })
+    }
+
+    /// 送信時点で捕捉した宛先 identity。
+    pub fn target_identity(&self) -> Identity<'_> {
+        Identity {
+            name: &self.target_name,
+            runtime: self.target_runtime.as_deref().unwrap_or(&self.target_name),
+        }
     }
 }
 
@@ -101,7 +146,11 @@ pub struct ExternalMailboxEvent {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Agent {
+    /// 宛先・表示・journal の from/to に使う識別名 (tab label 由来)。
     pub name: String,
+    /// herdr の runtime 検出名 (claude / codex / grok)。skill 記法と
+    /// installed skill の解決に使う。tab 名の無い pane では `name` と同じ。
+    pub runtime: String,
     pub queue: BTreeSet<u64>,
 }
 
@@ -111,6 +160,14 @@ impl Agent {
     /// 上限を素通りする。
     pub fn defers_delivery(&self) -> bool {
         !self.queue.is_empty()
+    }
+
+    /// 現在の登録 identity。捕捉済み identity との生存比較はこれを使う。
+    pub fn identity(&self) -> Identity<'_> {
+        Identity {
+            name: &self.name,
+            runtime: &self.runtime,
+        }
     }
 }
 
@@ -136,6 +193,7 @@ impl BrokerState {
         self.agents.insert(
             pane,
             Agent {
+                runtime: name.clone(),
                 name,
                 queue: BTreeSet::new(),
             },
@@ -171,9 +229,11 @@ impl BrokerState {
             id,
             sender: origin.pane,
             sender_name: Some(origin.name),
+            sender_runtime: Some(origin.runtime),
             brief,
             bell: make_bell(id),
             target_name: expected_name.to_owned(),
+            target_runtime: Some(agent.runtime.clone()),
         };
         // queue が残っている間は直接配達しない。直接配達を許すと、
         // 配達失敗で requeue された古い message を新規 message が追い越す
@@ -257,11 +317,11 @@ impl BrokerState {
     /// 送信者が退出・改名した場合や pane ID が再利用された場合は `None`
     /// (新しい住人へ誤配送しないため)。
     pub fn reply_target(&self, message: &Message) -> Option<String> {
-        let captured = message.sender_name.as_deref()?;
+        let captured = message.sender_identity()?;
         // 送信者が登録中の pane のときだけ返信先になる。`human` / `system` は
         // registry の key (herdr 発行の pane id) には現れないので自然に None になる。
         let agent = self.agents.get(&message.sender)?;
-        (agent.name == captured).then(|| message.sender.clone())
+        (agent.identity() == captured).then(|| message.sender.clone())
     }
 
     pub fn complete_delivery(&mut self, pane: &str, id: u64) {
@@ -293,14 +353,14 @@ impl BrokerState {
     /// 呼び出し元 pane 宛で未受領の ID（**queue 中 / 未配達も含む**）。本文は含めない。
     /// 所有者 pull の自己発見経路。push 呼び鈴を待たずに list → read できる。
     pub fn pending_to_me(&self, pane: &str) -> Vec<u64> {
-        let current_name = self.agents.get(pane).map(|agent| agent.name.as_str());
+        let current = self.agents.get(pane).map(Agent::identity);
         self.messages
             .values()
             .filter(|stored| {
                 stored.target_pane == pane
                     && !stored.acked
                     && !stored.seen
-                    && current_name == Some(stored.message.target_name.as_str())
+                    && current == Some(stored.message.target_identity())
             })
             .map(|stored| stored.message.id)
             .collect()
@@ -321,9 +381,16 @@ impl BrokerState {
         pending
     }
 
-    pub fn restore_agent(&mut self, pane: String, name: String, _legacy_state: AgentState) {
+    pub fn restore_agent(
+        &mut self,
+        pane: String,
+        name: String,
+        runtime: String,
+        _legacy_state: AgentState,
+    ) {
         self.agents.entry(pane).or_insert(Agent {
             name,
+            runtime,
             queue: BTreeSet::new(),
         });
     }
@@ -422,7 +489,8 @@ mod tests {
     }
 
     fn from(pane: &str) -> Origin {
-        Origin::new(pane, format!("agent{}", pane.trim_start_matches('%')))
+        let name = format!("agent{}", pane.trim_start_matches('%'));
+        Origin::new(pane, name.clone(), name)
     }
 
     #[test]
@@ -534,7 +602,7 @@ mod tests {
         let Dispatch::Deliver(id) = state
             .dispatch(
                 "w1:p1",
-                Origin::new("w1:p2", "codex"),
+                Origin::new("w1:p2", "codex", "codex"),
                 "body".into(),
                 "claude",
                 bell,
@@ -567,6 +635,69 @@ mod tests {
         assert_eq!(state.reply_target(&captured), None);
     }
 
+    /// 生存判定は (name, runtime) の組で行う。タブ名を保ったまま runtime だけ
+    /// 交代した pane は、送信側では `reply_target` を失い、宛先側では
+    /// `pending_to_me` から旧宛 message が消える。
+    #[test]
+    fn identity_comparisons_require_both_the_name_and_the_runtime() {
+        let mut state = BrokerState::default();
+        state.restore_agent(
+            "w1:p1".into(),
+            "opus".into(),
+            "claude".into(),
+            AgentState::Idle,
+        );
+        state.restore_agent(
+            "w1:p2".into(),
+            "fable".into(),
+            "claude".into(),
+            AgentState::Idle,
+        );
+        let Dispatch::Deliver(id) = state
+            .dispatch(
+                "w1:p1",
+                Origin::new("w1:p2", "fable", "claude"),
+                "body".into(),
+                "opus",
+                bell,
+            )
+            .unwrap()
+        else {
+            panic!("message should be delivered");
+        };
+        state.complete_delivery("w1:p1", id);
+        let captured = state.message(id).unwrap().message.clone();
+        assert_eq!(state.reply_target(&captured), Some("w1:p2".into()));
+        assert_eq!(state.pending_to_me("w1:p1"), vec![id]);
+
+        // 送信側: タブ名 fable のまま runtime だけ codex へ交代。
+        state.remove("w1:p2");
+        state.restore_agent(
+            "w1:p2".into(),
+            "fable".into(),
+            "codex".into(),
+            AgentState::Idle,
+        );
+        assert_eq!(
+            state.reply_target(&captured),
+            None,
+            "runtime だけ交代した pane の新しい住人へ返信させない"
+        );
+
+        // 宛先側: タブ名 opus のまま runtime 交代した新しい住人には見せない。
+        state.remove("w1:p1");
+        state.restore_agent(
+            "w1:p1".into(),
+            "opus".into(),
+            "codex".into(),
+            AgentState::Idle,
+        );
+        assert!(
+            state.pending_to_me("w1:p1").is_empty(),
+            "旧宛の message を新しい住人の pending に見せない"
+        );
+    }
+
     #[test]
     fn a_legacy_message_without_a_captured_name_never_offers_a_reply_target() {
         let mut state = BrokerState::default();
@@ -575,9 +706,11 @@ mod tests {
             id: 1,
             sender: "%2".into(),
             sender_name: None,
+            sender_runtime: None,
             brief: "body".into(),
             bell: "read 1".into(),
             target_name: "claude".into(),
+            target_runtime: None,
         };
         assert_eq!(legacy.sender_label(), "%2");
         assert_eq!(state.reply_target(&legacy), None);
@@ -591,7 +724,7 @@ mod tests {
             let Dispatch::Deliver(id) = state
                 .dispatch(
                     "%1",
-                    Origin::new(label, label),
+                    Origin::new(label, label, label),
                     "body".into(),
                     "claude",
                     bell,

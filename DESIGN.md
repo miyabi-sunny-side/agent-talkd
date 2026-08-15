@@ -60,7 +60,8 @@ view/selectedAgent を URL と別に持つ state にしない (単一情報源)�
 
 ## 3. Domain model
 
-- **agent**: name (claude/codex/grok 等) / state (idle|busy) / pane_id (opaque) /
+- **agent**: name (タブ名由来。custom タブ名が無ければ runtime 検出名
+  claude/codex/grok 等) / state (idle|busy) / pane_id (opaque) /
   session (= workspace label) / location / cwd / backend (herdr)。
 - **session (workspace)**: 同一 session に複数 agent が同居する。詳細画面の
   主タイトルは session であり、agent はその中のタブである。

@@ -285,7 +285,7 @@ agent-talk send claude --no-reply '確認してください。返信は不要で
 human caller向けです。外部クライアントは許可された `--from` と組み合わせて
 `--skill` を指定します。
 
-`--skill` は宛先のagent種別に応じ、Claudeでは `/deliver `、Codexでは
+`--skill` は宛先の runtime (herdr の検出名) に応じ、Claudeでは `/deliver `、Codexでは
 `$deliver ` のような固定呼び出しを呼び鈴の先頭へ付けます。依頼本文は従来どおり
 journalだけに保存され、端末への入力には含まれません。`--from` と `--skill` は
 daemonでも検証され、未許可値や記法未設定のagent宛は配達せずエラーにします。
@@ -300,7 +300,7 @@ daemonでも検証され、未許可値や記法未設定のagent宛は配達せ
 `AGENT_TALK_QUEUE_LIMIT`（pane ごとの通常メッセージ上限、既定 `1000`）
 で指定します。追加の送信設定は次の環境変数で指定します。
 
-- `AGENT_TALK_SKILL_SYNTAX`: agent名と記法の対応。形式は
+- `AGENT_TALK_SKILL_SYNTAX`: runtime 検出名と記法の対応。形式は
   `claude=slash,codex=dollar`。この2件は既定値で、設定値は追加・上書きされます。
 - `AGENT_TALK_ALLOWED_SKILLS`: 許可するスキル名のカンマ区切り。未設定時は
   文字種・長さ検証のみです。
@@ -356,8 +356,17 @@ label の無い workspace と旧来の `w2/codex` 形は workspace_id で引き�
 解決できます。`/`・`:`・空白を含む label は宛先構文と衝突するため採用せず、
 workspace_id 表示へ fallback します (rename は次回取得で自動追従)。
 
-素の `codex` のような bare 名は近接規則 (同 window → 同 session) で探し、
-workspace を暗黙にまたぎません。別 workspace へは `<scope>/<name>` を明示
+agent の **name** (宛先と表示) は herdr のタブ label から導出します。宛先に
+使える非数字の label があればそれ、無ければ runtime 検出名 (claude / codex
+など) です — custom 名の無いタブは herdr が番号文字列を label に入れるため、
+純数字 label も runtime 検出名へ fallback します。runtime は name とは別に
+保持し、`--skill` の記法と installed skill 一覧の解決に使います — タブ名
+`fable` の claude にも `/deliver` が届きます。
+
+素の `codex` のような bare 名は自分と同じ workspace 内 (自分自身を除く) で
+探し、workspace を暗黙にまたぎません。同名候補が2つ以上あるときは同一タブの
+近接でも自動選択せず、候補の pane id を案内する曖昧エラーになります
+(pane id 直指定なら届きます)。別 workspace へは `<scope>/<name>` を明示
 します (tmux 併存期の正式名称 `herdr/<scope>/<name>` も互換 alias として
 受理します)。
 
@@ -381,8 +390,9 @@ herdrのsnapshotを読み、agentの載っているpaneを同期**します。gr
 登録 hook を持たない agent も、herdr の pane で起動するだけで数秒以内に
 peer になります。
 
-- pane の agent 名が別の agent に変わったら、旧登録を即座に外して新しい名前で
-  引き継ぎます（herdr の agent 列は native な同一性情報のため、猶予は不要です）。
+- pane の identity (タブ名由来の name / runtime 検出名) のどちらかが変わったら、
+  旧登録を即座に外して新しい identity で引き継ぎます（herdr の観測は native な
+  同一性情報のため、猶予は不要です）。
 - 成功したsnapshotから消えたpaneは即座に登録を外し、未受領メッセージを
   送信元へ回収します。pen-cliなどによる高速なspace削除・再作成でも古い登録を
   次のsnapshotまで持ち越しません。
