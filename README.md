@@ -122,13 +122,22 @@ latest以上の場合はdowngradeせず、デーモンの版確認だけを行�
 
 | tool | 引数 | 返り値 |
 | --- | --- | --- |
-| `list_peers` | なし | `{"version":1,"self":"w1:p4","pending_to_me":[2],"peers":[...]}`。各peerは`name`/`state`/`location`/`pane`/`cwd`/`queued`/`pending_from_me` |
+| `list_peers` | なし | `{"version":1,"self":"w1:p4","pending_to_me":[2],"peers":[...]}`。各peerは`name`/`runtime`/`state`/`location`/`pane`/`cwd`/`queued`/`pending_from_me` |
 | `send_message` | `to`, `body`, `no_reply?` | `{"version":1,"id":0,"path":"sent","to":"w1:p2","name":"claude"}`（`path` は `sent` か `queued`） |
 | `read_message` | `id` | `{"version":1,"id":0,"from":"codex","from_full":"knowledge/codex","reply_to":"w1:p5","body":"..."}` |
 | `ack_message` | `id` | `{"version":1,"id":0,"outcome":"acked"}`（未知IDは `no_pending_message`） |
 
 どの返り値も `version: 1` の JSON です。デーモンの応答がこの形でなければ、adapter は
 成功として扱わず tool error（`isError: true`）にします。
+
+各 peer の `runtime` は、herdr がその pane に**今**検出している agent 種別
+（`"claude"` / `"codex"` / `"grok"` / `"cursor"` など。検出 manifest は増減するので
+固定の列挙ではありません）で、未検出なら `null` です。タブ名を付けた pane では
+`name` から runtime を読めないため、`name` とは別に返します。使い道は読み取り専用の
+判別だけです — 相手が `"claude"` のときだけ Claude Code 組み込みの cross-session
+channel を選び、それ以外・`null`・`runtime` field 自体が無い場合（`runtime` を返さない
+旧 daemon）は agent-talk へフォールバックします。`runtime` の追加で `version` は
+上がりません（既存 field の名前と値は不変で、読み飛ばす client はそのまま動きます）。
 
 呼び出し元の pane が未登録なら、4つとも
 `この操作は登録済みのagent paneからのみ実行できます` で拒否されます。拒否は呼び鈴も

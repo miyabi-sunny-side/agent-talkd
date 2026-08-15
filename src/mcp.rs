@@ -148,7 +148,7 @@ pub fn tools() -> Value {
     json!([
         {
             "name": "list_peers",
-            "description": "待受中の agent 一覧と、両方向の未受領メッセージ ID を返す。",
+            "description": "待受中の agent 一覧と、両方向の未受領メッセージ ID を返す。各 peer の runtime は herdr が今検出している種別 (claude / codex / grok / cursor など、未検出は null) で、相手が claude のときだけ Claude Code 組み込みの cross-session channel を選ぶ判別に使える。",
             "inputSchema": {
                 "type": "object",
                 "properties": {},

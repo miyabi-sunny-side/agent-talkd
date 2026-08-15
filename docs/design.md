@@ -352,6 +352,20 @@ journal appendで行い、journal replayでも`remove`後に同じ最終状態�
 | `read_message` | `read-message` |
 | `ack_message` | `ack-message` |
 
+`list_peers`の各peerは、`name`とは別に**live検出のruntime**を`runtime`として返します。
+値はherdrのpane一覧のagent列（検出manifestのid）をそのまま透過し、`claude` /
+`codex` / `grok` / `cursor`等の文字列、未検出は`null`です。enumに固定しないのは、
+検出manifestが増減するのに対しdaemonが判定を持たないためです。値の出どころは
+daemonが`list-peers`で読むherdrのsnapshotで、登録時点の`runtime`（identityの一部)
+ではありません — タブ名を保ったままruntimeが交代したpaneで、登録済みの古い値を
+配ってしまわないようにするためです。用途は呼び出し側の読み取り専用の判別だけで、
+相手が`claude`のときだけClaude Code組み込みのcross-session channelを選び、それ以外・
+`null`・field自体が無い応答（`runtime`導入前の旧daemon）ではagent-talkへ
+フォールバックできます。この追加で封筒の`version`は上げません。既存fieldの名前と値を
+一切変えない純粋な追加であり、知らないfieldを読み飛ばす既存clientはそのまま動く一方、
+`version`を上げると旧daemonの応答を拒否する側の判定（`version == 1`）を無用に
+壊すためです。
+
 旧wire名（`peers-v1` / `send-message-v1` / `read-v1` / `ack-v1` / `mailbox-list-v1`）は
 稼働中の旧adapterをsession途中で壊さないための互換aliasとして残り、次のminorで
 削除されます。逆方向のskew（新adapter→旧daemon）は、daemonが明示的に

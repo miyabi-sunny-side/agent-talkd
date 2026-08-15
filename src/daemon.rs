@@ -2084,6 +2084,12 @@ impl Broker {
                 let agent = self.state.agents.get(&pane.pane_id)?;
                 Some(serde_json::json!({
                     "name": agent.name,
+                    // herdr が今この pane に検出している runtime 種別をそのまま
+                    // 透過する (claude / codex / grok / cursor ...)。検出中の値を
+                    // 使うのは、登録時点の `agent.runtime` が stale になりうるため。
+                    // 未検出は `null` — 実在しうる runtime 名と衝突する sentinel
+                    // 文字列は置かない。
+                    "runtime": pane.agent.as_deref().filter(|runtime| !runtime.is_empty()),
                     "state": display_state(pane.status),
                     "location": format!("{}:{}.{}", pane.session, pane.window_index, pane.pane_index),
                     "pane": pane.pane_id,
@@ -4653,6 +4659,119 @@ mod tests {
         // pane id 直指定。
         let sent = json(&broker.handle(send_request("w1:p4", "w1:p3", "hi")).await);
         assert_eq!(sent["name"], "claude", "{sent}");
+    }
+
+    /// `list-peers` の各 peer は、herdr が今その pane に検出している runtime を
+    /// `runtime` として持つ。呼び出し側 (Claude Code 組み込みの cross-session
+    /// channel を選ぶかの判別) は tab 名で隠れた runtime を見る必要があるので、
+    /// `name` と独立に検出名がそのまま届くことを端から端まで確かめる。
+    #[tokio::test]
+    async fn peers_expose_the_live_herdr_runtime_of_each_pane() {
+        /// `runtime` は常に存在する field。欠けていたら panic する。
+        fn runtime_of(peers: &serde_json::Value, pane: &str) -> serde_json::Value {
+            peers["peers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|peer| peer["pane"] == pane)
+                .unwrap_or_else(|| panic!("{pane} が peers に居ない: {peers}"))
+                .get("runtime")
+                .unwrap_or_else(|| panic!("{pane} に runtime field が無い: {peers}"))
+                .clone()
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut broker = broker(
+            &dir,
+            vec![
+                // tab 名で登録される pane。name からは runtime を読めない。
+                tabbed_pane("w1:p1", "claude", "w1:t1", Some("fable")),
+                tabbed_pane("w1:p2", "codex", "w1:t2", None),
+                tabbed_pane("w1:p3", "cursor", "w1:t3", Some("editor")),
+            ],
+        );
+        broker.sync_herdr_registry().await;
+
+        let peers = json(
+            &broker
+                .handle(request("list-peers", Some("w1:p2"), &[]))
+                .await,
+        );
+        assert_eq!(peers["version"], 1, "封筒の version は据え置き: {peers}");
+        assert_eq!(
+            runtime_of(&peers, "w1:p1"),
+            serde_json::json!("claude"),
+            "tab 名で登録した pane でも runtime は herdr の検出名: {peers}"
+        );
+        assert_eq!(runtime_of(&peers, "w1:p2"), serde_json::json!("codex"));
+        assert_eq!(
+            runtime_of(&peers, "w1:p3"),
+            serde_json::json!("cursor"),
+            "runtime は enum ではなく herdr の manifest id を透過する: {peers}"
+        );
+        // 既存 field は名前も値も変わらない。
+        let peer = peers["peers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|peer| peer["pane"] == "w1:p1")
+            .unwrap();
+        assert_eq!(peer["name"], "fable", "{peers}");
+        assert_eq!(peer["state"], "idle", "{peers}");
+        assert_eq!(peer["location"], "test:1.1", "{peers}");
+        assert_eq!(peer["cwd"], "/tmp", "{peers}");
+        assert_eq!(peer["queued"], 0, "{peers}");
+
+        // runtime が交代したら、次の snapshot でそのまま新しい検出名になる
+        // (登録時点の値を持ち回らない)。
+        set_herdr_panes(
+            &broker,
+            vec![
+                tabbed_pane("w1:p1", "grok", "w1:t1", Some("fable")),
+                tabbed_pane("w1:p2", "codex", "w1:t2", None),
+                tabbed_pane("w1:p3", "cursor", "w1:t3", Some("editor")),
+            ],
+        );
+        let peers = json(
+            &broker
+                .handle(request("list-peers", Some("w1:p2"), &[]))
+                .await,
+        );
+        assert_eq!(
+            runtime_of(&peers, "w1:p1"),
+            serde_json::json!("grok"),
+            "live 検出の交代がそのまま出る: {peers}"
+        );
+
+        // 検出が消えた pane は evict されるが、その回収を journal へ書けない間は
+        // 登録が残る。その窓では runtime を `null` にし、field 自体は落とさない。
+        broker.journal.fail_appends_after(0);
+        set_herdr_panes(
+            &broker,
+            vec![
+                HerdrPane {
+                    agent: None,
+                    ..tabbed_pane("w1:p1", "grok", "w1:t1", Some("fable"))
+                },
+                tabbed_pane("w1:p2", "codex", "w1:t2", None),
+                tabbed_pane("w1:p3", "cursor", "w1:t3", Some("editor")),
+            ],
+        );
+        let peers = json(
+            &broker
+                .handle(request("list-peers", Some("w1:p2"), &[]))
+                .await,
+        );
+        assert_eq!(
+            runtime_of(&peers, "w1:p1"),
+            serde_json::Value::Null,
+            "未検出は null (実在しうる runtime 名と衝突する sentinel を置かない): {peers}"
+        );
+        assert_eq!(
+            runtime_of(&peers, "w1:p2"),
+            serde_json::json!("codex"),
+            "他 pane の runtime は巻き添えにならない: {peers}"
+        );
     }
 
     /// 受け入れ T2: 同一 workspace で tab 名が重複したら bare / scoped とも
