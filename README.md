@@ -124,7 +124,7 @@ latest以上の場合はdowngradeせず、デーモンの版確認だけを行�
 | --- | --- | --- |
 | `list_peers` | なし | `{"version":1,"self":"w1:p4","pending_to_me":[2],"peers":[...]}`。各peerは`name`/`state`/`location`/`pane`/`cwd`/`queued`/`pending_from_me` |
 | `send_message` | `to`, `body`, `no_reply?` | `{"version":1,"id":0,"path":"sent","to":"w1:p2","name":"claude"}`（`path` は `sent` か `queued`） |
-| `read_message` | `id` | `{"version":1,"id":0,"from":"codex","reply_to":"w1:p5","body":"..."}` |
+| `read_message` | `id` | `{"version":1,"id":0,"from":"codex","from_full":"knowledge/codex","reply_to":"w1:p5","body":"..."}` |
 | `ack_message` | `id` | `{"version":1,"id":0,"outcome":"acked"}`（未知IDは `no_pending_message`） |
 
 どの返り値も `version: 1` の JSON です。デーモンの応答がこの形でなければ、adapter は
@@ -135,7 +135,19 @@ latest以上の場合はdowngradeせず、デーモンの版確認だけを行�
 未受領一覧も変えません。CLI の `send` は未登録 pane からも従来どおり送れます。人間が
 CLI から送る経路を閉じないためです。
 
-`read_message` の `from` は送信時点の送信者名で、送信者が退出・改名しても変わりません。
+`read_message` の `from` は送信時点の送信者名（bare 名）で、送信者が退出・改名しても
+変わりません。`from_full` は同じく送信受理時点で捕捉した canonical full label
+（`<workspace>/<name>`）で、同名の agent が別 workspace に居ても区別できます。
+呼び鈴の差出人表記もこの full label です。workspace を捕捉していない送信者
+（`human` / `system` / `--from` の外部送信元、および `from_full` 導入前の journal 由来の
+message）では、`from_full` は `from` と同じ bare 名になります。読み出し時に現在の
+peer 一覧や cwd から workspace を推測することはありません。
+
+登録済みの pane からの送信で、その pane の登録内容と herdr の現在の状態が食い違って
+いる間は、`送信元 pane ... と herdr の現在の状態が食い違うため送信できません` で
+拒否されます（タブ名の変更や runtime の交代の直後に起こりえます）。拒否は呼び鈴も
+未受領一覧も変えないので、同期が追いついてからそのまま再送してください。
+
 `reply_to` は同じ名前の agent がその pane に今も登録されている場合だけ pane ID を返し、
 それ以外は `null` です。`null` のときは `list_peers` で現在の宛先を選び直します。
 

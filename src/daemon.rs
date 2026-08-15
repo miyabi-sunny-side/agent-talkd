@@ -1709,6 +1709,30 @@ impl Broker {
             .or_else(|| intent.source().map(str::to_owned))
             .unwrap_or_else(|| "human".into());
         let reply_info = registered_sender.as_ref().and(from_info);
+        // 送信受理時点の workspace label を捕捉する。**登録内容 (`state.agents`) と
+        // pane snapshot の identity が一致した pane からしか採らない** — pane の
+        // 占有者が入れ替わっている間に、別人の workspace を差出人へ結合しないため。
+        // 一致しなければ拒否する: 捕捉できないまま受理すると、呼び鈴が canonical
+        // full label にならず `sender_workspace` も持たない record が恒久的に残る。
+        // bare fallback を許すのは、旧 journal record と pane 由来でない送信者
+        // (`human` / `system` / `--from` の外部送信元) だけ。
+        let sender_workspace = match registered_sender.as_ref() {
+            Some((pane_id, name, runtime)) => {
+                let backing = panes.iter().find(|pane| {
+                    pane.pane_id == *pane_id
+                        && pane_backs_registration(pane, Identity { name, runtime })
+                });
+                let Some(pane) = backing else {
+                    // snapshot は取り直さない。同期 tick が短時間で追いつくので、
+                    // その場で拒否して同期後の再送を求めるほうが単純で決定的。
+                    return Ok(Response::error(format!(
+                        "送信元 pane {pane_id} の登録 ({name}) と herdr の現在の状態が食い違うため送信できません。同期後に再送してください"
+                    )));
+                };
+                Some(pane.session.clone())
+            }
+            None => None,
+        };
         let brief_mode = if external_source.is_some() {
             BriefMode::External(0)
         } else if intent.no_reply() {
@@ -1717,11 +1741,16 @@ impl Broker {
             BriefMode::Normal
         };
         let brief = build_brief(addr, &from_agent, from_info, reply_info, &body, brief_mode);
+        // 呼び鈴の差出人は canonical full label。読み出し側
+        // (`Message::sender_full_label`) と同じ helper を通して組み立てる。
+        let from_agent_full = crate::state::full_label(sender_workspace.as_deref(), &from_agent);
         // 送信時点の identity を捕捉する。後からレジストリを引き直さない。
         // pane 由来でない送信者 (`human` / 外部 source) は name を runtime として扱う。
         let origin = registered_sender.map_or_else(
             || Origin::new("human", from_agent.clone(), from_agent.clone()),
-            |(pane, name, runtime)| Origin::new(pane, name, runtime),
+            |(pane, name, runtime)| {
+                Origin::new(pane, name, runtime).with_workspace(sender_workspace)
+            },
         );
         let dispatch = self.state.dispatch(
             &pane,
@@ -1731,11 +1760,11 @@ impl Broker {
             |id| {
                 if intent.no_reply() {
                     format!(
-                        "{skill_prefix}[agent-talk] {from_agent} から連絡が届きました。read_message {id} で本文を確認してください。返信は不要です。"
+                        "{skill_prefix}[agent-talk] {from_agent_full} から連絡が届きました。read_message {id} で本文を確認してください。返信は不要です。"
                     )
                 } else {
                     format!(
-                        "{skill_prefix}[agent-talk] {from_agent} から依頼が届きました。read_message {id} で本文を確認してから対応してください。"
+                        "{skill_prefix}[agent-talk] {from_agent_full} から依頼が届きました。read_message {id} で本文を確認してから対応してください。"
                     )
                 }
             },
@@ -1968,6 +1997,9 @@ impl Broker {
         };
         // 送信時点で捕捉した名前を返す。現在のレジストリを引き直さない。
         let from = stored.message.sender_label().to_owned();
+        // canonical full label (`<workspace>/<name>`)。旧 journal 由来など
+        // workspace 未捕捉の message は bare 名へ fallback する。
+        let from_full = stored.message.sender_full_label();
         // 返信先は、捕捉時と同じ identity で今も登録中の pane のときだけ。
         let reply_to = self.state.reply_target(&stored.message);
         let body = stored.message.brief.clone();
@@ -1977,6 +2009,7 @@ impl Broker {
                 "version": 1,
                 "id": id,
                 "from": from,
+                "from_full": from_full,
                 "reply_to": reply_to,
                 "body": body,
             })
@@ -2788,9 +2821,9 @@ mod tests {
 
     use super::{
         Broker, Event, HttpEvent, HttpRoute, Journal, MAX_BODY_BYTES, MailboxPageError, Request,
-        SendIntent, SendOptions, WebAgent, adopt_legacy_journal, capture_failure, classify_http,
-        decode_path_segment, installed_skills_for_runtime, parse_mailbox_page, parse_mailbox_query,
-        peer_uid_allowed, request_web_agents, rfc3339, static_response,
+        SendIntent, SendOptions, SendReport, WebAgent, adopt_legacy_journal, capture_failure,
+        classify_http, decode_path_segment, installed_skills_for_runtime, parse_mailbox_page,
+        parse_mailbox_query, peer_uid_allowed, request_web_agents, rfc3339, static_response,
     };
     use crate::{
         backend::Backend,
@@ -2820,6 +2853,15 @@ mod tests {
             tab_id: tab_id.into(),
             tab_label: label.map(str::to_owned),
             ..pane_info(pane_id, Some(agent))
+        }
+    }
+
+    /// workspace label 付きの pane。workspace ごとの sender identity を
+    /// 検証するために使う (`tabbed_pane` は workspace label を `test` に固定する)。
+    fn workspaced_pane(pane_id: &str, workspace: &str, tab_id: &str, label: &str) -> HerdrPane {
+        HerdrPane {
+            workspace_label: Some(workspace.into()),
+            ..tabbed_pane(pane_id, "claude", tab_id, Some(label))
         }
     }
 
@@ -3132,6 +3174,14 @@ mod tests {
         let stored = broker.state.messages.values().next().unwrap();
         assert_eq!(stored.message.sender, "human");
         assert_eq!(stored.message.sender_label(), "human");
+        // pane 由来でない送信者は workspace を捕捉しないので、呼び鈴も bare のまま。
+        assert_eq!(stored.message.sender_workspace, None);
+        assert_eq!(stored.message.sender_full_label(), "human");
+        assert!(
+            stored.message.bell.contains("human から依頼が届きました"),
+            "{}",
+            stored.message.bell
+        );
     }
 
     #[tokio::test]
@@ -4745,11 +4795,12 @@ mod tests {
             );
             let id = sent["id"].as_u64().unwrap();
             assert_eq!(sent["name"], "opus");
-            // 呼び鈴 (agent.prompt で配送されるテキスト) の sender 表記はタブ名。
+            // 呼び鈴 (agent.prompt で配送されるテキスト) の sender 表記は
+            // workspace label 付きのタブ名 (canonical full label)。
             let delivered = bells(&broker);
             assert!(
                 delivered.last().is_some_and(|(pane, bell)| {
-                    pane == "w1:p2" && bell.contains("fable から依頼が届きました")
+                    pane == "w1:p2" && bell.contains("test/fable から依頼が届きました")
                 }),
                 "{delivered:?}"
             );
@@ -4810,6 +4861,199 @@ mod tests {
             stored.message.brief
         );
         assert_eq!(stored.message.target_name, "opus");
+    }
+
+    /// 呼び鈴の差出人は canonical full label (`<workspace>/<name>`)。同名 (`intake`)
+    /// の agent が別 workspace に居ても呼び鈴で区別できる。`read_message` の
+    /// `from` は互換のため bare 名のままで、`from_full` が workspace 付きを返す。
+    #[tokio::test]
+    async fn bells_name_the_sender_with_its_workspace_qualified_label() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut broker = broker(
+            &dir,
+            vec![
+                workspaced_pane("w1:p1", "task", "w1:t1", "intake"),
+                workspaced_pane("w2:p1", "knowledge", "w2:t1", "intake"),
+                workspaced_pane("w3:p1", "ops", "w3:t1", "boss"),
+            ],
+        );
+        broker.sync_herdr_registry().await;
+
+        for (sender, expected_full) in [("w1:p1", "task/intake"), ("w2:p1", "knowledge/intake")] {
+            let sent = json(
+                &broker
+                    .handle(send_request(sender, "w3:p1", "question"))
+                    .await,
+            );
+            let id = sent["id"].as_u64().unwrap();
+            let delivered = bells(&broker);
+            assert!(
+                delivered.last().is_some_and(|(pane, bell)| {
+                    pane == "w3:p1"
+                        && bell.contains(&format!("{expected_full} から依頼が届きました"))
+                }),
+                "{delivered:?}"
+            );
+            let read = json(
+                &broker
+                    .handle(request("read-message", Some("w3:p1"), &[&id.to_string()]))
+                    .await,
+            );
+            assert_eq!(read["version"], 1, "additive な追加で版は上げない");
+            assert_eq!(read["from"], "intake", "既存の from は bare 名のまま");
+            assert_eq!(read["from_full"], expected_full);
+        }
+    }
+
+    /// 送信受理時点で捕捉した workspace は journal に載り、送信者が消えた後の
+    /// 再起動でも同じ identity を返す (live peer の再検索に依存しない)。
+    #[tokio::test]
+    async fn a_captured_sender_workspace_survives_restart_and_the_senders_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = {
+            let mut broker = broker(
+                &dir,
+                vec![
+                    workspaced_pane("w1:p1", "task", "w1:t1", "intake"),
+                    workspaced_pane("w3:p1", "ops", "w3:t1", "boss"),
+                ],
+            );
+            broker.sync_herdr_registry().await;
+            let sent = json(
+                &broker
+                    .handle(send_request("w1:p1", "w3:p1", "question"))
+                    .await,
+            );
+            let id = sent["id"].as_u64().unwrap();
+            let journal = std::fs::read_to_string(&broker.config.journal).unwrap();
+            assert!(
+                journal.lines().any(|line| {
+                    line.contains("\"type\":\"enqueue\"")
+                        && line.contains("\"sender_workspace\":\"task\"")
+                }),
+                "{journal}"
+            );
+            id
+        };
+
+        // 送信者 pane が消えた状態で daemon を再起動する。
+        let mut restarted = broker(&dir, vec![workspaced_pane("w3:p1", "ops", "w3:t1", "boss")]);
+        restarted.startup().await.unwrap();
+        let bell = restarted.state.message(id).unwrap().message.bell.clone();
+        assert!(bell.contains("task/intake から依頼が届きました"), "{bell}");
+        let read = json(
+            &restarted
+                .handle(request("read-message", Some("w3:p1"), &[&id.to_string()]))
+                .await,
+        );
+        assert_eq!(read["from"], "intake");
+        assert_eq!(read["from_full"], "task/intake");
+        assert_eq!(
+            read["reply_to"],
+            serde_json::Value::Null,
+            "退出した送信者へは返信先を出さない"
+        );
+    }
+
+    /// `sender_workspace` を持たない旧 journal の `Enqueue` は従来どおり読め、
+    /// `from` は従来値、`from_full` は bare fallback になる。cwd や現在の
+    /// peer 一覧から workspace を推測しない。
+    #[tokio::test]
+    async fn a_legacy_enqueue_without_a_sender_workspace_falls_back_to_the_bare_label() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("queue.journal"),
+            concat!(
+                r#"{"type":"register","pane":"w1:p1","name":"fable","runtime":"claude","state":"idle"}"#,
+                "\n",
+                r#"{"type":"register","pane":"w1:p2","name":"opus","runtime":"claude","state":"idle"}"#,
+                "\n",
+                r##"{"type":"enqueue","pane":"w1:p2","message":{"id":7,"sender":"w1:p1","sender_name":"fable","sender_runtime":"claude","brief":"# body\n","bell":"[agent-talk] fable から依頼が届きました。read_message 7 で本文を確認してから対応してください。","target_name":"opus","target_runtime":"claude"}}"##,
+                "\n",
+                r#"{"type":"complete","pane":"w1:p2","id":7}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let mut broker = broker(
+            &dir,
+            vec![
+                workspaced_pane("w1:p1", "task", "w1:t1", "fable"),
+                workspaced_pane("w1:p2", "task", "w1:t2", "opus"),
+            ],
+        );
+        broker.startup().await.unwrap();
+        let stored = broker.state.message(7).unwrap();
+        assert_eq!(stored.message.sender_workspace, None);
+        assert_eq!(stored.message.sender_full_label(), "fable");
+        assert!(
+            stored.message.bell.contains("fable から依頼が届きました")
+                && !stored.message.bell.contains("task/fable"),
+            "保存済みの呼び鈴は書き換えない: {}",
+            stored.message.bell
+        );
+        let read = json(
+            &broker
+                .handle(request("read-message", Some("w1:p2"), &["7"]))
+                .await,
+        );
+        assert_eq!(read["from"], "fable");
+        assert_eq!(read["from_full"], "fable", "workspace を推測しない");
+    }
+
+    /// 登録済み送信者なのに、`send` が引いた snapshot が登録 identity を裏付けない
+    /// 間の送信は受理しない。受理してしまうと、呼び鈴が canonical full label に
+    /// ならず `sender_workspace` も持たない record が恒久的に残る。journal・state・
+    /// 配達のどれも変えずに拒否し、同期後の再送を求める。
+    ///
+    /// `handle` 経由ではなく `send` を直接呼ぶ: `handle` は送信前に registry を
+    /// 同期し直すので、この race は **その同期が使った snapshot と `send` 自身が
+    /// 引く snapshot が別物** であることから生じる。snapshot を差し替えてから
+    /// `send` を呼ぶのが、その2枚目が食い違った状態そのものを再現する。
+    #[tokio::test]
+    async fn a_send_whose_sender_pane_no_longer_backs_its_registration_is_refused() {
+        for drifted in [
+            // tab rename (name が食い違う)。
+            workspaced_pane("w1:p1", "task", "w1:t1", "intake-renamed"),
+            // runtime 交代 (name は同じでも runtime が食い違う)。
+            HerdrPane {
+                agent: Some("codex".into()),
+                ..workspaced_pane("w1:p1", "task", "w1:t1", "intake")
+            },
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut broker = broker(
+                &dir,
+                vec![
+                    workspaced_pane("w1:p1", "task", "w1:t1", "intake"),
+                    workspaced_pane("w3:p1", "ops", "w3:t1", "boss"),
+                ],
+            );
+            broker.sync_herdr_registry().await;
+            // 再 sync せずに snapshot だけ差し替える (tick の合間の変化)。
+            set_herdr_panes(
+                &broker,
+                vec![drifted, workspaced_pane("w3:p1", "ops", "w3:t1", "boss")],
+            );
+
+            let response = broker
+                .send(send_request("w1:p1", "w3:p1", "question"), SendReport::Json)
+                .await
+                .unwrap();
+            assert_ne!(response.code, 0, "{response:?}");
+            assert!(
+                response.stderr.contains("再送"),
+                "同期後の再送を促す: {}",
+                response.stderr
+            );
+            assert!(broker.state.messages.is_empty(), "message を採番しない");
+            let journal = std::fs::read_to_string(&broker.config.journal).unwrap();
+            assert!(
+                !journal.contains("\"type\":\"enqueue\""),
+                "journal を変えない: {journal}"
+            );
+            assert!(bells(&broker).is_empty(), "呼び鈴を配達しない");
+        }
     }
 
     #[tokio::test]

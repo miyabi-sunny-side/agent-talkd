@@ -29,6 +29,16 @@ pub struct Identity<'a> {
     pub runtime: &'a str,
 }
 
+/// canonical full label (`<workspace>/<name>`) を組み立てる唯一の場所。
+/// workspace を捕捉できていない送信者は bare 名のまま。呼び鈴 (送信時) と
+/// `read_message` (読み出し時) が同じ規則で名乗るよう、両方ここを通す。
+pub fn full_label(workspace: Option<&str>, name: &str) -> String {
+    workspace.map_or_else(
+        || name.to_owned(),
+        |workspace| format!("{workspace}/{name}"),
+    )
+}
+
 /// 送信時点で捕捉した送信者 identity。
 ///
 /// **後からレジストリを引き直さない。** 送信者が退出・改名・pane ID 再利用されると
@@ -43,6 +53,10 @@ pub struct Origin {
     /// 送信時点の送信者 runtime。pane 由来でない送信者 (`human` / `system` /
     /// 外部 source) は name をそのまま使う。
     pub runtime: String,
+    /// 送信時点の送信者 workspace label。pane 由来でない送信者 (`human` /
+    /// `system` / 外部 source) は `None`。登録と pane 占有者が食い違う場合は
+    /// `Origin` を作らずに送信を拒否する。
+    pub workspace: Option<String>,
 }
 
 impl Origin {
@@ -55,7 +69,15 @@ impl Origin {
             pane: pane.into(),
             name: name.into(),
             runtime: runtime.into(),
+            workspace: None,
         }
+    }
+
+    /// 送信受理時点で捕捉した workspace label を載せる。
+    #[must_use]
+    pub fn with_workspace(mut self, workspace: Option<String>) -> Self {
+        self.workspace = workspace;
+        self
     }
 }
 
@@ -72,6 +94,10 @@ pub struct Message {
     /// して読む。旧 daemon は未知フィールドを黙って無視するため読み出し互換。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sender_runtime: Option<String>,
+    /// 送信受理時点で捕捉した送信者の workspace label。旧 journal には無いので
+    /// `None` を許す (`None` は「捕捉されていない」であって「workspace が無い」ではない)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_workspace: Option<String>,
     pub brief: String,
     pub bell: String,
     pub target_name: String,
@@ -84,6 +110,13 @@ impl Message {
     /// 表示用の送信者名。捕捉済みならそれを、旧 journal 由来なら生の sender を返す。
     pub fn sender_label(&self) -> &str {
         self.sender_name.as_deref().unwrap_or(&self.sender)
+    }
+
+    /// 表示用の canonical full label (`<workspace>/<name>`)。workspace を捕捉
+    /// できていない message (旧 journal 由来・`human` / `system` / 外部 source)
+    /// は bare 名へ fallback する。**読み出し時に workspace を推測しない。**
+    pub fn sender_full_label(&self) -> String {
+        full_label(self.sender_workspace.as_deref(), self.sender_label())
     }
 
     /// 送信時点で捕捉した送信者 identity。旧 journal 由来 (未捕捉) は `None`。
@@ -230,6 +263,7 @@ impl BrokerState {
             sender: origin.pane,
             sender_name: Some(origin.name),
             sender_runtime: Some(origin.runtime),
+            sender_workspace: origin.workspace,
             brief,
             bell: make_bell(id),
             target_name: expected_name.to_owned(),
@@ -707,6 +741,7 @@ mod tests {
             sender: "%2".into(),
             sender_name: None,
             sender_runtime: None,
+            sender_workspace: None,
             brief: "body".into(),
             bell: "read 1".into(),
             target_name: "claude".into(),

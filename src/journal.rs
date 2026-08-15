@@ -387,6 +387,7 @@ mod tests {
             sender: "%2".into(),
             sender_name: Some("codex".into()),
             sender_runtime: None,
+            sender_workspace: None,
             brief: brief.into(),
             bell: format!("read {id}"),
             target_name: "claude".into(),

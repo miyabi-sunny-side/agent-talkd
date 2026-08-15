@@ -255,6 +255,9 @@ journal（tmux socket名で命名）がちょうど1つ残っていて新名の 
   （name, runtime）の組を失わない。runtimeフィールドの無い旧recordは、name=
   runtime検出名だった時代の記録としてruntime=nameで読む（旧daemonは未知
   フィールドを黙って無視するため読み出し互換も保たれる）。
+- messageは送信時点のsender workspace label（`sender_workspace`）も持つ。
+  restart後・送信者の退出後も同じfull labelを返すため。フィールドの無い旧record
+  は`None`（＝未捕捉）のまま読み、workspaceを推測しない。
 - 本文は1MiBを上限とし、journalの無制限な単発肥大を防ぐ。
 
 単一イベントループにCLI要求とhealth tickを合流させることで、busy判定と
@@ -408,6 +411,37 @@ runtimeだけが交代した場合も`null`に当たります。
 表示用の名前と実際に配達へ使う宛先を別の規則で決めるのはこのためです。旧journal由来で
 `sender_name`を持たないmessageは、`from`が生のsender（pane IDや`human`などのラベル）に
 なり、`reply_to`は常に`null`になります。
+
+### 差出人はworkspace付きのfull labelで名乗る
+
+呼び鈴の差出人表記と`read_message`の`from_full`は、canonical full label
+（`<workspace>/<name>`）です。bare名だけでは、同じタブ名（`intake`など）の
+agentが複数のworkspaceに居るときに受け手が送信者を特定できません。
+
+workspace labelは**送信受理時点で捕捉して`Message::sender_workspace`へ永続化**します。
+捕捉するのは、送信者の登録（`state.agents`）とその時点のpane snapshotが
+`pane_backs_registration`で一致した場合だけです。registryとsnapshotの間でpaneの
+占有者が入れ替わっているときに、別人のworkspaceを差出人へ結合しないためです。
+
+登録済みの送信者（`state.agents`に居るpane）なのに一致するpaneがsnapshotに無い場合は、
+`dispatch`の前に**明示エラーで送信を拒否**します。workspace未捕捉のまま受理すると、
+新規に受理したagent messageなのに呼び鈴がcanonical full labelにならず、
+`sender_workspace`も持たないrecordが恒久的に残るためです。拒否はjournal・配達状態・
+呼び鈴のどれも変えません。宛先が入れ替わったときに送信を断る既存の契約と同じ扱いです。
+その場でsnapshotを取り直すことはしません。同期tickが短時間で追いつくので、拒否して
+同期後の再送を求めるほうが単純で決定的だからです。bare名へのfallbackを許すのは、
+`sender_workspace`を持たない旧journalのrecordと、pane由来でない送信者
+（`human` / `system` / `--from`の外部送信元）だけです。
+
+読み出し時にworkspaceを引き直さないのは`from`と同じ理由で、daemon再起動後・
+送信者の退出後も送信時と同じidentityを返すためです。`sender_workspace`を持たない
+旧journalのrecordは`None`のまま扱い、cwd・pane id・現在のpeer一覧からworkspaceを
+推測せず、`from_full`は`from`と同じbare名へfallbackします（保存済みの`bell`文字列も
+書き換えません）。`human` / `system` / 外部送信元（`--from`）はpane由来の送信者では
+ないので、同じくbare名のままです。
+
+`from_full`は`read_message`へのadditiveな追加で、`version`は1のまま、`from`（bare名）も
+不変です。旧adapterは未知フィールドを無視して従来どおり動きます。
 
 ### 応答の解釈を暗黙に劣化させない
 
