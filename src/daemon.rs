@@ -38,7 +38,7 @@ use crate::{
     protocol::{Request, Response, SendOptions},
     state::{
         Agent, AgentState, BrokerState, Dispatch, ExternalMailboxEvent, Identity, MailboxDirection,
-        Message, Origin,
+        Message, NON_PANE_SENDERS, Origin, SenderKind,
     },
 };
 
@@ -1642,7 +1642,7 @@ impl Broker {
                     "送信元 '{source}' は AGENT_TALK_ALLOWED_SOURCES で許可されていません"
                 )));
             }
-            if matches!(source, "human" | "system")
+            if NON_PANE_SENDERS.contains(&source)
                 || self.state.agents.values().any(|agent| agent.name == source)
             {
                 return Ok(Response::error(format!(
@@ -1733,6 +1733,13 @@ impl Broker {
             }
             None => None,
         };
+        // 呼び鈴と brief の文言を分ける軸。`--from` / `--skill` は登録 pane から
+        // 指定できない (`SendIntent::classify`) ので、この2つは排他になる。
+        let sender_kind = if registered_sender.is_some() {
+            SenderKind::Peer
+        } else {
+            SenderKind::Human
+        };
         let brief_mode = if external_source.is_some() {
             BriefMode::External(0)
         } else if intent.no_reply() {
@@ -1740,7 +1747,15 @@ impl Broker {
         } else {
             BriefMode::Normal
         };
-        let brief = build_brief(addr, &from_agent, from_info, reply_info, &body, brief_mode);
+        let brief = build_brief(
+            addr,
+            &from_agent,
+            from_info,
+            reply_info,
+            &body,
+            brief_mode,
+            sender_kind,
+        );
         // 呼び鈴の差出人は canonical full label。読み出し側
         // (`Message::sender_full_label`) と同じ helper を通して組み立てる。
         let from_agent_full = crate::state::full_label(sender_workspace.as_deref(), &from_agent);
@@ -1761,6 +1776,10 @@ impl Broker {
                 if intent.no_reply() {
                     format!(
                         "{skill_prefix}[agent-talk] {from_agent_full} から連絡が届きました。read_message {id} で本文を確認してください。返信は不要です。"
+                    )
+                } else if sender_kind == SenderKind::Peer {
+                    format!(
+                        "{skill_prefix}[agent-talk] {from_agent_full} から連絡が届きました。read_message {id} で本文を確認してください。"
                     )
                 } else {
                     format!(
@@ -1784,6 +1803,7 @@ impl Broker {
                             reply_info,
                             &body,
                             BriefMode::External(id),
+                            sender_kind,
                         ),
                     );
                 }
@@ -2399,13 +2419,13 @@ impl Broker {
                     body_budget -= original.brief.len();
                     let _ = write!(
                         failure_brief,
-                        "\n## 元の依頼 #{}\n{}\n",
+                        "\n## 元のメッセージ #{}\n{}\n",
                         original.id, original.brief
                     );
                 } else {
                     let _ = write!(
                         failure_brief,
-                        "\n## 元の依頼 #{}\n(本文 {} bytes は集約通知の上限を超えるため省略)\n",
+                        "\n## 元のメッセージ #{}\n(本文 {} bytes は集約通知の上限を超えるため省略)\n",
                         original.id,
                         original.brief.len()
                     );
@@ -2418,7 +2438,7 @@ impl Broker {
                 &expected,
                 |id| {
                     format!(
-                        "[agent-talk] 未受領のまま終了: message {listed} は受領報告されないまま{reason}ため回収されました。read_message {id} で元の依頼内容を確認してください。",
+                        "[agent-talk] 未受領のまま終了: message {listed} は受領報告されないまま{reason}ため回収されました。read_message {id} で元の本文を確認してください。",
                     )
                 },
             );
@@ -2757,6 +2777,7 @@ fn build_brief(
     reply_info: Option<&PaneInfo>,
     body: &str,
     mode: BriefMode,
+    sender: SenderKind,
 ) -> String {
     let origin = origin_info
         .map(|pane| format!(" (session: {}, pane: {})", pane.session, pane.pane_id))
@@ -2778,9 +2799,8 @@ fn build_brief(
             },
         ),
     };
-    format!(
-        "# agent-talk 依頼書\n- from: {from}{origin}\n- to: {addr}\n- reply: {reply}\n\n{body}\n"
-    )
+    let title = sender.brief_title();
+    format!("{title}\n- from: {from}{origin}\n- to: {addr}\n- reply: {reply}\n\n{body}\n")
 }
 
 fn init_logging(path: &Path, configured_level: &str) -> Result<()> {
@@ -3181,6 +3201,90 @@ mod tests {
             stored.message.bell.contains("human から依頼が届きました"),
             "{}",
             stored.message.bell
+        );
+    }
+
+    /// 呼び鈴と brief の文言は送信元で分かれる。登録 agent pane からの送信は
+    /// 「連絡」として提示し (peer message は user 権限を運ばないので作業指示に
+    /// しない)、未登録の human caller からの送信は「依頼」のまま維持する。
+    #[tokio::test]
+    async fn peer_sends_read_as_a_notice_while_human_sends_stay_a_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut broker = registered_pair(&dir).await;
+
+        // 登録 agent pane (w1:p1 = codex) からの送信。
+        let peer = json(&broker.handle(send_request("w1:p1", "claude", "body")).await);
+        let peer_id = peer["id"].as_u64().unwrap();
+        let peer_message = broker.state.message(peer_id).unwrap().message.clone();
+        assert_eq!(
+            peer_message.bell,
+            format!(
+                "[agent-talk] test/codex から連絡が届きました。read_message {peer_id} で本文を確認してください。"
+            )
+        );
+        assert!(
+            peer_message
+                .brief
+                .starts_with("# agent-talk 連絡\n- from: codex"),
+            "{}",
+            peer_message.brief
+        );
+
+        // 未登録の human caller からの送信。
+        let mut human = request("send", None, &["claude", "body"]);
+        human.pane = None;
+        let response = broker.handle(human).await;
+        assert_eq!(response.code, 0, "{}", response.stderr);
+        let human_message = broker
+            .state
+            .messages
+            .values()
+            .find(|stored| stored.message.sender == "human")
+            .expect("human caller の message")
+            .message
+            .clone();
+        assert!(
+            human_message
+                .bell
+                .contains("human から依頼が届きました。read_message"),
+            "{}",
+            human_message.bell
+        );
+        assert!(
+            human_message
+                .brief
+                .starts_with("# agent-talk 依頼書\n- from: human"),
+            "{}",
+            human_message.brief
+        );
+    }
+
+    /// `--no-reply` の呼び鈴は byte 単位で維持する (docs/design.md「既定の送信文言は
+    /// byte単位で維持し、no-reply時だけ『返信は不要』と明示する」)。
+    #[tokio::test]
+    async fn a_no_reply_peer_send_keeps_its_exact_bell() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut broker = registered_pair(&dir).await;
+        let mut oneway = send_request("w1:p1", "claude", "body");
+        oneway.send_options = Some(SendOptions {
+            no_reply: true,
+            ..SendOptions::default()
+        });
+        let sent = json(&broker.handle(oneway).await);
+        let id = sent["id"].as_u64().unwrap();
+        let message = broker.state.message(id).unwrap().message.clone();
+        assert_eq!(
+            message.bell,
+            format!(
+                "[agent-talk] test/codex から連絡が届きました。read_message {id} で本文を確認してください。返信は不要です。"
+            )
+        );
+        assert!(
+            message
+                .brief
+                .starts_with("# agent-talk 連絡\n- from: codex"),
+            "{}",
+            message.brief
         );
     }
 
@@ -3766,7 +3870,7 @@ mod tests {
         let brief = &to_codex[0].message.brief;
         for id in &from_codex {
             assert!(
-                brief.contains(&format!("## 元の依頼 #{id}")),
+                brief.contains(&format!("## 元のメッセージ #{id}")),
                 "回収された全 message の本文を含む: {brief}"
             );
         }
@@ -3783,7 +3887,7 @@ mod tests {
             .filter(|stored| stored.target_pane == "w1:p3")
             .collect();
         assert_eq!(to_cursor.len(), 1, "cursor への通知は独立に1通");
-        assert!(to_cursor[0].message.brief.contains("## 元の依頼 #"));
+        assert!(to_cursor[0].message.brief.contains("## 元のメッセージ #"));
 
         let new_bells: Vec<_> = bells(&broker)[before..].to_vec();
         assert_eq!(new_bells.len(), 2, "send-keys は送信元 pane ごとに1回だけ");
@@ -4774,7 +4878,7 @@ mod tests {
         assert_eq!(sent["to"], "w1:p2", "{sent}");
     }
 
-    /// 呼び鈴・依頼書・journal の from/to がタブ名 (fable / opus) に追随し、
+    /// 呼び鈴・brief・journal の from/to がタブ名 (fable / opus) に追随し、
     /// journal replay (restart) 後も保たれる。
     #[tokio::test]
     async fn bells_briefs_and_journal_carry_tab_names_for_custom_named_agents() {
@@ -4800,7 +4904,7 @@ mod tests {
             let delivered = bells(&broker);
             assert!(
                 delivered.last().is_some_and(|(pane, bell)| {
-                    pane == "w1:p2" && bell.contains("test/fable から依頼が届きました")
+                    pane == "w1:p2" && bell.contains("test/fable から連絡が届きました")
                 }),
                 "{delivered:?}"
             );
@@ -4808,7 +4912,7 @@ mod tests {
             let stored = broker.state.message(id).unwrap();
             assert_eq!(stored.message.sender_label(), "fable");
             assert_eq!(stored.message.target_name, "opus");
-            // 依頼書テンプレートの from/to header。
+            // brief テンプレートの from/to header。
             assert!(
                 stored.message.brief.contains("- from: fable"),
                 "{}",
@@ -4890,7 +4994,7 @@ mod tests {
             assert!(
                 delivered.last().is_some_and(|(pane, bell)| {
                     pane == "w3:p1"
-                        && bell.contains(&format!("{expected_full} から依頼が届きました"))
+                        && bell.contains(&format!("{expected_full} から連絡が届きました"))
                 }),
                 "{delivered:?}"
             );
@@ -4940,7 +5044,7 @@ mod tests {
         let mut restarted = broker(&dir, vec![workspaced_pane("w3:p1", "ops", "w3:t1", "boss")]);
         restarted.startup().await.unwrap();
         let bell = restarted.state.message(id).unwrap().message.bell.clone();
-        assert!(bell.contains("task/intake から依頼が届きました"), "{bell}");
+        assert!(bell.contains("task/intake から連絡が届きました"), "{bell}");
         let read = json(
             &restarted
                 .handle(request("read-message", Some("w3:p1"), &[&id.to_string()]))
@@ -5537,9 +5641,9 @@ mod tests {
             brief.len()
         );
         // 予算内の1通目は全文、超過する2通目は ID を残して本文を省略する。
-        assert!(brief.contains(&format!("## 元の依頼 #{}", ids[0])));
+        assert!(brief.contains(&format!("## 元のメッセージ #{}", ids[0])));
         assert!(brief.contains(&big));
-        assert!(brief.contains(&format!("## 元の依頼 #{}", ids[1])));
+        assert!(brief.contains(&format!("## 元のメッセージ #{}", ids[1])));
         assert!(
             brief.contains("集約通知の上限を超えるため省略"),
             "超過は明示的に省略と書く"

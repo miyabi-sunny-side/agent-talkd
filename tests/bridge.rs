@@ -354,7 +354,7 @@ fn one_daemon_serves_herdr_panes_and_mobile_over_tcp() {
     assert!(bell.contains("read_message"), "{bell:?}");
     // 差出人は canonical full label (`<workspace label>/<name>`)。
     assert!(
-        bell.contains("knowledge/claude から依頼が届きました"),
+        bell.contains("knowledge/claude から連絡が届きました"),
         "呼び鈴の差出人は workspace 付き: {bell:?}"
     );
     assert!(

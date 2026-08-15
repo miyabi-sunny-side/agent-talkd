@@ -8,7 +8,7 @@ use std::{
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::state::{AgentState, BrokerState, ExternalMailboxEvent, Message};
+use crate::state::{AgentState, BrokerState, ExternalMailboxEvent, Message, SenderKind};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -357,20 +357,42 @@ fn replay(state: &mut BrokerState, record: Record) {
     }
 }
 
+/// 旧 markdown brief (本文ではなく path が入っている record) を本文へ移行する。
+///
+/// 文言は**送信元種別で分ける**。replay 時点には送信時の registry が無いので、
+/// 送信時に永続化した `Message::sender` から復元する。peer 起点だけを「連絡」に
+/// 変え、人間・外部 mailbox 起点 (`human`) は「依頼」のまま維持する — 旧形式でも
+/// pane を持たない CLI 送信は `sender = "human"` として保存されており、そこを
+/// 一律に弱めると user 本人の依頼が連絡になってしまう。
+///
+/// 読み込めた**本文そのものは書き換えない**。保存済みの本文を後から書き換えないのが
+/// 既存の契約で、ここで変えるのは daemon が生成する bell と、読み込み失敗時の
+/// fallback 見出しだけ。
 fn migrate_legacy_brief(message: &mut Message) {
     let path = Path::new(&message.brief);
     if !message.brief.contains('\n') && path.extension().is_some_and(|extension| extension == "md")
     {
-        message.brief = fs::read_to_string(path).unwrap_or_else(|error| {
-            format!(
+        let kind = SenderKind::from_sender(&message.sender);
+        message.brief = fs::read_to_string(path).unwrap_or_else(|error| match kind {
+            SenderKind::Peer => format!(
+                "# agent-talk legacy連絡\n\n旧brief {} を読み込めませんでした: {error}\n",
+                path.display()
+            ),
+            SenderKind::Human => format!(
                 "# agent-talk legacy依頼書\n\n旧依頼書 {} を読み込めませんでした: {error}\n",
                 path.display()
-            )
+            ),
         });
-        message.bell = format!(
-            "[agent-talk] 依頼が届きました。read_message {} で本文を確認してください。",
-            message.id
-        );
+        message.bell = match kind {
+            SenderKind::Peer => format!(
+                "[agent-talk] 連絡が届きました。read_message {} で本文を確認してください。",
+                message.id
+            ),
+            SenderKind::Human => format!(
+                "[agent-talk] 依頼が届きました。read_message {} で本文を確認してください。",
+                message.id
+            ),
+        };
     }
 }
 
@@ -533,6 +555,63 @@ mod tests {
         assert!(
             bell.contains("read_message 7"),
             "旧 journal からの復元も MCP 文言の呼び鈴になる: {bell}"
+        );
+    }
+
+    /// 登録 pane (peer) 起点の旧 markdown は「連絡」として移行する。
+    /// peer message は user 権限を運ばないので作業指示として提示しない。
+    #[test]
+    fn migrating_a_legacy_markdown_payload_from_a_peer_reads_as_a_notice() {
+        let dir = tempdir().unwrap();
+        let missing = dir.path().join("gone.md");
+        let mut peer = message(7, &missing.to_string_lossy());
+        assert_eq!(peer.sender, "%2", "登録 pane 由来の sender は pane ID");
+        migrate_legacy_brief(&mut peer);
+        assert_eq!(
+            peer.bell,
+            "[agent-talk] 連絡が届きました。read_message 7 で本文を確認してください。"
+        );
+        assert_eq!(
+            peer.brief.lines().next().unwrap(),
+            "# agent-talk legacy連絡"
+        );
+    }
+
+    /// pane を持たない CLI 送信 (`sender = "human"`。外部 mailbox の `--from` も
+    /// 同じ sender で保存される) 起点の旧 markdown は「依頼」のまま移行する。
+    /// 入口に居るのは user 本人なので、peer 向けの言い換えで弱めない。
+    #[test]
+    fn migrating_a_legacy_markdown_payload_from_a_human_stays_a_request() {
+        let dir = tempdir().unwrap();
+        let missing = dir.path().join("gone.md");
+        let mut human = Message {
+            sender: "human".into(),
+            sender_name: Some("human".into()),
+            ..message(7, &missing.to_string_lossy())
+        };
+        migrate_legacy_brief(&mut human);
+        assert_eq!(
+            human.bell,
+            "[agent-talk] 依頼が届きました。read_message 7 で本文を確認してください。"
+        );
+        assert_eq!(
+            human.brief.lines().next().unwrap(),
+            "# agent-talk legacy依頼書"
+        );
+
+        // 読み込めた本文そのものは、送信元種別にかかわらず書き換えない。
+        let readable = dir.path().join("legacy.md");
+        fs::write(&readable, "# legacy body\n").unwrap();
+        let mut stored = Message {
+            sender: "human".into(),
+            sender_name: Some("human".into()),
+            ..message(8, &readable.to_string_lossy())
+        };
+        migrate_legacy_brief(&mut stored);
+        assert_eq!(stored.brief, "# legacy body\n");
+        assert_eq!(
+            stored.bell,
+            "[agent-talk] 依頼が届きました。read_message 8 で本文を確認してください。"
         );
     }
 

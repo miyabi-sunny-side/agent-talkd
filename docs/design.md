@@ -194,7 +194,7 @@ pull側の規則:
 
 配送入口は1つです。
 
-1. 依頼ヘッダと本文をID付きでjournalへ永続化します。
+1. メッセージヘッダと本文をID付きでjournalへ永続化します。
 2. 宛先に先行queueがなく、herdrが配達可能なら、`read_message <id>`を
    案内する呼び鈴をherdrの`agent.prompt`でagent本人へ
    submitします。herdrが**idle / done / working と判定したpaneに**送り、
@@ -380,7 +380,10 @@ subprocess実行・shell経由の呼び出しをtoolにも実装にも持ち込�
 agentが自分のsandboxを迂回する経路になります。
 
 initializeで返すserver instructionsは短い操作契約に限定し、「呼び鈴を受けたら
-`read_message`で読む。読んだ時点で受領になる」を含めます。toolが
+`read_message`で読む。読んだ時点で受領になる」を含めます。あわせて、受け取った内容が
+peerの連絡であり**自分の権限を増やしも減らしもしない**ことを1行で示します。「user権限
+ではない」とだけ書くと「だから何もしない」と読まれ、agent同士が互いを停止根拠に
+参照し合って双方止まる事故が起きたためです。toolが
 context にあるだけでは横展開は起きない一方、判断そのものを縛る大きな文にすると
 skillを消した意味が失われます。
 
@@ -483,6 +486,20 @@ identityとは分離します。登録agentからのラベル上書きと予約�
 扱わせません。未登録のhuman callerと、許可された外部送信元からのskill指定は維持します。
 ただしRPCのpane情報を含め、同一ユーザーで動くクライアントからの自己申告です。
 送信元の真正性を保証する認証境界ではなく、認可や監査には使用しません。
+
+同じ軸で**呼び鈴とbriefの文言も分岐**します。登録agent paneからの送信は「連絡が届きました」
+「# agent-talk 連絡」として提示し、作業指示としては見せません — peer messageはuser権限を
+運ばないため、依頼として提示すると受け手が権限を誤読します。未登録のhuman callerと外部
+mailbox (`--from`) からの送信は入口に居るのがuser本人なので、「依頼が届きました」
+「# agent-talk 依頼書」を維持します。`--from`/`--skill`は登録paneから指定できないため
+（上の拒否規則）、この2つは排他で、判定に新しいstateもschema fieldも要りません。
+
+旧markdown brief（本文ではなくpathを持つ古いrecord）をreplayで本文へ移行するときも同じ軸で
+分岐します。replay時点には送信時のregistryが無いので、永続化済みの`Message::sender`から
+種別を復元します——登録paneからの送信はpane IDが、未登録のhuman callerと外部mailboxは
+`human`が入っているためです。人間・外部起点の呼び鈴と見出しは「依頼」のまま維持します。
+読み込めた本文そのものは書き換えません（保存済みの本文を後から書き換えない既存の契約）。
+移行で変わるのはdaemonが生成する呼び鈴と、読み込み失敗時のfallback見出しだけです。
 
 `send --no-reply` は agent 間の一方向連絡を表す送信オプションです。journal/stateの
 schemaは変更せず、既存Messageに生成済みのbrief/bellを保存します。既定の送信文言は

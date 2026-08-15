@@ -130,7 +130,7 @@ fn fake_daemon(socket: &Path) -> mpsc::Receiver<Value> {
                 "{\"version\":1,\"id\":9,\"path\":\"sent\",\"to\":\"w1:p2\",\"name\":\"codex\"}\n",
             ),
             "read-message" => ok_response(
-                "{\"version\":1,\"id\":3,\"from\":\"codex\",\"reply_to\":\"w1:p2\",\"body\":\"# agent-talk 依頼書\\n本文\"}\n",
+                "{\"version\":1,\"id\":3,\"from\":\"codex\",\"reply_to\":\"w1:p2\",\"body\":\"# agent-talk 連絡\\n本文\"}\n",
             ),
             "ack-message" => ok_response("{\"version\":1,\"id\":3,\"outcome\":\"acked\"}\n"),
             _ => unknown_command(),

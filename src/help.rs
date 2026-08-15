@@ -67,11 +67,11 @@ pub const COMMANDS: &[CommandHelp] = &[
     },
     CommandHelp {
         command: "send",
-        text: "usage: agent-talk send [scope/]<name> [--from <source>] [--skill <name>] [--no-reply] [--] [message]\n\nagentへ依頼または一方向連絡を送信します。pane-id直指定 (w1:p2) も可。--from/--skill/--no-replyを指定できます。",
+        text: "usage: agent-talk send [scope/]<name> [--from <source>] [--skill <name>] [--no-reply] [--] [message]\n\nagentへ連絡を送信します (--no-replyで一方向)。pane-id直指定 (w1:p2) も可。--from/--skill/--no-replyを指定できます。",
     },
     CommandHelp {
         command: "read",
-        text: "usage: agent-talk read <id>\n\n現在のpane宛の依頼本文を確認します。",
+        text: "usage: agent-talk read <id>\n\n現在のpane宛の本文を確認します。",
     },
     CommandHelp {
         command: "send-message",
@@ -79,7 +79,7 @@ pub const COMMANDS: &[CommandHelp] = &[
     },
     CommandHelp {
         command: "read-message",
-        text: "usage: agent-talk read-message <id>\n\n依頼本文をJSONで返します (MCP adapter用)。配達未完了は拒否します。",
+        text: "usage: agent-talk read-message <id>\n\n本文をJSONで返します (MCP adapter用)。配達未完了は拒否します。",
     },
     CommandHelp {
         command: "ack-message",

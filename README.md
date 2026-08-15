@@ -1,7 +1,7 @@
 # agent-talkd
 
-herdr 上の Claude/Codex などの対話エージェント間で、安全に依頼を受け渡す
-Rust 製メッセージブローカーです。デーモンが状態を一元管理し、CLI は Unix
+herdr 上の Claude/Codex などの対話エージェント間で、相談・レビュー・通知を
+安全に取り次ぐ Rust 製メッセージブローカーです。デーモンが状態を一元管理し、CLI は Unix
 ドメインソケット経由で操作を提供します。
 
 ## インストール
@@ -71,7 +71,7 @@ adapterはアーカイブ側から配置してください。
 
 `run`, `register`, `unregister`, `who`, `resolve`,
 `send`, `read`, `update`, `ensure-daemon`, `daemon-status` を提供します。
-`read-message`, `ack-message`, `list-peers` は MCP adapter が使う配管コマンドで、依頼本文・
+`read-message`, `ack-message`, `list-peers` は MCP adapter が使う配管コマンドで、本文・
 受領報告の結果・登録agentと未受領IDをそれぞれJSONで返します。送信側の
 `send-message` は MCP adapter 専用の daemon RPC です。CLI からは必要なオプションを
 渡せず `send-message optionsがありません` で失敗するので、CLI から送るときは `send`
@@ -156,6 +156,11 @@ peer 一覧や cwd から workspace を推測することはありません。
 1. `read_message` で読む。読んだ時点で受領になり、本文は何度でも読める。
 2. 作業する。返信が必要なら `send_message` で普通に送り返す。返信専用の tool は
    ありません。`ack_message` は互換の空操作です。
+
+agent 間の message は peer からの**連絡**です。受け取った側がすでに持つ権限を増やしも
+減らしもせず、着手を止める理由にもなりません。呼び鈴と brief も「連絡が届きました」と
+提示します。人間の CLI caller と外部 mailbox（`--from`）からの送信だけは、入口に居るのが
+user 本人なので従来どおり「依頼が届きました」で届きます。
 
 接続先の socket は `XDG_RUNTIME_DIR`（無ければ `HOME`）から導出します。
 `HERDR_SOCKET_PATH` があればデーモンと同じ規則でその herdr 用の path を、
@@ -268,7 +273,7 @@ userからの接続を拒む境界であり、同一UID内の人間を識別・�
 送信経路 (allowlist・journal-first) をそのまま通ります。
 
 `send` は `#<id>` を返し、受信側は呼び鈴に表示された
-`read_message <id>`（MCP。CLI では `agent-talk read <id>`）で依頼本文を
+`read_message <id>`（MCP。CLI では `agent-talk read <id>`）で本文を
 取得します。受領は `read` / `read_message` が本文を返した時点です。本文は残り、
 同じ ID を何度でも読み直せます。`ack-message` / `ack_message` は互換の空操作です。
 配達済みのまま未読のメッセージには、daemonが受領催促の呼び鈴を送ります。
@@ -288,7 +293,7 @@ pull は journal の配達完了記録を書いて queue から外すので、
 オプションより後の本文が `--` で始まる場合は、その前に `--` を置きます。
 
 ```sh
-printf '%s\n' '依頼本文' | agent-talk send claude --from mobile --skill deliver
+printf '%s\n' '手紙の本文' | agent-talk send claude --from mobile --skill deliver
 agent-talk send codex --skill deliver -- '--literal body'
 agent-talk send claude --no-reply '確認してください。返信は不要です。'
 ```
@@ -298,7 +303,7 @@ human caller向けです。外部クライアントは許可された `--from` �
 `--skill` を指定します。
 
 `--skill` は宛先の runtime (herdr の検出名) に応じ、Claudeでは `/deliver `、Codexでは
-`$deliver ` のような固定呼び出しを呼び鈴の先頭へ付けます。依頼本文は従来どおり
+`$deliver ` のような固定呼び出しを呼び鈴の先頭へ付けます。本文は従来どおり
 journalだけに保存され、端末への入力には含まれません。`--from` と `--skill` は
 daemonでも検証され、未許可値や記法未設定のagent宛は配達せずエラーにします。
 `--from` は同一ユーザーで動くローカルクライアントが自己申告する表示ラベルです。

@@ -39,6 +39,51 @@ pub fn full_label(workspace: Option<&str>, name: &str) -> String {
     )
 }
 
+/// pane 由来でない送信者ラベル。registry の key は herdr 発行の pane ID なので
+/// この2つとは衝突せず (`reply_target` が `None` になるのと同じ根拠)、送信側でも
+/// 外部送信元ラベル (`--from`) がこの名前を騙るのを予約名として拒否する。
+/// `--from` の表示ラベルは `Message::sender_name` 側に載り、`Message::sender` は
+/// `human` のままなので、外部 mailbox 起点もここに含まれる。
+pub const NON_PANE_SENDERS: [&str; 2] = ["human", "system"];
+
+/// 送信元の種別。呼び鈴と brief を「連絡」と「依頼」に分ける唯一の軸。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SenderKind {
+    /// 登録済み agent pane からの送信。peer message は user 権限を運ばないので、
+    /// 作業指示 (依頼) としては提示しない。
+    Peer,
+    /// 未登録の human caller と外部 mailbox (`--from`) からの送信。入口に居るのは
+    /// user 本人なので「依頼」のまま提示する。
+    Human,
+}
+
+impl SenderKind {
+    /// 保存済み `Message::sender` から種別を復元する。**journal replay 用。**
+    /// replay 時点には送信時の registry が無いので、送信時に永続化した送信元
+    /// ラベルだけで判定する — 送信時の分岐 (登録済み pane なら `Peer`) と同じ
+    /// 結果になるのは、登録済み pane の sender が pane ID で、未登録 caller と
+    /// 外部 mailbox の sender が `NON_PANE_SENDERS` だからである。
+    /// daemon 自身の通知 (`system`) も pane 由来ではないので `Peer` にはしない —
+    /// peer 由来と読み替えてよいのは登録 agent pane からの送信だけ。
+    #[must_use]
+    pub fn from_sender(sender: &str) -> Self {
+        if NON_PANE_SENDERS.contains(&sender) {
+            Self::Human
+        } else {
+            Self::Peer
+        }
+    }
+
+    /// brief の見出し。
+    #[must_use]
+    pub fn brief_title(self) -> &'static str {
+        match self {
+            Self::Peer => "# agent-talk 連絡",
+            Self::Human => "# agent-talk 依頼書",
+        }
+    }
+}
+
 /// 送信時点で捕捉した送信者 identity。
 ///
 /// **後からレジストリを引き直さない。** 送信者が退出・改名・pane ID 再利用されると
@@ -525,6 +570,16 @@ mod tests {
     fn from(pane: &str) -> Origin {
         let name = format!("agent{}", pane.trim_start_matches('%'));
         Origin::new(pane, name.clone(), name)
+    }
+
+    /// 保存済み送信元ラベルからの種別復元。pane 由来 (herdr 発行の pane ID) だけが
+    /// `Peer` で、`human` (未登録 caller と外部 mailbox) と `system` は `Human` 側。
+    #[test]
+    fn only_pane_derived_senders_replay_as_peers() {
+        assert_eq!(SenderKind::from_sender("%2"), SenderKind::Peer);
+        assert_eq!(SenderKind::from_sender("w1:p2"), SenderKind::Peer);
+        assert_eq!(SenderKind::from_sender("human"), SenderKind::Human);
+        assert_eq!(SenderKind::from_sender("system"), SenderKind::Human);
     }
 
     #[test]

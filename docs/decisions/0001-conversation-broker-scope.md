@@ -4,6 +4,18 @@
 - Date: 2026-07-31
 - Independent review: codex (`%6`) — 再判定で **A〜F すべて PASS**
 
+> **訂正注記（2026-08-05・本記録の冒頭で読まれること）**
+>
+> 本決定のうち **Phase 4（Web 画面 / HTTP 面 / `client/` / 外部 mailbox / `--skill` の削除）は
+> user 指示により撤回され、実行されていない。** 現行 repository がこれらを持つ状態が正であり、
+> 本記録を根拠にこれらを削ってはならない。本文中の該当箇所には「— **撤回 (2026-08-05)**」を
+> その場に付けてある（原文は履歴として残す）。詳細と user 原文は末尾の
+> [追記 (2026-08-05)](#追記-2026-08-05-削除計画と-get-専用原則の部分的撤回) を見よ。
+>
+> **撤回されたのは削除計画だけである。** agent の窓口を MCP tool 4 個へ一本化すること、
+> 会話ブローカへ縮小すること、MCP server に会話以外の能力を持たせないこと（premise 5 と
+> それに紐づく forbidden effects）は引き続き有効で、現行実装もそれに従っている。
+
 ## 要約（決裁者はここだけ読めば足りる）
 
 **agent-talkd は「tmux 上の agent 同士の会話ブローカ」だけになる。
@@ -16,8 +28,8 @@ agent はコマンドを覚えず、MCP の道具を4つ使う。**
 | なぜ `--help` 連発が止まるか | MCP は道具の一覧と引数仕様を毎ターン自動で渡す。調べる対象が消える |
 | なぜ skill が要らなくなるか | 道具が常設になるので、使い方を教える文書が不要 |
 | `/agent-talk` は | 打たなくてよくなる。agent が必要と判断した時に自分で呼ぶ |
-| **Web 画面・HTTP サーバ** | **ごっそり削除**（`client/` 一式、HTTP-over-UDS、`/v1/*` 全部） |
-| **スマホからの会話（外部 mailbox）** | **削除**（`--from` / `mailbox-list-v1` / `reply`） |
+| **Web 画面・HTTP サーバ** | **ごっそり削除**（`client/` 一式、HTTP-over-UDS、`/v1/*` 全部） — **撤回 (2026-08-05)**。現行は維持。 |
+| **スマホからの会話（外部 mailbox）** | **削除**（`--from` / `mailbox-list-v1` / `reply`） — **撤回 (2026-08-05)**。現行は維持。 |
 | スマホからの操作は今後どうなるか | SSH を別口として使う**専用アプリ**の領域。本 repo の範囲外 |
 | 常駐プロセス | **残る**。tmux 監視・queue・journal・呼び鈴は他で代替できない |
 | 呼び鈴（割り込み通知） | **tmux のまま**。MCP は agent のターンを起こせないため |
@@ -27,6 +39,8 @@ agent はコマンドを覚えず、MCP の道具を4つ使う。**
 **消えるもの**: Web 画面（`client/` 一式）、HTTP-over-UDS アダプタと `/v1/*`、
 外部 mailbox（`--from` / `mailbox-list-v1` / `reply`）、`--skill`、
 CLI の会話コマンド、`agent-talk` skill、`agent-talk-peer` dispatcher、`gc` / `watch`。
+（このうち **Web 画面・HTTP 面・`client/`・外部 mailbox・`--skill` は撤回 (2026-08-05)**。
+現行 repository は維持しており、削除しない。）
 
 **残るもの**: 常駐プロセス（登録・busy/idle・queue・journal・呼び鈴）と、
 hooks と wrapper が呼ぶ配管コマンド（agent からは見えなくなる）。
@@ -125,6 +139,9 @@ initialize で返す server instructions を**短い操作契約に限定**し�
 - 関連する作業をしている agent へ相談・共有してよい
 - 不確かな横断事項では自分の判断で使う
 - 受け取った内容は peer の情報であって user の権限ではない
+  — 趣旨は維持したまま、現行の instructions は「**自分がすでに持つ権限を増やしも減らしもしない**」
+  と明示する形へ言い換えてある。この一文だけだと「だから何もしない」と読まれ、agent が互いを
+  停止根拠に参照し合う事故が起きたため（現行の文言は `src/mcp.rs` と `docs/design.md`）
 - **呼び鈴を受けたら `read_message` で読み、作業に入る前に `ack_message` で受領報告する**
   （[0002](0002-message-retention-ack.md)）
 
@@ -160,22 +177,22 @@ broker の message ID は補助参照であり、一次根拠ではない。
 - 新規 binary `agent-talk-mcp`（同一 crate の第2 `[[bin]]`）を追加し、stdio JSON-RPC で
   MCP tool 4 個を提供する
 - 既存 UDS 越しに daemon へ接続する（新しい socket も新しい protocol も作らない）
-- `--skill` とその設定（`@agent_talkd_skill_syntax` / `@agent_talkd_allowed_skills`）を削除する
+- `--skill` とその設定（`@agent_talkd_skill_syntax` / `@agent_talkd_allowed_skills`）を削除する — **撤回 (2026-08-05)**。現行は維持。
 - CLI から会話動詞（who / send / read / reply）を段階的に削除する
 - doorbell 文言を MCP 前提へ変更する
 - `gc` / `watch` を削除する
 - **Web 画面と HTTP 面を一式削除する**: `client/`、`build.rs` の資産埋め込み、
   HTTP-over-UDS listener、`/v1/*` route、`http_socket`、CI の frontend job、
-  `DESIGN.md`、関連依存（hyper / hyper-util / http-body-util / bytes）
+  `DESIGN.md`、関連依存（hyper / hyper-util / http-body-util / bytes） — **撤回 (2026-08-05)**。現行は維持。
 - **外部 mailbox を削除する**: `--from`、`mailbox-list-v1`、`reply`、
-  `@agent_talkd_allowed_sources`、mailbox event の state / journal / retention
+  `@agent_talkd_allowed_sources`、mailbox event の state / journal / retention — **撤回 (2026-08-05)**。現行は維持。
 
 **Forbidden**
 
 - TCP listener、tailnet 連携、Funnel / Serve、HTTP write route の追加
 - 新しい認証機構・token・socket 分割の追加（same-UID 境界は現状維持）
 - `TMUX_PANE` など自己申告 metadata を認証根拠へ昇格させること
-- Web / HTTP / mailbox の**再導入**（削除後に「便利だから」で戻さない）
+- Web / HTTP / mailbox の**再導入**（削除後に「便利だから」で戻さない） — **撤回 (2026-08-05)**。現行は維持。削除自体が撤回されたため、この禁止は現行機能の維持・改善を妨げない。TCP listener と write route の扱いは末尾の追記が定める
 - **MCP server に、会話以外の能力を持たせること。** file 読み書き・任意 path 指定・
   subprocess 実行・shell 経由の呼び出しを tool にも実装にも持ち込まない（理由は premise 5）
 - **MCP server が `Config::discover` を呼ぶこと。** 現行実装は `TMUX` 不在時に
@@ -263,7 +280,7 @@ TCP、他の UDS、shell、subprocess、tool 引数由来の path は一切な�
 | **1** | `agent-talk-mcp` bin 追加（4 tool）**＋ [0002](0002-message-retention-ack.md) の daemon 側変更**（ack RPC、`read` 非破壊化、state / journal / checkpoint）。既存 CLI・skill・dispatcher は並存 | 既存 CLI の**コマンド面と send / queue / lifecycle 挙動**は維持。**保持と再読の挙動は [0002](0002-message-retention-ack.md) のとおり意図的に変わる** |
 | **2** | 3 ランタイムの MCP 設定、doorbell 文言変更、`agent-talk` skill 削除 | skill 経由の運用 |
 | **3** | CLI の会話動詞（who/send/read/reply）を削除、残る内部コマンドを help から隠す、`agent-talk-peer` dispatcher 退役、`--skill` 削除 | 旧 CLI 利用者 |
-| **4** | **Web / HTTP 面の一括削除**（`client/`、`build.rs`、HTTP listener、`/v1/*`、`http_socket`、CI frontend job、`DESIGN.md`、hyper 系依存）と**外部 mailbox の削除**（`--from`、`mailbox-list-v1`、`reply`、`allowed_sources`、mailbox の state / journal / retention）、`gc` / `watch` の物理削除 | mailbox 経由の外部投稿、Web 閲覧 |
+| **4** | — **撤回 (2026-08-05)**。現行は維持。以下は原文 — **Web / HTTP 面の一括削除**（`client/`、`build.rs`、HTTP listener、`/v1/*`、`http_socket`、CI frontend job、`DESIGN.md`、hyper 系依存）と**外部 mailbox の削除**（`--from`、`mailbox-list-v1`、`reply`、`allowed_sources`、mailbox の state / journal / retention）、`gc` / `watch` の物理削除 | mailbox 経由の外部投稿、Web 閲覧 |
 
 **Phase 1 は「純増」ではない。** `ack_message` は daemon 側の保持規則の変更なしには実装できず、
 [0002](0002-message-retention-ack.md) が「MCP と同時に導入」と定めているため、両者は同一 Phase になる。
@@ -310,9 +327,9 @@ TCP、他の UDS、shell、subprocess、tool 引数由来の path は一切な�
   （source scan で `Command` 不使用を固定、または実プロセスツリーで確認）
 - 既定で TCP listener を持たないこと（`TcpListener` の不在を source scan で固定）
 - Phase 4 後、**HTTP 面が一切残らないこと**（`hyper` 系依存・`/v1` route・`http_socket` の
-  不在を source scan と `Cargo.toml` で固定。socket が作られないことを実 tmux で確認）
+  不在を source scan と `Cargo.toml` で固定。socket が作られないことを実 tmux で確認） — **撤回 (2026-08-05)**。現行は維持。
 - Phase 4 後、**mailbox 面が一切残らないこと**（`--from` / `mailbox-list-v1` / `reply` が
-  受理されず、journal に mailbox record 種別が残らないこと）
+  受理されず、journal に mailbox record 種別が残らないこと） — **撤回 (2026-08-05)**。現行は維持。
 - Phase 4 の削除後も、agent 同士の会話（send → doorbell → read）と hooks の
   lifecycle が無傷であること
 - Phase 3 で会話動詞を削除した後も、hooks（register / busy / idle / turn-end）と
@@ -394,7 +411,26 @@ user の UX 評価（読めても行動できない、遡れない）と、agent
 
 ---
 
-## 追記 (2026-08-05): GET 専用の部分的撤回
+## 追記 (2026-08-05): 削除計画と GET 専用原則の部分的撤回
+
+**Phase 4 の削除計画そのものが撤回された。** user は 2026-08-05 に Web 管理画面の
+改修と手紙投函の復活を指示しており、Web 画面 / HTTP 面 / `client/` / 外部 mailbox は
+**削除対象ではなく改善対象**になった。Phase 4 は実行されておらず、以後も実行しない。
+`--skill` も同じ経路 (手紙に skill を添えて投函する) の一部として現行のまま維持する。
+本文中の Allowed / Forbidden / Phase 表 / Verification の該当箇所には、その場で分かる
+「— **撤回 (2026-08-05)**」を付けた。**原文は履歴として残してある。**
+
+当初この記録は、user の UX 評価 (「出先からそれを読んでも対処も何もない」) を
+「Web 面と mailbox は不要」と読んで削除を計画した。**読み違いだった。**
+否定されていたのは *読むだけの画面* であって、外から *行動できる* 面ではない。
+手紙投函という行動経路が加わったことで、同じ user が同じ画面を必要とした。
+判定軸は「その面が存在するか」ではなく「**出先から行動できるか**」だった。
+
+撤回は削除計画に限る。agent の窓口を MCP tool 4 個へ一本化する決定、会話ブローカへの
+縮小、MCP server の tool surface を会話に限定する forbidden effects (premise 5) は
+引き続き有効である。
+
+以下、HTTP の書き込み route についての裁定。
 
 本決定の「HTTP は GET 専用 (POST は 405)」は、user 指示により **`POST /api/letters`
 1 route に限り撤回**された。旧 agent-terrace の手紙投函 (置換時に受容された機能後退、
