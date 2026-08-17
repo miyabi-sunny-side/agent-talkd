@@ -988,7 +988,9 @@ fn content_type(path: &str) -> &'static str {
         Some("css") => "text/css; charset=utf-8",
         Some("js") => "text/javascript; charset=utf-8",
         Some("svg") => "image/svg+xml",
+        Some("png") => "image/png",
         Some("json") => "application/json; charset=utf-8",
+        Some("webmanifest") => "application/manifest+json",
         _ => "text/html; charset=utf-8",
     }
 }

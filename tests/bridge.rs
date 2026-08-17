@@ -282,14 +282,19 @@ impl Harness {
     }
 
     fn http_get(&self, path: &str) -> String {
+        String::from_utf8_lossy(&self.http_get_bytes(path)).into_owned()
+    }
+
+    /// PNG のような非 UTF-8 の body も測れる生バイト版。
+    fn http_get_bytes(&self, path: &str) -> Vec<u8> {
         let mut stream = TcpStream::connect(("127.0.0.1", self.http_port)).unwrap();
         write!(
             stream,
             "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
         )
         .unwrap();
-        let mut response = String::new();
-        stream.read_to_string(&mut response).unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).unwrap();
         response
     }
 
@@ -344,6 +349,23 @@ fn wait_for(mut condition: impl FnMut() -> bool) {
         assert!(Instant::now() < deadline, "condition timed out");
         thread::sleep(Duration::from_millis(25));
     }
+}
+
+/// 生 HTTP response を「status line + header 部 (小文字化)」と body に割る。
+fn split_response(raw: &[u8]) -> (String, &[u8]) {
+    let terminator = raw
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .unwrap_or_else(|| {
+            panic!(
+                "header terminator missing from {:?}",
+                String::from_utf8_lossy(raw)
+            )
+        });
+    (
+        String::from_utf8_lossy(&raw[..terminator]).to_lowercase(),
+        &raw[terminator + 4..],
+    )
 }
 
 /// `sent -> ... : #N` / `queued (waiting) -> ... : #N` の末尾 ID。
@@ -684,6 +706,109 @@ fn a_done_pane_receives_the_bell_without_the_user_opening_its_tab() {
     let (target, bell) = harness.herdr.prompts().remove(0);
     assert_eq!(target, "w1:p1");
     assert!(bell.contains("read_message"), "{bell:?}");
+
+    let _ = harness.as_herdr_pane("w1:p2", &["internal-daemon-shutdown"]);
+}
+
+/// installable web app として成立しているかを配信結果で測る。
+///
+/// 未知 path は SPA entry へ fallback するので、status code だけ見ても資産の
+/// 欠落は 200 の HTML に埋もれる。manifest の Content-Type、manifest が列挙する
+/// icon の実体 (Content-Type と PNG signature)、SPA entry の manifest link まで
+/// 実測して初めて「ホーム画面に入るアプリ」の成立が確かめられる。
+#[test]
+#[ignore = "spawns a background daemon; run explicitly"]
+fn the_web_app_manifest_and_every_icon_it_lists_are_served_as_real_assets() {
+    let harness = Harness::start();
+    harness.ok(&harness.as_herdr_pane("w1:p2", &["register", "claude"]));
+    wait_for(|| harness.rpc_socket().exists());
+
+    let raw = harness.http_get_bytes("/manifest.webmanifest");
+    let (head, body) = split_response(&raw);
+    assert!(head.starts_with("http/1.1 200"), "{head}");
+    assert!(
+        head.contains("content-type: application/manifest+json"),
+        "manifest は SPA entry の HTML に化けてはならない: {head}"
+    );
+
+    let manifest: Value = serde_json::from_slice(body).unwrap_or_else(|error| {
+        panic!(
+            "manifest が JSON として読めない ({error}): {:?}",
+            String::from_utf8_lossy(body)
+        )
+    });
+    assert_eq!(manifest["start_url"], "/", "{manifest}");
+    assert_eq!(manifest["scope"], "/", "{manifest}");
+    assert_eq!(manifest["display"], "standalone", "{manifest}");
+    assert_eq!(manifest["theme_color"], "#171714", "{manifest}");
+    assert_eq!(manifest["background_color"], "#171714", "{manifest}");
+    assert!(
+        manifest["name"]
+            .as_str()
+            .is_some_and(|name| !name.is_empty()),
+        "{manifest}"
+    );
+    assert!(
+        manifest["short_name"]
+            .as_str()
+            .is_some_and(|name| !name.is_empty()),
+        "{manifest}"
+    );
+
+    let icons = manifest["icons"]
+        .as_array()
+        .unwrap_or_else(|| panic!("icons が配列でない: {manifest}"));
+    let listed: Vec<(&str, &str, &str)> = icons
+        .iter()
+        .map(|icon| {
+            (
+                icon["src"].as_str().unwrap_or_default(),
+                icon["sizes"].as_str().unwrap_or_default(),
+                icon["purpose"].as_str().unwrap_or("any"),
+            )
+        })
+        .collect();
+    let shape: Vec<(&str, &str)> = listed
+        .iter()
+        .map(|(_, sizes, purpose)| (*sizes, *purpose))
+        .collect();
+    assert_eq!(
+        shape,
+        vec![
+            ("192x192", "any"),
+            ("512x512", "any"),
+            ("512x512", "maskable"),
+        ],
+        "{manifest}"
+    );
+
+    // manifest が案内する先を1つずつ実際に取りに行く (path の決め打ちはしない)。
+    for (src, sizes, purpose) in listed {
+        let raw = harness.http_get_bytes(src);
+        let (head, body) = split_response(&raw);
+        assert!(
+            head.starts_with("http/1.1 200"),
+            "{src} ({sizes} {purpose}): {head}"
+        );
+        assert!(
+            head.contains("content-type: image/png"),
+            "{src} ({sizes} {purpose}) が PNG として配信されていない: {head}"
+        );
+        assert_eq!(
+            body.get(..8),
+            Some(b"\x89PNG\r\n\x1a\n".as_slice()),
+            "{src} ({sizes} {purpose}) の中身が PNG ではない: {:?}",
+            String::from_utf8_lossy(&body[..body.len().min(64)])
+        );
+    }
+
+    // ブラウザが manifest に辿り着く導線 (SPA entry の link) も配信されている。
+    let index = harness.http_get("/index.html");
+    assert!(index.starts_with("HTTP/1.1 200"), "{index}");
+    assert!(
+        index.contains(r#"rel="manifest""#),
+        "SPA entry に manifest link が無い: {index}"
+    );
 
     let _ = harness.as_herdr_pane("w1:p2", &["internal-daemon-shutdown"]);
 }

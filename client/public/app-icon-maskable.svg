@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="agent talk">
+  <rect width="512" height="512" fill="#171714"/>
+  <g transform="translate(256 256) scale(0.875) translate(-256 -256)">
+    <path d="M96 96 H288 V142 L148 148 V332 H102 Z" fill="#e9e4d8"/>
+    <path d="M416 416 H224 V370 L364 364 V180 H410 Z" fill="#d66f3d"/>
+  </g>
+</svg>

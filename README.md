@@ -273,6 +273,10 @@ TCP面の到達範囲はoperatorが所有するVPN/LAN境界で定め、process�
   明示的に拒否します (SPA entryへはfallbackさせません。200を返すと残存する旧
   updaterのhealth probeが旧APIを正常と誤認するためです)。
 - GET以外: `POST /api/letters` を除き `Allow` 付きの405を返します。
+- `GET /manifest.webmanifest`: web app manifest (`application/manifest+json`)。
+  スマホのブラウザからホーム画面へ追加すると、`/app-icon-*.png` のアイコンで
+  standalone表示のアプリとして起動します (service workerは持たないため、
+  オフライン動作はしません)。
 - その他のGET: 埋め込み静的ファイルを返し、未知の画面パスはSPA entryへfallbackします。
   静的ファイルを埋め込まずにビルドした場合はJSONの503を返します。
 
