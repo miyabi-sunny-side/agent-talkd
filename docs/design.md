@@ -401,6 +401,63 @@ peerの連絡であり**自分の権限を増やしも減らしもしない**こ
 context にあるだけでは横展開は起きない一方、判断そのものを縛る大きな文にすると
 skillを消した意味が失われます。
 
+### 宛先がClaude Codeなら組み込みchannelへ譲る
+
+Claude Codeはsessionごとに`$XDG_RUNTIME_DIR/cc-socks/<PID>.sock`を作り、組み込みの
+cross-session channelはこのpathを`uds:<path>`として宛先に取ります。daemonは
+`pane label → pane → そのpaneのagent PID → socket`の鎖を導出でき、宛先が引けたときは
+`send_message`を**配送せずに**拒否して組み込みchannelを案内します。二重の連絡経路を
+同時に生かすより、届く経路が1つに決まっているほうが受け手の呼び鈴が混ざりません。
+
+鎖の要はPIDの求め方です。**herdrが認定しているagent PIDとsocket名を完全一致させます。**
+`pane.process_info`（herdr 0.7.5 / protocol 17、params は`pane_id`、応答は
+`result.process_info.foreground_processes[]`）はpaneのforeground process groupだけを
+挙げるので、paneで動くagent本体は載り、そのagentがspawnした子agentは載りません。
+paneのruntime検出名（`claude`など）と`name`が一致するprocessのPIDだけを採り、その
+`<PID>.sock`が実在するときだけ宛先にします。**PIDから`/proc`の祖先を遡ってpaneを
+引く方法は使いません** — 祖先遡りは子agentのPIDも同じpaneに結び付けてしまい、主socketが
+無く子socketだけ残った場合に子へ誤誘導し、両方ある場合は有効な主socketを曖昧として
+捨てるためです。`/proc`の祖先遡り（`procid`）は、MCPの**呼び出し元**paneの同定という
+本来の用途にだけ残しています。
+
+導出の不変条件は次のとおりです。
+
+- **導出結果は永続化しない。** PIDは再利用され、socketはsessionと共に消えるため、
+  保存した対応表は黙って腐ります。`resolve --json`も`send_message`も毎回導出します。
+- 問い合わせるのは**解決が必要なpane 1つだけ**です。`resolve --json`の対象か、
+  `send_message`の宛先しか要らないので、pane一覧を舐めません。
+- 導出するのは**paneのlive runtimeが`claude`のときだけ**です。cc-socksはClaude Codeの
+  持ち物なので、codex等のpaneやruntime未検出のpaneで導出すると、そのpaneのPIDと
+  たまたま同名のstale socketを「そのagentの宛先」として案内してしまいます。
+  `resolve --json`も`send_message`も同じ規則で、非Claude paneは`pid`/`uds`が`null`です。
+- runtime名と一致するprocessが0個または2個以上なら**推測せず**、そのpaneの
+  `pid`/`uds`は`null`です。誤った宛先を案内するくらいなら案内しません。
+- **応答は要素まで厳密に読み、壊れた要素を捨てません。** 捨てると、主agentの要素だけ
+  PIDを落とした応答が「同名の子agentが1つだけ居るpane」に化け、子のPIDが一意の候補と
+  して採用されます。封筒の`type`が`pane_process_info`でない、要素がobjectでない、
+  `pid`が正のi32でない、`name`が文字列でない — 1つでも当たれば応答ごと失敗させます。
+- **追加RPCには期限があります。** `pane.process_info`にだけ答えないherdrで単一event
+  loopを止めないよう、health checkのtickと同じ2秒で諦めます。この問い合わせは宛先案内の
+  付加情報でしかなく、答えを待つ価値が配送の停止に見合いません。
+- **fail closed。** 宛先がClaude Codeでない、`pane.process_info`が失敗する、method自体が
+  未知（古いherdr）、申告されたpaneが要求と違う、応答が壊れている、期限内に答えない、
+  該当processが無い、socketが無い — いずれも
+  「udsは解決できなかった」として扱います。`resolve --json`は`pid`/`uds`が`null`、
+  `send_message`は従来どおり配送に倒れます。エラーで送信を止めません。
+- 誘導は「呼び出し元paneのlive runtimeが`claude`」「宛先paneのlive runtimeが`claude`」
+  「宛先の`uds`が解決できた」の3つが揃ったときだけです。1つでも欠ければ従来どおり
+  配送します（代替宛先を提示できないなら拒否しない）。
+- 拒否は**journalへのdurable writeより前**に置きます。誘導されたmessageはIDも本文も
+  永続化されず、`agent-talk read`にも呼び鈴にも残りません。
+- 対象はMCPの`send_message`経路だけです。CLIの`send` / `send-v2` / `reply`と、HTTP
+  経由の外部mailbox送信は宛先がClaude Codeでも変わらず配送します。CLIは人間が経路を
+  選んで叩くものなので、daemonが行き先を差し替える理由がありません。
+
+`resolve --json <addr>`は同じ導出をそのまま返す読み取り専用の面で、`{"version":1,
+"label":"<workspace>/<name>","pane":"w2E:pA","runtime":"claude","pid":1481334,
+"uds":"/run/user/1000/cc-socks/1481334.sock"}`の形です。`--json`を付けない
+`resolve`はpane idを平文1行で返す既存の挙動のままです。
+
 ### 未登録paneからの呼び出しは状態を見る前に拒否する
 
 `send-message` / `read-message` / `ack-message` / `list-peers`の4つは、呼び出し元paneが現在

@@ -207,6 +207,7 @@ mod tests {
             http_tcp: None,
             journal: PathBuf::new(),
             log: PathBuf::new(),
+            cc_socks: PathBuf::new(),
             queue_limit: 1,
             log_level: "info".into(),
             skill_syntax: BTreeMap::new(),

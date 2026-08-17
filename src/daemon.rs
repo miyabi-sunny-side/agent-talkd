@@ -38,7 +38,7 @@ use crate::{
     protocol::{Request, Response, SendOptions},
     state::{
         Agent, AgentState, BrokerState, Dispatch, ExternalMailboxEvent, Identity, MailboxDirection,
-        Message, NON_PANE_SENDERS, Origin, SenderKind,
+        Message, NON_PANE_SENDERS, Origin, SenderKind, full_label,
     },
 };
 
@@ -50,6 +50,16 @@ const NAG_AFTER: std::time::Duration = std::time::Duration::from_mins(1);
 
 /// 受領催促の再送間隔。連打で pane を荒らさないための下限。
 const NAG_COOLDOWN: std::time::Duration = std::time::Duration::from_mins(5);
+
+/// herdr が pane に検出する Claude Code の runtime 名。cc-socks を持つのは
+/// この runtime だけ。
+const CLAUDE_RUNTIME: &str = "claude";
+
+/// cc-socks 解決のための追加 RPC (`pane.process_info`) の期限。
+/// health check の tick (2 秒) と同じ桁に揃える — この lookup は宛先案内の
+/// 付加情報でしかないので、1 tick 以上 event loop を止めるくらいなら
+/// 「解決できなかった」に倒して従来配送へ進むほうが良い。
+const CROSS_SESSION_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// MCP adapter 経由の操作は、呼び出し元 pane が登録済み agent であることを要求する。
 /// 呼び出し元 pane id は routing metadata でしかないが、**未登録 pane を拒否する
@@ -171,6 +181,22 @@ impl SendReport {
             )),
         }
     }
+}
+
+/// `send` を呼んだ経路。組み込みの cross-session channel への誘導は MCP の
+/// 会話 RPC (`send_message`) だけで行う。CLI (`send` / `send-v2`) と HTTP 経由の
+/// 外部 mailbox は、宛先が Claude Code でも従来どおり配送する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendChannel {
+    Mcp,
+    Other,
+}
+
+/// herdr がその pane に **今** 検出している runtime 名。未検出は `None` —
+/// 実在しうる runtime 名と衝突する sentinel 文字列は置かない。
+fn live_runtime(pane: Option<&PaneInfo>) -> Option<&str> {
+    pane.and_then(|pane| pane.agent.as_deref())
+        .filter(|runtime| !runtime.is_empty())
 }
 
 /// `read` / `ack` から見たメッセージの状態。
@@ -1098,7 +1124,7 @@ impl Broker {
             peer_pid: None,
         };
         let response = self
-            .send(request, SendReport::Json)
+            .send(request, SendReport::Json, SendChannel::Other)
             .await
             .map_err(|_| WebError::new(StatusCode::INTERNAL_SERVER_ERROR, "letter_failed"))?;
         if response.code == 0 {
@@ -1203,12 +1229,16 @@ impl Broker {
             "unregister" => Ok(Self::unregister(&request)),
             "who" => self.who(&request).await,
             "resolve" => self.resolve_command(request).await,
-            "send" if request.send_options.is_none() => self.send(request, SendReport::Text).await,
+            "send" if request.send_options.is_none() => {
+                self.send(request, SendReport::Text, SendChannel::Other)
+                    .await
+            }
             "send" => Ok(Response::error(
                 "send optionsにはsend-v2 protocolが必要です",
             )),
             "send-v2" if request.send_options.is_some() => {
-                self.send(request, SendReport::Text).await
+                self.send(request, SendReport::Text, SendChannel::Other)
+                    .await
             }
             "send-v2" => Ok(Response::error("send-v2 optionsがありません")),
             "read" => Ok(self.read(&request)),
@@ -1220,7 +1250,7 @@ impl Broker {
                 Ok(Response::error(UNREGISTERED_CALLER))
             }
             "send-message" if request.send_options.is_some() => {
-                self.send(request, SendReport::Json).await
+                self.send(request, SendReport::Json, SendChannel::Mcp).await
             }
             "send-message" => Ok(Response::error("send-message optionsがありません")),
             "read-message" => Ok(self.read_json(&request)),
@@ -1585,18 +1615,82 @@ impl Broker {
         Ok(Response::ok(output))
     }
 
+    /// 宛先解決。`--json` を付けると、pane に加えて組み込みの cross-session
+    /// channel が宛先に取る `uds` まで返す。**`--json` 無しの出力 (pane id を
+    /// 平文 1 行) は互換のため変えない。**
     async fn resolve_command(&self, request: Request) -> Result<Response> {
-        let Some(addr) = request.args.first() else {
+        // `--json` は位置に依らず option として扱う (addr は最初の非 option 引数)。
+        let json = request.args.iter().any(|arg| arg == "--json");
+        let Some(addr) = request.args.iter().find(|arg| *arg != "--json") else {
             return Ok(Response::error(help::usage("resolve")));
         };
-        match self.resolve(addr, request.pane.as_deref()).await {
-            Ok((pane, _)) => Ok(Response::ok(format!("{pane}\n"))),
-            Err(response) => Ok(response),
+        let (pane, name) = match self.resolve(addr, request.pane.as_deref()).await {
+            Ok(hit) => hit,
+            Err(response) => return Ok(response),
+        };
+        if !json {
+            return Ok(Response::ok(format!("{pane}\n")));
         }
+        let panes = self.backend.panes().await?;
+        let info = panes.iter().find(|candidate| candidate.pane_id == pane);
+        let runtime = live_runtime(info);
+        let socket = self.cross_session_socket(&pane, runtime).await;
+        Ok(Response::ok(format!(
+            "{}\n",
+            serde_json::json!({
+                "version": 1,
+                "label": full_label(info.map(|pane| pane.session.as_str()), &name),
+                "pane": pane,
+                "runtime": runtime,
+                "pid": socket.as_ref().map(|socket| socket.pid),
+                "uds": socket.as_ref().map(|socket| socket.uds.display().to_string()),
+            })
+        )))
+    }
+
+    /// 宛先 pane → その pane の agent が持つ Claude Code の cross-session socket。
+    ///
+    /// **cc-socks は Claude Code だけの持ち物** なので、herdr がその pane に
+    /// **今** 検出している runtime が `claude` のときしか導出しない。codex 等の
+    /// pane や runtime 未検出の pane で導出すると、その pane の PID と同名の
+    /// stale socket を「その agent の宛先」として案内してしまう。
+    ///
+    /// **永続化せず毎回導出する** — PID は再利用され、socket は session と共に
+    /// 消えるので、保存した対応表は黙って腐る。herdr に **その pane 1 つだけ**
+    /// `pane.process_info` を問い合わせ、pane に検出されている runtime と同名の
+    /// foreground process の PID に一致する socket だけを採用する。
+    ///
+    /// fail closed: 宛先が Claude Code でない、herdr が答えられない (古い herdr の
+    /// 未知 method・pane 消滅・応答の破損・`CROSS_SESSION_LOOKUP_TIMEOUT` 超過を
+    /// 含む)、同名 process が 0 件か複数、socket が実在しない — いずれも `None`。
+    /// 推測で別の socket を案内しない。
+    async fn cross_session_socket(
+        &self,
+        pane: &str,
+        runtime: Option<&str>,
+    ) -> Option<crate::ccsock::PaneSocket> {
+        if runtime != Some(CLAUDE_RUNTIME) {
+            return None;
+        }
+        // この追加 RPC は宛先案内の付加情報でしかない。答えない herdr に
+        // 単一 event loop を明け渡さないよう、期限を切って諦める。
+        let processes = tokio::time::timeout(
+            CROSS_SESSION_LOOKUP_TIMEOUT,
+            self.backend.foreground_processes(pane),
+        )
+        .await
+        .ok()?
+        .ok()?;
+        crate::ccsock::agent_socket(&self.config.cc_socks, &processes, CLAUDE_RUNTIME)
     }
 
     #[allow(clippy::too_many_lines)]
-    async fn send(&mut self, request: Request, report: SendReport) -> Result<Response> {
+    async fn send(
+        &mut self,
+        request: Request,
+        report: SendReport,
+        channel: SendChannel,
+    ) -> Result<Response> {
         let Some(addr) = request.args.first() else {
             return Ok(Response::error(help::usage(report.usage_command())));
         };
@@ -1703,6 +1797,22 @@ impl Broker {
             .pane
             .as_deref()
             .and_then(|id| panes.iter().find(|p| p.pane_id == id));
+        // 送信側も宛先も live で Claude Code、かつ宛先 pane の agent PID から
+        // cc-socks が引けるなら、組み込みの cross-session channel のほうが直接
+        // 届く。**配送も永続化もせずに** 宛先だけ案内する — この判定は journal
+        // への durable write より前 (`state.dispatch` にも入らない) なので、
+        // 拒否した message は 1件も残らない。代替宛先を出せないとき (どれか1つ
+        // でも欠けるとき) は従来どおり配送する。
+        let to_runtime = live_runtime(panes.iter().find(|p| p.pane_id == pane));
+        if channel == SendChannel::Mcp
+            && live_runtime(from_info) == Some(CLAUDE_RUNTIME)
+            && let Some(socket) = self.cross_session_socket(&pane, to_runtime).await
+        {
+            return Ok(Response::error(format!(
+                "宛先 {expected} ({pane}) は Claude Code なので、組み込みの cross-session channel (ListAgents / SendMessage) で送ってください。宛先は uds:{} です。組み込み channel が使えないときは CLI の `agent-talk send {addr}` を使ってください",
+                socket.uds.display()
+            )));
+        }
         let from_agent = registered_sender
             .as_ref()
             .map(|(_, name, _)| name.clone())
@@ -2089,7 +2199,7 @@ impl Broker {
                     // 使うのは、登録時点の `agent.runtime` が stale になりうるため。
                     // 未検出は `null` — 実在しうる runtime 名と衝突する sentinel
                     // 文字列は置かない。
-                    "runtime": pane.agent.as_deref().filter(|runtime| !runtime.is_empty()),
+                    "runtime": live_runtime(Some(pane)),
                     "state": display_state(pane.status),
                     "location": format!("{}:{}.{}", pane.session, pane.window_index, pane.pane_index),
                     "pane": pane.pane_id,
@@ -2837,7 +2947,10 @@ fn init_logging(path: &Path, configured_level: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, path::PathBuf};
+    use std::{
+        collections::BTreeMap,
+        path::{Path, PathBuf},
+    };
 
     use hyper::{
         Method, StatusCode,
@@ -2847,9 +2960,10 @@ mod tests {
 
     use super::{
         Broker, Event, HttpEvent, HttpRoute, Journal, MAX_BODY_BYTES, MailboxPageError, Request,
-        SendIntent, SendOptions, SendReport, WebAgent, adopt_legacy_journal, capture_failure,
-        classify_http, decode_path_segment, installed_skills_for_runtime, parse_mailbox_page,
-        parse_mailbox_query, peer_uid_allowed, request_web_agents, rfc3339, static_response,
+        SendChannel, SendIntent, SendOptions, SendReport, WebAgent, adopt_legacy_journal,
+        capture_failure, classify_http, decode_path_segment, installed_skills_for_runtime,
+        parse_mailbox_page, parse_mailbox_query, peer_uid_allowed, request_web_agents, rfc3339,
+        static_response,
     };
     use crate::{
         backend::Backend,
@@ -2908,6 +3022,7 @@ mod tests {
                 http_tcp: None,
                 journal: journal_path,
                 log: PathBuf::new(),
+                cc_socks: PathBuf::new(),
                 queue_limit: 1000,
                 log_level: "info".into(),
                 skill_syntax: BTreeMap::new(),
@@ -2953,6 +3068,7 @@ mod tests {
                     http_tcp: None,
                     journal: journal_path,
                     log: PathBuf::new(),
+                    cc_socks: PathBuf::new(),
                     queue_limit: 1000,
                     log_level: "info".into(),
                     skill_syntax: BTreeMap::new(),
@@ -3068,6 +3184,407 @@ mod tests {
         let sent = json(&broker.handle(send_request("w1:p2", weird, "hello")).await);
         assert_eq!(sent["path"], "sent");
         assert_eq!(sent["to"], weird);
+    }
+
+    /// cc-socks の探索先を tempdir に閉じ込める。agent PID は scripted herdr が
+    /// 申告するので、実 `/proc` にも実 `$XDG_RUNTIME_DIR` にも触らない。
+    fn cc_socks_dir(dir: &TempDir) -> PathBuf {
+        let root = dir.path().join("cc-socks");
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn bind_cc_socket(root: &Path, pid: i32) -> (PathBuf, std::os::unix::net::UnixListener) {
+        let path = root.join(format!("{pid}.sock"));
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        (path, listener)
+    }
+
+    fn process(pid: i32, name: &str) -> crate::herdr::ForegroundProcess {
+        crate::herdr::ForegroundProcess {
+            pid,
+            name: name.to_owned(),
+        }
+    }
+
+    /// 主 agent と子 agent の区別。herdr は pane の agent として **主 agent の
+    /// PID だけ** を申告する。子 agent (同じ pane から派生した別の claude
+    /// process) の socket が cc-socks に並んでいても、
+    ///
+    /// - 主 agent の socket があるならそれを選ぶ (曖昧として捨てない)
+    /// - 主 agent の socket が無く子の socket だけなら解決不能 (子へ誘導しない)
+    #[tokio::test]
+    async fn the_cross_session_socket_matches_the_agent_pid_herdr_reports_not_a_child_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut broker = registered_pair(&dir).await;
+        let root = cc_socks_dir(&dir);
+        broker.config.cc_socks = root.clone();
+        // herdr の申告: この pane の agent は 4242。4243 (子 agent) は載らない。
+        broker.backend.herdr().script_processes(
+            "w1:p2",
+            &[process(4242, "claude"), process(4300, "agent-talk-mcp")],
+        );
+
+        let (main_uds, main_listener) = bind_cc_socket(&root, 4242);
+        let (child_uds, _child_listener) = bind_cc_socket(&root, 4243);
+        let both = json(
+            &broker
+                .handle(request("resolve", Some("w1:p1"), &["--json", "claude"]))
+                .await,
+        );
+        assert_eq!(both["pid"], 4242, "主 agent の PID を選ぶ: {both}");
+        assert_eq!(both["uds"], main_uds.to_str().unwrap(), "{both}");
+
+        // 主 socket が消え、子の socket だけが残った状態。
+        drop(main_listener);
+        std::fs::remove_file(&main_uds).unwrap();
+        assert!(child_uds.exists(), "子の socket は残っている");
+        let orphan = json(
+            &broker
+                .handle(request("resolve", Some("w1:p1"), &["--json", "claude"]))
+                .await,
+        );
+        assert!(orphan["pid"].is_null(), "子 agent へ誘導しない: {orphan}");
+        assert!(orphan["uds"].is_null(), "{orphan}");
+        assert_eq!(orphan["pane"], "w1:p2", "pane と label は返る");
+    }
+
+    /// MCP 送信の誘導も同じ規則で決まる。子 agent の socket しか無い pane へは
+    /// 誘導せず、従来どおり配送する。
+    #[tokio::test]
+    async fn mcp_send_never_hands_off_to_a_child_agent_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut broker = broker(
+            &dir,
+            vec![
+                tabbed_pane("w1:p1", "claude", "w1:t1", Some("fable")),
+                tabbed_pane("w1:p2", "claude", "w1:t2", Some("opus")),
+            ],
+        );
+        broker.sync_herdr_registry().await;
+        let root = cc_socks_dir(&dir);
+        broker.config.cc_socks = root.clone();
+        broker
+            .backend
+            .herdr()
+            .script_processes("w1:p2", &[process(4242, "claude")]);
+        // 子 agent の socket だけがある。
+        let (_child_uds, _child_listener) = bind_cc_socket(&root, 4243);
+
+        let sent = broker
+            .handle(send_request("w1:p1", "opus", "delivered"))
+            .await;
+        assert_eq!(sent.code, 0, "{}", sent.stderr);
+        assert_eq!(json(&sent)["path"], "sent");
+
+        // 主 agent の socket が現れたら誘導へ切り替わる。
+        let (main_uds, _main_listener) = bind_cc_socket(&root, 4242);
+        let refused = broker
+            .handle(send_request("w1:p1", "opus", "handed off"))
+            .await;
+        assert_eq!(refused.code, 1, "{refused:?}");
+        assert!(
+            refused
+                .stderr
+                .contains(&format!("uds:{}", main_uds.display())),
+            "{}",
+            refused.stderr
+        );
+    }
+
+    /// `resolve --json` は宛先の label / pane / runtime と、組み込み
+    /// cross-session channel の宛先になる cc-socks を返す。
+    /// `--json` の無い既存の `resolve` は平文 1 行のまま。
+    #[tokio::test]
+    async fn resolve_json_reports_the_target_pane_with_its_cross_session_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut broker = registered_pair(&dir).await;
+        let root = cc_socks_dir(&dir);
+        broker.config.cc_socks = root.clone();
+        let (uds, _listener) = bind_cc_socket(&root, 4242);
+        broker
+            .backend
+            .herdr()
+            .script_processes("w1:p2", &[process(4242, "claude")]);
+
+        let response = broker
+            .handle(request("resolve", Some("w1:p1"), &["--json", "claude"]))
+            .await;
+        assert_eq!(response.code, 0, "{}", response.stderr);
+        let value = json(&response);
+        assert_eq!(value["version"], 1);
+        assert_eq!(value["label"], "test/claude");
+        assert_eq!(value["pane"], "w1:p2");
+        assert_eq!(value["runtime"], "claude");
+        assert_eq!(value["pid"], 4242);
+        assert_eq!(value["uds"], uds.to_str().unwrap());
+
+        // 既存の平文の挙動は変えない。
+        let plain = broker
+            .handle(request("resolve", Some("w1:p1"), &["claude"]))
+            .await;
+        assert_eq!(plain.stdout, "w1:p2\n");
+        assert!(plain.stderr.is_empty());
+
+        // herdr が同名の foreground process を 2 つ申告したら推測しない。
+        let (_second, _listener2) = bind_cc_socket(&root, 4243);
+        broker
+            .backend
+            .herdr()
+            .script_processes("w1:p2", &[process(4242, "claude"), process(4243, "claude")]);
+        let ambiguous = json(
+            &broker
+                .handle(request("resolve", Some("w1:p1"), &["--json", "claude"]))
+                .await,
+        );
+        assert!(ambiguous["pid"].is_null(), "{ambiguous}");
+        assert!(ambiguous["uds"].is_null(), "{ambiguous}");
+        assert_eq!(ambiguous["pane"], "w1:p2", "pane と label は返る");
+        assert_eq!(ambiguous["label"], "test/claude");
+
+        // herdr が process_info に答えられない (古い herdr の未知 method・pane
+        // 消滅) 場合も、socket を推測せず null に倒す。
+        broker.backend.herdr().script_processes("w1:pX", &[]);
+        broker.backend.herdr().clear_processes("w1:p2");
+        let blind = json(
+            &broker
+                .handle(request("resolve", Some("w1:p1"), &["--json", "claude"]))
+                .await,
+        );
+        assert!(blind["pid"].is_null(), "{blind}");
+        assert!(blind["uds"].is_null(), "{blind}");
+        assert_eq!(blind["runtime"], "claude", "runtime は herdr の検出のまま");
+    }
+
+    /// MCP の `send_message` は、送信側と宛先の両方が live で claude、かつ宛先の
+    /// cc-socks が一意に引けるときだけ配送せずに組み込み channel へ誘導する。
+    /// **拒否は journal への durable write より前**で、message は 1 件も残らない。
+    #[tokio::test]
+    async fn mcp_send_defers_to_the_built_in_channel_only_between_resolvable_claude_panes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut broker = broker(
+            &dir,
+            vec![
+                tabbed_pane("w1:p1", "claude", "w1:t1", Some("fable")),
+                tabbed_pane("w1:p2", "claude", "w1:t2", Some("opus")),
+                tabbed_pane("w1:p3", "codex", "w1:t3", Some("codex")),
+            ],
+        );
+        broker.sync_herdr_registry().await;
+        let root = cc_socks_dir(&dir);
+        broker.config.cc_socks = root.clone();
+        let (uds, _listener) = bind_cc_socket(&root, 4242);
+        broker
+            .backend
+            .herdr()
+            .script_processes("w1:p2", &[process(4242, "claude")]);
+
+        let refused = broker
+            .handle(send_request("w1:p1", "opus", "peer message"))
+            .await;
+        assert_eq!(refused.code, 1, "{refused:?}");
+        for expected in [
+            "cross-session",
+            &format!("uds:{}", uds.display()),
+            "agent-talk send",
+        ] {
+            assert!(refused.stderr.contains(expected), "{}", refused.stderr);
+        }
+        let journal = std::fs::read_to_string(&broker.config.journal).unwrap();
+        assert!(
+            !journal.contains("peer message") && !journal.contains("\"type\":\"enqueue\""),
+            "拒否は journal write より前: {journal}"
+        );
+        assert!(
+            broker.state.messages.is_empty(),
+            "拒否は message を1件も作らない: {:?}",
+            broker.state.messages
+        );
+        assert!(broker.state.pending_to_me("w1:p2").is_empty());
+
+        // 送信側が claude でない / 宛先が claude でない / socket が引けない、の
+        // どれか1つでも欠ければ従来どおり配送する。
+        for (from, to) in [("w1:p3", "opus"), ("w1:p1", "codex")] {
+            let sent = broker.handle(send_request(from, to, "delivered")).await;
+            assert_eq!(sent.code, 0, "{from} -> {to}: {}", sent.stderr);
+            assert_eq!(json(&sent)["path"], "sent");
+        }
+        broker.backend.herdr().clear_processes("w1:p2");
+        let sent = broker
+            .handle(send_request("w1:p1", "opus", "no socket"))
+            .await;
+        assert_eq!(sent.code, 0, "{}", sent.stderr);
+        assert_eq!(json(&sent)["path"], "sent");
+
+        // CLI 経路 (send / send-v2) は誘導しない。
+        broker
+            .backend
+            .herdr()
+            .script_processes("w1:p2", &[process(4242, "claude")]);
+        let mut cli = send_request("w1:p1", "opus", "cli body");
+        cli.command = "send-v2".into();
+        let sent = broker.handle(cli).await;
+        assert_eq!(sent.code, 0, "{}", sent.stderr);
+        assert!(sent.stdout.starts_with("sent -> w1:p2"), "{}", sent.stdout);
+    }
+
+    /// 2 つの claude pane (`fable` = w1:p1, `opus` = w1:p2) を持つ broker。
+    /// cc-socks は tempdir に閉じ込める。
+    async fn claude_pair(dir: &TempDir) -> (Broker, PathBuf) {
+        let mut broker = broker(
+            dir,
+            vec![
+                tabbed_pane("w1:p1", "claude", "w1:t1", Some("fable")),
+                tabbed_pane("w1:p2", "claude", "w1:t2", Some("opus")),
+            ],
+        );
+        broker.sync_herdr_registry().await;
+        let root = cc_socks_dir(dir);
+        broker.config.cc_socks = root.clone();
+        (broker, root)
+    }
+
+    /// production の期限より十分長い外側の期限。追加 RPC を期限なしで await して
+    /// いると、単一 event loop がそこで止まってこの期限に掛かる (test は
+    /// virtual clock 上で走るので、実時間は待たない)。
+    async fn within_deadline<T>(what: &str, future: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(std::time::Duration::from_mins(1), future)
+            .await
+            .unwrap_or_else(|_| panic!("{what} が cross-session 解決の応答待ちで固まった"))
+    }
+
+    /// 応答の一部が壊れていても、残った要素から宛先を組み立てない。
+    /// 主 agent の要素だけ `pid` を失い、同名の子 agent の要素が正常なとき、
+    /// 子の PID が「唯一の候補」に見えてしまう — 応答ごと捨てて解決不能にする。
+    #[tokio::test]
+    async fn a_partly_broken_process_info_never_promotes_the_child_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut broker, root) = claude_pair(&dir).await;
+        // cc-socks に居るのは子 agent の socket だけ。
+        let (_child_uds, _child_listener) = bind_cc_socket(&root, 4243);
+        broker.backend.herdr().script_process_info(
+            "w1:p2",
+            serde_json::json!({
+                "type": "pane_process_info",
+                "process_info": {
+                    "pane_id": "w1:p2",
+                    "shell_pid": 4241,
+                    "foreground_process_group_id": 4241,
+                    "foreground_processes": [
+                        // 主 agent (herdr が pane の agent と認めている側) の PID が欠けている。
+                        {"name": "claude", "cmdline": "claude"},
+                        // 同名の子 agent。こちらは正常な要素。
+                        {"pid": 4243, "name": "claude", "cmdline": "claude"},
+                    ],
+                },
+            }),
+        );
+
+        let resolved = json(
+            &broker
+                .handle(request("resolve", Some("w1:p1"), &["--json", "opus"]))
+                .await,
+        );
+        assert_eq!(
+            resolved["pane"], "w1:p2",
+            "pane と label は返る: {resolved}"
+        );
+        assert!(
+            resolved["pid"].is_null(),
+            "子 agent の PID を唯一の候補にしない: {resolved}"
+        );
+        assert!(resolved["uds"].is_null(), "{resolved}");
+
+        // MCP 送信も誘導へ倒れず、従来どおり配送する。
+        let sent = broker
+            .handle(send_request("w1:p1", "opus", "delivered"))
+            .await;
+        assert_eq!(sent.code, 0, "{}", sent.stderr);
+        assert_eq!(json(&sent)["path"], "sent");
+
+        // 封筒の type が違う応答も同じ (別 method の答えを受け取らない)。
+        broker.backend.herdr().script_process_info(
+            "w1:p2",
+            serde_json::json!({
+                "type": "pane",
+                "process_info": {
+                    "pane_id": "w1:p2",
+                    "foreground_processes": [{"pid": 4243, "name": "claude"}],
+                },
+            }),
+        );
+        let foreign = json(
+            &broker
+                .handle(request("resolve", Some("w1:p1"), &["--json", "opus"]))
+                .await,
+        );
+        assert!(foreign["pid"].is_null(), "{foreign}");
+        assert!(foreign["uds"].is_null(), "{foreign}");
+    }
+
+    /// `pane.process_info` にだけ応答しない herdr。追加 RPC は期限付きで諦め、
+    /// `resolve --json` は `null`、MCP 送信は従来どおり配送へ倒れる。
+    /// 期限なしで await していると、単一 event loop がここで止まり
+    /// `within_deadline` が落とす。
+    #[tokio::test(start_paused = true)]
+    async fn a_herdr_that_never_answers_process_info_falls_back_instead_of_stalling() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut broker, root) = claude_pair(&dir).await;
+        // socket は実在する。答えが返らないことだけが解決を阻む。
+        let (_uds, _listener) = bind_cc_socket(&root, 4242);
+        broker.backend.herdr().silence_process_info("w1:p2");
+
+        let resolved = json(
+            &within_deadline(
+                "resolve --json",
+                broker.handle(request("resolve", Some("w1:p1"), &["--json", "opus"])),
+            )
+            .await,
+        );
+        assert_eq!(resolved["pane"], "w1:p2", "{resolved}");
+        assert_eq!(resolved["runtime"], "claude", "{resolved}");
+        assert!(resolved["pid"].is_null(), "{resolved}");
+        assert!(resolved["uds"].is_null(), "{resolved}");
+
+        let sent = within_deadline(
+            "send_message",
+            broker.handle(send_request("w1:p1", "opus", "delivered")),
+        )
+        .await;
+        assert_eq!(sent.code, 0, "{}", sent.stderr);
+        assert_eq!(json(&sent)["path"], "sent");
+        assert_eq!(broker.state.pending_to_me("w1:p2").len(), 1);
+    }
+
+    /// cc-socks は Claude Code だけの持ち物。非 Claude pane の foreground process
+    /// と同じ PID の socket が残っていても、その pane の宛先として案内しない
+    /// (README /「Claude Code のときだけ」)。
+    #[tokio::test]
+    async fn resolve_json_never_derives_a_socket_for_a_non_claude_pane() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut broker = registered_pair(&dir).await;
+        let root = cc_socks_dir(&dir);
+        broker.config.cc_socks = root.clone();
+        // codex pane の foreground process と同名の socket が cc-socks に居る
+        // (PID 再利用、または終了した claude session の残骸)。
+        let (_stale, _listener) = bind_cc_socket(&root, 4242);
+        broker
+            .backend
+            .herdr()
+            .script_processes("w1:p1", &[process(4242, "codex")]);
+
+        let resolved = json(
+            &broker
+                .handle(request("resolve", Some("w1:p2"), &["--json", "codex"]))
+                .await,
+        );
+        assert_eq!(resolved["pane"], "w1:p1", "{resolved}");
+        assert_eq!(resolved["runtime"], "codex", "{resolved}");
+        assert!(
+            resolved["pid"].is_null(),
+            "非 Claude pane では PID を出さない: {resolved}"
+        );
+        assert!(resolved["uds"].is_null(), "{resolved}");
     }
 
     /// register は herdr の native identity と一致する名前しか受理しない。
@@ -5260,7 +5777,11 @@ mod tests {
             );
 
             let response = broker
-                .send(send_request("w1:p1", "w3:p1", "question"), SendReport::Json)
+                .send(
+                    send_request("w1:p1", "w3:p1", "question"),
+                    SendReport::Json,
+                    SendChannel::Mcp,
+                )
                 .await
                 .unwrap();
             assert_ne!(response.code, 0, "{response:?}");

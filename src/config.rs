@@ -37,6 +37,10 @@ pub struct Config {
     pub http_tcp: Option<String>,
     pub journal: PathBuf,
     pub log: PathBuf,
+    /// Claude Code の cross-session socket が並ぶ directory
+    /// (`$XDG_RUNTIME_DIR/cc-socks`)。宛先は herdr が申告する agent PID から
+    /// 毎回導出して永続化しないので、ここは「どこを見るか」だけを持つ。
+    pub cc_socks: PathBuf,
     pub queue_limit: usize,
     pub log_level: String,
     pub skill_syntax: BTreeMap<String, SkillSyntax>,
@@ -89,6 +93,8 @@ impl Config {
                 .filter(|value| !value.is_empty()),
             journal: state.join("agent-talkd").join(format!("{name}.journal")),
             log: state.join("agent-talkd").join("agent-talkd.log"),
+            cc_socks: env::var_os("AGENT_TALK_CC_SOCKS")
+                .map_or_else(|| runtime.join("cc-socks"), PathBuf::from),
             queue_limit,
             log_level,
             skill_syntax,

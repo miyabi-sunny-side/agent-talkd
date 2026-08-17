@@ -34,6 +34,9 @@ struct FakeHerdr {
     status: Arc<Mutex<String>>,
     /// `(pane_id, agent)` の一覧。稼働中の agent 出現・消滅を模すために可変。
     panes: Arc<Mutex<Vec<(String, String)>>>,
+    /// true の間、`pane.process_info` にだけ応答を返さない (接続は開いたまま)。
+    /// 他の method は普通に答える。
+    mute_process_info: Arc<Mutex<bool>>,
 }
 
 impl FakeHerdr {
@@ -46,16 +49,19 @@ impl FakeHerdr {
             ("w1:p1".to_owned(), "codex".to_owned()),
             ("w1:p2".to_owned(), "claude".to_owned()),
         ]));
+        let mute_process_info = Arc::new(Mutex::new(false));
         let recorded = Arc::clone(&requests);
         let reported = Arc::clone(&status);
         let listing = Arc::clone(&panes);
+        let muted = Arc::clone(&mute_process_info);
         thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(stream) = stream else { break };
                 let recorded = Arc::clone(&recorded);
                 let reported = Arc::clone(&reported);
                 let listing = Arc::clone(&listing);
-                thread::spawn(move || serve_one(stream, &recorded, &reported, &listing));
+                let muted = Arc::clone(&muted);
+                thread::spawn(move || serve_one(stream, &recorded, &reported, &listing, &muted));
             }
         });
         Self {
@@ -63,7 +69,13 @@ impl FakeHerdr {
             requests,
             status,
             panes,
+            mute_process_info,
         }
+    }
+
+    /// `pane.process_info` にだけ答えない herdr を模す (接続は開けたまま黙る)。
+    fn mute_process_info(&self) {
+        *self.mute_process_info.lock().unwrap() = true;
     }
 
     /// 稼働中の agent 出現を模す。
@@ -104,6 +116,7 @@ fn serve_one(
     recorded: &Arc<Mutex<Vec<Value>>>,
     status: &Arc<Mutex<String>>,
     panes: &Arc<Mutex<Vec<(String, String)>>>,
+    mute_process_info: &Arc<Mutex<bool>>,
 ) {
     let mut reader = BufReader::new(stream.try_clone().unwrap());
     let mut line = String::new();
@@ -119,6 +132,12 @@ fn serve_one(
         .unwrap_or("w1:p1")
         .to_owned();
     recorded.lock().unwrap().push(request);
+    // 応答しない herdr: 接続を開けたまま黙る (EOF も返さない)。呼び出し側が
+    // 期限を持たなければ、ここで永久に待つ。
+    if method == "pane.process_info" && *mute_process_info.lock().unwrap() {
+        thread::sleep(Duration::from_mins(1));
+        return;
+    }
     let agent_status = status.lock().unwrap().clone();
     let pane_json = |pane_id: &str, agent: &str| {
         json!({
@@ -168,6 +187,33 @@ fn serve_one(
         // 実 herdr は method 別の封筒を持つ (2026-08-03 実機採取)。
         // pane.get の中身は result.pane にネストする。
         "pane.get" => json!({"type": "pane", "pane": pane}),
+        // 実機封筒 (2026-08-17 採取): pane の foreground process group だけが
+        // 載る。agent 本体の process 名は herdr の runtime 検出名と一致し、
+        // その agent が spawn した子 agent はここに現れない。
+        // daemon はこの PID と cc-socks の socket 名を完全一致させる。
+        "pane.process_info" => {
+            let agent = listing
+                .iter()
+                .find(|(id, _)| *id == requested_pane)
+                .map(|(_, agent)| agent.clone());
+            json!({
+                "type": "pane_process_info",
+                "process_info": {
+                    "pane_id": requested_pane,
+                    "shell_pid": 4_000_000,
+                    "foreground_process_group_id": 4_000_001,
+                    "foreground_processes": agent.as_deref().map_or_else(Vec::new, |agent| {
+                        vec![json!({
+                            "pid": 4_000_001,
+                            "name": agent,
+                            "argv": [agent],
+                            "cmdline": agent,
+                            "cwd": "/tmp",
+                        })]
+                    }),
+                },
+            })
+        }
         "pane.read" => json!({
             "type": "read",
             "read": {
@@ -573,6 +619,48 @@ fn an_env_free_mcp_child_is_identified_through_its_ancestor() {
 
     drop(stdin);
     let _ = child.wait();
+    let _ = harness.as_herdr_pane("w1:p2", &["internal-daemon-shutdown"]);
+}
+
+/// `resolve --json` は herdr が申告する agent PID の socket を返す。
+/// `pane.process_info` にだけ答えない herdr では、期限を切って諦め `pid`/`uds` を
+/// `null` に倒す — 単一 event loop をそこで止めない。
+#[test]
+#[ignore = "spawns a background daemon; run explicitly"]
+fn resolve_json_gives_up_on_a_herdr_that_never_answers_process_info() {
+    let harness = Harness::start();
+    harness.ok(&harness.as_herdr_pane("w1:p2", &["register", "claude"]));
+    wait_for(|| harness.rpc_socket().exists());
+
+    // fake herdr が w1:p2 の claude として申告する PID の socket を置く。
+    let cc_socks = harness.runtime.join("cc-socks");
+    fs::create_dir_all(&cc_socks).unwrap();
+    let _listener = UnixListener::bind(cc_socks.join("4000001.sock")).unwrap();
+
+    let resolved = harness.ok(&harness.as_herdr_pane("w1:p1", &["resolve", "--json", "claude"]));
+    let value: Value = serde_json::from_str(&resolved).unwrap();
+    assert_eq!(value["pane"], "w1:p2", "{resolved}");
+    assert_eq!(value["pid"], 4_000_001, "{resolved}");
+    assert_eq!(
+        value["uds"],
+        cc_socks.join("4000001.sock").display().to_string(),
+        "{resolved}"
+    );
+
+    // 以後 herdr は pane.process_info にだけ答えない (他の method は普通に答える)。
+    harness.herdr.mute_process_info();
+    let started = Instant::now();
+    let quiet = harness.ok(&harness.as_herdr_pane("w1:p1", &["resolve", "--json", "claude"]));
+    let elapsed = started.elapsed();
+    let value: Value = serde_json::from_str(&quiet).unwrap();
+    assert_eq!(value["pane"], "w1:p2", "pane と label は返る: {quiet}");
+    assert!(value["pid"].is_null(), "{quiet}");
+    assert!(value["uds"].is_null(), "{quiet}");
+    assert!(
+        elapsed < Duration::from_secs(20),
+        "期限なしで応答を待っている: {elapsed:?}"
+    );
+
     let _ = harness.as_herdr_pane("w1:p2", &["internal-daemon-shutdown"]);
 }
 

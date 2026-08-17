@@ -6,7 +6,7 @@
 
 use anyhow::{Result, bail};
 
-use crate::herdr::{AgentStatus, Delivery, Herdr};
+use crate::herdr::{AgentStatus, Delivery, ForegroundProcess, Herdr};
 
 /// 宛先解決が使う pane 情報。
 #[derive(Debug, Clone)]
@@ -106,6 +106,12 @@ impl Backend {
                 )
             }
         }
+    }
+
+    /// 1 つの pane の foreground process を herdr に問い合わせる。
+    /// 宛先解決が要る pane にだけ呼ぶ (pane 一覧の走査には使わない)。
+    pub async fn foreground_processes(&self, pane: &str) -> Result<Vec<ForegroundProcess>> {
+        self.herdr.foreground_processes(pane).await
     }
 
     pub async fn capture_pane(&self, pane: &str) -> Result<String> {

@@ -22,6 +22,9 @@ use tokio::{
 /// 応答 1 行の上限。壊れた相手からの無限読み出しを防ぐ。
 const MAX_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
 
+/// `pane.process_info` の応答封筒に載る `type`。
+const PROCESS_INFO_TYPE: &str = "pane_process_info";
+
 /// herdr が報告する agent の意味的状態。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentStatus {
@@ -83,6 +86,17 @@ pub enum Delivery {
     Skipped(AgentStatus),
 }
 
+/// `pane.process_info` が申告する foreground process 1 つ。
+///
+/// herdr は pane の foreground process group に居る process だけを挙げる。
+/// pane で動いている agent 本体はここに載るが、その agent が spawn した子
+/// agent は載らない — 主 agent と子 agent を取り違えないための土台。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForegroundProcess {
+    pub pid: i32,
+    pub name: String,
+}
+
 /// herdr の pane 1 つ。`pane_id` は位置依存 (`w1:p2`)、`terminal_id` は安定。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HerdrPane {
@@ -118,6 +132,24 @@ pub struct Herdr {
     /// clone 間で共有されるので、broker へ渡した後からでも観測できる。
     #[cfg(test)]
     pub(crate) delivered: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    /// scripted モードで `pane.process_info` が返すもの (test 専用)。
+    /// 登録の無い pane は実装と同じく Err になる。
+    #[cfg(test)]
+    pub(crate) scripted_processes:
+        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, ProcessInfoScript>>>,
+}
+
+/// scripted herdr の `pane.process_info` の振る舞い (test 専用)。
+///
+/// `Answer` は **wire と同じ応答封筒** を持ち、実装と同じ `parse_process_info`
+/// を通す。scripted 経路が parse を迂回すると、封筒の破損に対する daemon 側の
+/// 振る舞い (解決不能へ倒す) をテストできなくなる。
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) enum ProcessInfoScript {
+    Answer(Value),
+    /// この method にだけ応答しない herdr。呼び出し側の timeout を測る。
+    Never,
 }
 
 impl Herdr {
@@ -130,6 +162,8 @@ impl Herdr {
             scripted_fail: std::sync::Arc::default(),
             #[cfg(test)]
             delivered: std::sync::Arc::default(),
+            #[cfg(test)]
+            scripted_processes: std::sync::Arc::default(),
         }
     }
 
@@ -141,7 +175,57 @@ impl Herdr {
             scripted: Some(std::sync::Arc::new(std::sync::Mutex::new(panes))),
             scripted_fail: std::sync::Arc::default(),
             delivered: std::sync::Arc::default(),
+            scripted_processes: std::sync::Arc::default(),
         }
+    }
+
+    /// scripted モードで、ある pane の foreground process を差し込む (test 専用)。
+    /// 実 herdr と同じ応答封筒を組み立てるので、実装と同じ parse を通る。
+    #[cfg(test)]
+    pub(crate) fn script_processes(&self, pane_id: &str, processes: &[ForegroundProcess]) {
+        let processes: Vec<Value> = processes
+            .iter()
+            .map(|process| json!({"pid": process.pid, "name": process.name}))
+            .collect();
+        self.script_process_info(
+            pane_id,
+            json!({
+                "type": "pane_process_info",
+                "process_info": {
+                    "pane_id": pane_id,
+                    "shell_pid": 1,
+                    "foreground_process_group_id": 1,
+                    "foreground_processes": processes,
+                },
+            }),
+        );
+    }
+
+    /// scripted モードで、`pane.process_info` の応答封筒をそのまま差し込む
+    /// (test 専用)。壊れた封筒に対する daemon の振る舞いを測るために使う。
+    #[cfg(test)]
+    pub(crate) fn script_process_info(&self, pane_id: &str, result: Value) {
+        self.scripted_processes
+            .lock()
+            .unwrap()
+            .insert(pane_id.to_owned(), ProcessInfoScript::Answer(result));
+    }
+
+    /// scripted モードで、その pane の `pane.process_info` にだけ **応答しない**
+    /// herdr を模す (test 専用)。他の method は普通に答える。
+    #[cfg(test)]
+    pub(crate) fn silence_process_info(&self, pane_id: &str) {
+        self.scripted_processes
+            .lock()
+            .unwrap()
+            .insert(pane_id.to_owned(), ProcessInfoScript::Never);
+    }
+
+    /// scripted モードで、その pane の `pane.process_info` を失敗させる
+    /// (test 専用)。古い herdr の未知 method や pane 消滅を模す。
+    #[cfg(test)]
+    pub(crate) fn clear_processes(&self, pane_id: &str) {
+        self.scripted_processes.lock().unwrap().remove(pane_id);
     }
 
     /// protocol 番号を返す。daemon の health check に使う。
@@ -316,6 +400,36 @@ impl Herdr {
             .with_context(|| format!("herdr pane.read 応答に read.text がありません ({pane_id})"))
     }
 
+    /// `pane.process_info` で **1 つの pane** の foreground process を引く。
+    ///
+    /// 呼ぶのは宛先の解決が要る pane だけ — 全 pane を舐めない。
+    ///
+    /// wire 形式 (2026-08-17 実機採取, herdr 0.7.5 / protocol 17): params の key は
+    /// `pane_id` で、応答は `result.process_info.foreground_processes[]`。
+    /// **`target` を渡すと herdr は key を無視して focus 中の pane を黙って返す**
+    /// ため、申告された `process_info.pane_id` を照合して不一致は失敗にする。
+    /// 別 pane の PID を宛先に化けさせないための fail-closed。
+    pub async fn foreground_processes(&self, pane_id: &str) -> Result<Vec<ForegroundProcess>> {
+        #[cfg(test)]
+        if self.scripted.is_some() {
+            let script = self
+                .scripted_processes
+                .lock()
+                .unwrap()
+                .get(pane_id)
+                .cloned()
+                .with_context(|| format!("herdr pane {pane_id} の process を取得できません"))?;
+            return match script {
+                ProcessInfoScript::Answer(result) => parse_process_info(&result, pane_id),
+                ProcessInfoScript::Never => std::future::pending().await,
+            };
+        }
+        let result = self
+            .call("pane.process_info", json!({"pane_id": pane_id}))
+            .await?;
+        parse_process_info(&result, pane_id)
+    }
+
     async fn status_of(&self, pane_id: &str) -> Result<AgentStatus> {
         let result = self
             .call("pane.get", json!({"pane_id": pane_id}))
@@ -376,6 +490,73 @@ fn status_from(value: &Value) -> AgentStatus {
         .get("agent_status")
         .and_then(Value::as_str)
         .map_or(AgentStatus::Unknown, AgentStatus::parse)
+}
+
+/// `pane.process_info` の応答封筒を読む。**壊れた要素を捨てない。**
+///
+/// 捨てると、主 agent の要素だけ PID を落とした応答が「同名の子 agent が
+/// 1 つだけ居る pane」に化け、子の PID が一意の候補として採用されてしまう。
+/// 封筒の `type`・申告 pane・全要素のいずれか 1 つでも壊れていたら応答全体を
+/// 失敗にし、呼び出し側 (`cross_session_socket`) を「解決不能」へ倒す。
+fn parse_process_info(result: &Value, pane_id: &str) -> Result<Vec<ForegroundProcess>> {
+    let kind = result.get("type").and_then(Value::as_str);
+    if kind != Some(PROCESS_INFO_TYPE) {
+        bail!(
+            "herdr pane.process_info 応答の type が {PROCESS_INFO_TYPE} ではありません ({}) ({pane_id})",
+            kind.unwrap_or("?")
+        );
+    }
+    let info = result
+        .get("process_info")
+        .filter(|value| value.is_object())
+        .with_context(|| {
+            format!("herdr pane.process_info 応答に process_info がありません ({pane_id})")
+        })?;
+    let reported = info.get("pane_id").and_then(Value::as_str);
+    if reported != Some(pane_id) {
+        bail!(
+            "herdr pane.process_info が別の pane ({}) を返しました ({pane_id} を要求)",
+            reported.unwrap_or("?")
+        );
+    }
+    let processes = info
+        .get("foreground_processes")
+        .and_then(Value::as_array)
+        .with_context(|| {
+            format!("herdr pane.process_info 応答に foreground_processes がありません ({pane_id})")
+        })?;
+    processes
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            parse_process(value).with_context(|| {
+                format!(
+                    "herdr pane.process_info 応答の foreground_processes[{index}] を読めません ({pane_id}): {value}"
+                )
+            })
+        })
+        .collect()
+}
+
+/// `foreground_processes[]` の 1 要素。object でない・`pid` が正の i32 でない・
+/// `name` が文字列でない — どれも要素の破損として扱う (呼び出し側が応答ごと
+/// 失敗させる)。
+fn parse_process(value: &Value) -> Result<ForegroundProcess> {
+    let object = value.as_object().context("object ではありません")?;
+    let pid: i32 = object
+        .get("pid")
+        .and_then(Value::as_i64)
+        .and_then(|pid| i32::try_from(pid).ok())
+        .filter(|pid| *pid > 0)
+        .context("pid が正の i32 ではありません")?;
+    let name = object
+        .get("name")
+        .and_then(Value::as_str)
+        .context("name が文字列ではありません")?;
+    Ok(ForegroundProcess {
+        pid,
+        name: name.to_owned(),
+    })
 }
 
 fn parse_pane(value: &Value) -> Option<HerdrPane> {
@@ -881,6 +1062,159 @@ mod tests {
         });
         let error = fake.client().panes().await.unwrap_err().to_string();
         assert!(error.contains("tab.list"), "{error}");
+    }
+
+    /// `pane.process_info` の wire 形式 (2026-08-17 実機採取, herdr 0.7.5 /
+    /// protocol 17)。params の key は `pane_id`、中身は
+    /// `result.process_info.foreground_processes[]`。pane で動く agent 本体だけが
+    /// 載り、その agent が spawn した子 agent は載らない。
+    #[tokio::test]
+    async fn foreground_processes_read_the_real_process_info_envelope() {
+        let fake = FakeHerdr::start(|method, params| match method {
+            "pane.process_info" => ok(&json!({
+                "type": "pane_process_info",
+                "process_info": {
+                    "pane_id": params["pane_id"],
+                    "shell_pid": 1_873_555,
+                    "foreground_process_group_id": 1_873_555,
+                    "foreground_processes": [
+                        {"pid": 1_873_555, "name": "claude", "argv": ["claude"], "cmdline": "claude", "cwd": "/tmp"},
+                        {"pid": 1_875_034, "name": "agent-talk-mcp", "argv": ["agent-talk-mcp"], "cmdline": "agent-talk-mcp", "cwd": "/tmp"},
+                    ],
+                },
+            })),
+            _ => ok(&json!({})),
+        });
+
+        let processes = fake.client().foreground_processes("w2G:p3").await.unwrap();
+
+        assert_eq!(
+            processes,
+            vec![
+                ForegroundProcess {
+                    pid: 1_873_555,
+                    name: "claude".into()
+                },
+                ForegroundProcess {
+                    pid: 1_875_034,
+                    name: "agent-talk-mcp".into()
+                },
+            ]
+        );
+        // wire 形式: params の key は `pane_id` ちょうど1つ。
+        let request = fake.requests.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(request["method"], "pane.process_info");
+        assert_eq!(request["params"]["pane_id"], "w2G:p3");
+        assert!(request["params"].get("target").is_none(), "{request}");
+    }
+
+    /// 実 herdr は `pane_id` 以外の key で呼ぶと、**エラーにせず focus 中の
+    /// pane を黙って返す**。別 pane の PID を宛先に化けさせないため、申告された
+    /// `process_info.pane_id` が要求と違う応答は失敗にする。
+    #[tokio::test]
+    async fn a_process_info_answer_about_another_pane_is_refused() {
+        let fake = FakeHerdr::start(|method, _| match method {
+            "pane.process_info" => ok(&json!({
+                "type": "pane_process_info",
+                "process_info": {
+                    "pane_id": "w2G:p3",
+                    "shell_pid": 1,
+                    "foreground_process_group_id": 1,
+                    "foreground_processes": [{"pid": 1_873_555, "name": "claude"}],
+                },
+            })),
+            _ => ok(&json!({})),
+        });
+        let error = fake
+            .client()
+            .foreground_processes("w1:p2")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("別の pane"), "{error}");
+
+        // 封筒の欠けた応答も「process が居ない」へ劣化させず protocol error。
+        let flat = FakeHerdr::start(|method, _| match method {
+            "pane.process_info" => ok(&json!({"type": "pane_process_info"})),
+            _ => ok(&json!({})),
+        });
+        let error = flat
+            .client()
+            .foreground_processes("w1:p2")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("process_info"), "{error}");
+    }
+
+    /// 封筒の `type` も照合する。`process_info` を持っていても、名乗りが
+    /// `pane_process_info` でない応答は別 method の答えなので採用しない。
+    #[tokio::test]
+    async fn a_process_info_answer_with_a_foreign_type_is_refused() {
+        let fake = FakeHerdr::start(|method, params| match method {
+            "pane.process_info" => ok(&json!({
+                "type": "pane",
+                "process_info": {
+                    "pane_id": params["pane_id"],
+                    "foreground_processes": [{"pid": 1_873_555, "name": "claude"}],
+                },
+            })),
+            _ => ok(&json!({})),
+        });
+        let error = fake
+            .client()
+            .foreground_processes("w1:p2")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("pane_process_info"), "{error}");
+    }
+
+    /// 壊れた要素を捨てると、**主 agent の要素だけ PID を落とした応答** が
+    /// 「同名の子 agent が 1 つだけ居る pane」に化け、子の PID が一意の候補と
+    /// して採用されてしまう。要素が 1 つでも壊れていたら応答全体を失敗させる。
+    #[tokio::test]
+    async fn one_malformed_process_element_fails_the_whole_answer() {
+        for broken in [
+            json!({"name": "claude"}),           // pid 欠損
+            json!({"pid": 0, "name": "claude"}), // 正の PID ではない
+            json!({"pid": -1, "name": "claude"}),
+            json!({"pid": 4_294_967_296_i64, "name": "claude"}), // i32 に収まらない
+            json!({"pid": 1_873_555.5, "name": "claude"}),       // 整数ではない
+            json!({"pid": "1873555", "name": "claude"}),         // 数値ではない
+            json!({"pid": 1_873_555}),                           // name 欠損
+            json!({"pid": 1_873_555, "name": 17}),               // 文字列ではない
+            json!("claude"),                                     // object ではない
+        ] {
+            let label = broken.to_string();
+            let fake = FakeHerdr::start(move |method, params| match method {
+                "pane.process_info" => ok(&json!({
+                    "type": "pane_process_info",
+                    "process_info": {
+                        "pane_id": params["pane_id"],
+                        "shell_pid": 1_873_555,
+                        "foreground_process_group_id": 1_873_555,
+                        "foreground_processes": [
+                            broken.clone(),
+                            // 主 agent が spawn した同名の子 agent。主 agent の
+                            // 要素が捨てられると、これが唯一の候補になる。
+                            {"pid": 1_875_291, "name": "claude"},
+                        ],
+                    },
+                })),
+                _ => ok(&json!({})),
+            });
+            let error = fake
+                .client()
+                .foreground_processes("w1:p2")
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("foreground_processes[0]"),
+                "{label}: {error}"
+            );
+        }
     }
 
     /// herdr の error 応答を握り潰さない。

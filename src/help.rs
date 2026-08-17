@@ -17,7 +17,7 @@ pub const GLOBAL: &str = r"agent-talk: herdr 上の対話エージェント同�
   agent-talk unregister
   agent-talk who
   agent-talk gc
-  agent-talk resolve <addr>
+  agent-talk resolve [--json] <addr>
   agent-talk send <addr> [--from <source>] [--skill <name>] [--] [message]
   agent-talk send <addr> [--no-reply] [--] [message]
   agent-talk read <id>
@@ -63,7 +63,7 @@ pub const COMMANDS: &[CommandHelp] = &[
     },
     CommandHelp {
         command: "resolve",
-        text: "usage: agent-talk resolve [scope/]<name> | <pane-id>\n\n宛先agentをpaneへ解決します。pane-idは w1:p2 形式です。",
+        text: "usage: agent-talk resolve [--json] [scope/]<name> | <pane-id>\n\n宛先agentをpaneへ解決します。pane-idは w1:p2 形式です。--jsonはlabel/pane/runtimeと、Claude Codeなら組み込みcross-session channel用のpid/udsも返します。",
     },
     CommandHelp {
         command: "send",

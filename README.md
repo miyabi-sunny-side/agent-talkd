@@ -86,6 +86,24 @@ socket 単位で自動起動し、既存デーモンの版が古ければ安全�
 インストール済みのversionは `agent-talk --version` で確認できます。
 各サブコマンドの使い方は `agent-talk <command> --help` で確認できます。
 
+`resolve` は宛先を pane へ解決して pane id を1行で表示します。`--json` を付けると、
+宛先の識別情報と、宛先が Claude Code のときは組み込み cross-session channel の宛先に
+なる socket も返します。
+
+```json
+{"version":1,"label":"knowledge/claude","pane":"w2E:pA","runtime":"claude","pid":1481334,"uds":"/run/user/1000/cc-socks/1481334.sock"}
+```
+
+`pid` は herdr がその pane に検出している runtime と**同名の foreground process**
+（`pane.process_info`）の PID で、`uds` は `$XDG_RUNTIME_DIR/cc-socks/<その PID>.sock` が
+実在するときだけ入ります。pane の主 agent だけが foreground process に載るので、その
+agent が spawn した子 agent の socket が同じ directory に並んでいても選ばれません。
+両方とも毎回導出し、保存しません。**cc-socks を持つのは Claude Code だけ**なので、
+`runtime` が `claude` でない pane では、同じ PID の socket が cc-socks に残っていても
+導出しません。同名の process が 0 個か 2 個以上のとき、socket が無いとき、herdr が
+`pane.process_info` に答えられない・壊れた応答を返す・数秒以内に答えないときは、どれも `null` です
+（推測はしません）。探す directory は `AGENT_TALK_CC_SOCKS` で差し替えられます。
+
 `run` は子プロセスの実行中だけ現在のpaneを登録し、終了時に登録解除します。
 たとえば `_agent_talk_run codex codex "$@"` は次のように置き換えられます。
 
@@ -138,6 +156,16 @@ latest以上の場合はdowngradeせず、デーモンの版確認だけを行�
 channel を選び、それ以外・`null`・`runtime` field 自体が無い場合（`runtime` を返さない
 旧 daemon）は agent-talk へフォールバックします。`runtime` の追加で `version` は
 上がりません（既存 field の名前と値は不変で、読み飛ばす client はそのまま動きます）。
+
+送信側と宛先の両方が live で `"claude"` で、かつ宛先 pane の agent PID から Claude Code
+cross-session socket (`$XDG_RUNTIME_DIR/cc-socks/<PID>.sock`) が引けるときは、`send_message` は
+**配送せずに** `宛先 ... は Claude Code なので、組み込みの cross-session channel ... で
+送ってください。宛先は uds:<path> です` と拒否します。そのまま組み込みの
+`SendMessage` へ `uds:<path>` を渡してください。組み込み channel が使えないときは CLI の
+`agent-talk send` が逃げ道です。3条件のどれかが欠けるとき（socket が引けない、herdr が
+`pane.process_info` に答えられない、どちらかが claude でない）は従来どおり配送します。
+この拒否では message は永続化されず、呼び鈴も未受領一覧も変わりません。CLI の
+`send` / `send-v2` / `reply` と外部 mailbox 経路は影響を受けません。
 
 呼び出し元の pane が未登録なら、4つとも
 `この操作は登録済みのagent paneからのみ実行できます` で拒否されます。拒否は呼び鈴も
@@ -366,6 +394,7 @@ daemon は herdr socket から導出した RPC socket を 1 つ開きます。pa
 |---|---|
 | `AGENT_TALK_HERDR_SOCKET` | herdr socket を明示指定する。空文字なら無効 |
 | `AGENT_TALK_HTTP_ADDR` | 設定すると HTTP 面を TCP でも待ち受ける（例 `127.0.0.1:8787`）。既定は無効 |
+| `AGENT_TALK_CC_SOCKS` | Claude Code の cross-session socket を探す directory。既定は `$XDG_RUNTIME_DIR/cc-socks` |
 
 herdr の pane の中に居る場合（`HERDR_PANE_ID` / `HERDR_SOCKET_PATH` がある）は
 自動的に herdr socket を発見します。**socket file が存在するだけでは
