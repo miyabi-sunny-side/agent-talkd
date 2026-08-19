@@ -442,6 +442,40 @@ pane には herdr が拒否を返すため、素の shell へ呼び鈴が入る�
 されます。`queued` は「捨てられた」ではなく「配達可能を待って自動配送される」
 の意味です。
 
+### herdr の読み出し RPC には 5 秒の期限がある
+
+herdr への **読み出し専用 RPC**（`ping` / `pane.list` / `workspace.list` /
+`tab.list` / `pane.get` / `pane.read` / `pane.process_info`）は **5 秒**で
+諦めます。この値は正常応答の上限ではなく**異常検知の閾値**です — ローカルの
+Unix domain socket が読み出しに 5 秒かかる時点で herdr 側が固まっており、
+一方 2 秒だと 4 MiB 近い `pane.read` や高負荷時の正当に遅い応答を切りかねません。
+期限を持たないと、herdr が黙り込んだときに daemon の単一 event loop がそこで
+止まり、**静的ページは 200 のまま API だけが永久に返らなくなります**。
+
+超過は method 名を含むエラーになり、agent 一覧を返す `GET /api/who` は
+503 (`registry_unavailable`) を返します。retry も、前回の一覧への fallback も
+しません — どちらも「生きている agent 一覧」を偽るためです。broker を経由しない
+静的ページはこの間も 200 のままで、herdr が戻れば次の要求から一覧も戻ります。
+
+**呼び鈴を送る `agent.prompt` には期限を付けません。** これは pane へ入力を
+注入する mutating な RPC で、応答を失うと「herdr 側で実行済みかどうか」が
+分かりません。期限でエラーにすると daemon が「送れなかった」と判断して
+再配送し、呼び鈴の**二重配送**になりえます。
+
+daemon の health tick（2 秒間隔）は、**未処理のものが同時に 1 件になるように
+集約** します。event loop は 1 本で、herdr が黙った tick は期限ぶん止まるため、
+tick を送り続けると check が処理速度より速く積もり、broker を経由する API が
+その後ろで滞留してしまいます。捨てた tick は次の tick で取り戻せます（health tick は
+状態を持ち越さない巡回です）。この集約のおかげで、herdr が黙り続けている間も
+broker を経由する API は有限時間で応答します。同じ tick の中で一覧取得が既に
+期限切れになっているときは、同じ一覧をもう一度引く受領催促も次の tick へ回します。
+
+一覧取得の失敗と復旧は daemon の log（`$XDG_STATE_HOME/agent-talkd/agent-talkd.log`）
+に記録します。記録するのは**落ち始めの WARN 1 行と復旧の INFO 1 行だけ**です —
+snapshot は最短 2 秒間隔で回るため、失敗している間ずっと同じ行を吐くと
+log が洪水になります。`/api/who` 経由の取得と定期 snapshot はこの状態を
+共有するので、同じ障害が二重に記録されることもありません。
+
 ### herdr の登録は pull（hook 不要）
 
 **daemon はsend・message RPCの受信時に即座に、待機中は2秒間隔のhealth tickで

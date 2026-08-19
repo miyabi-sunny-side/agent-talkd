@@ -61,6 +61,75 @@ const CLAUDE_RUNTIME: &str = "claude";
 /// 「解決できなかった」に倒して従来配送へ進むほうが良い。
 const CROSS_SESSION_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// health tick の間隔。この tick が pull 同期・queue drain・受領催促を回す。
+const HEALTH_TICK: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// 未処理の [`Event::ServerCheck`] を **同時に 1 件** へ集約する門。
+///
+/// event loop は 1 本で、1 回の health check は herdr が黙ると読み出し期限
+/// ぶん (`READ_ONLY_TIMEOUT`) 止まる。tick 間隔 ([`HEALTH_TICK`]) はそれより
+/// 短いので、素直に送り続けると処理速度より速く check が mpsc に積もり、
+/// broker を通る要求 (`/api/who` など) がその後ろで滞留する — 「静的面は
+/// 生きているのに一覧 API が返らない」という元の症状が期限を入れても残る。
+/// そこで **未処理の check が残っている間は tick を捨てる**。捨てた tick は
+/// 次の tick で取り戻せる (health check は状態を持ち越さない冪等な巡回)。
+///
+/// 集約は event loop の並行化ではない。herdr 呼び出しは今までどおり
+/// event loop の中で直列に起きる。
+#[derive(Debug, Default)]
+struct HealthGate(std::sync::atomic::AtomicBool);
+
+impl HealthGate {
+    /// tick が来た。未処理の check が無いときだけ `true` (= event を送る)。
+    fn admit(&self) -> bool {
+        !self.0.swap(true, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// check を 1 件処理し終えた。次の tick を通す。
+    fn release(&self) {
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// herdr snapshot (agent 一覧の取得) が落ちている間の記録状態。
+///
+/// snapshot の refresh は最短 2 秒間隔 (health tick) で回るので、失敗のたびに
+/// 記録するとログが洪水になる。記録するのは **落ち始めの 1 回** と
+/// **復旧の 1 回** だけ。この状態は `/api/who` 経由の取得と定期 snapshot で
+/// 共有する — 別々に持つと同じ障害が二重に出る。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct SnapshotHealth {
+    failing: bool,
+}
+
+/// snapshot を 1 回観測した結果、記録すべきこと。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotLog {
+    /// 直前と同じ状態。何も記録しない。
+    Quiet,
+    /// 落ち始め。
+    Failed,
+    /// 復旧。
+    Recovered,
+}
+
+impl SnapshotHealth {
+    /// snapshot 1 回の成否を取り込み、記録すべき状態遷移だけを返す。
+    fn observe(&mut self, ok: bool) -> SnapshotLog {
+        match (self.failing, ok) {
+            (false, false) => {
+                self.failing = true;
+                SnapshotLog::Failed
+            }
+            (true, true) => {
+                self.failing = false;
+                SnapshotLog::Recovered
+            }
+            _ => SnapshotLog::Quiet,
+        }
+    }
+}
+
 /// MCP adapter 経由の操作は、呼び出し元 pane が登録済み agent であることを要求する。
 /// 呼び出し元 pane id は routing metadata でしかないが、**未登録 pane を拒否する
 /// 既存境界は変更しない** (docs/decisions/0001-conversation-broker-scope.md 起動時 contract 5)。
@@ -324,16 +393,8 @@ pub async fn run(config: Config) -> Result<()> {
     spawn_accept_loop(listener, tx.clone());
     spawn_http_accept_loop(http_listener, tx.clone());
     spawn_http_tcp(config.http_tcp.as_deref(), &tx).await;
-    let health_tx = tx.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
-        loop {
-            interval.tick().await;
-            if health_tx.send(Event::ServerCheck).await.is_err() {
-                break;
-            }
-        }
-    });
+    let checks = std::sync::Arc::new(HealthGate::default());
+    spawn_health_ticks(tx.clone(), std::sync::Arc::clone(&checks), HEALTH_TICK);
 
     adopt_legacy_journal(&config.journal)?;
     let (journal, state) = Journal::open(config.journal.clone())?;
@@ -343,10 +404,54 @@ pub async fn run(config: Config) -> Result<()> {
         backend: backend.clone(),
         config,
         pane_resolver: crate::procid::resolve_from_peer,
+        herdr_health: SnapshotHealth::default(),
     };
     broker.startup().await?;
     info!(source = "daemon", "started");
 
+    let shutdown_requested = serve(&mut broker, &mut rx, &backend, &checks).await;
+
+    if shutdown_requested {
+        info!(source = "lifecycle", "stopping after shutdown request");
+    } else {
+        info!(source = "health", "stopping after herdr went away");
+    }
+    let _ = fs::remove_file(&broker.config.rpc_socket);
+    let _ = fs::remove_file(&broker.config.http_socket);
+    Ok(())
+}
+
+/// health tick を送り続ける。**未処理の check が残っている間は送らない**
+/// ([`HealthGate`])。門は event loop 側が 1 件処理し終えたときに開く。
+fn spawn_health_ticks(
+    tx: mpsc::Sender<Event>,
+    gate: std::sync::Arc<HealthGate>,
+    period: std::time::Duration,
+) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(period);
+        loop {
+            interval.tick().await;
+            if !gate.admit() {
+                continue;
+            }
+            if tx.send(Event::ServerCheck).await.is_err() {
+                break;
+            }
+        }
+    });
+}
+
+/// 単一の event loop。**すべての herdr 呼び出しはこの中で直列に起きる。**
+///
+/// `run` の setup から切り離してあるのは、health tick の集約を仮想時計から
+/// 測れるようにするため。戻り値は「shutdown 要求で抜けたか」。
+async fn serve(
+    broker: &mut Broker,
+    rx: &mut mpsc::Receiver<Event>,
+    backend: &Backend,
+    checks: &HealthGate,
+) -> bool {
     let mut shutdown_requested = false;
     let mut failed_health_checks = 0_u8;
     while let Some(event) = rx.recv().await {
@@ -367,32 +472,27 @@ pub async fn run(config: Config) -> Result<()> {
             }
             Event::Http(event) => broker.handle_http_event(event).await,
             // herdr が応答しなくなったときだけ停止する。
-            Event::ServerCheck => match backend.still_serving().await {
-                Ok(()) => {
-                    failed_health_checks = 0;
-                    broker.sync_herdr_registry().await;
-                    broker.drain_queued().await;
-                    broker.nag_unacked().await;
-                }
-                Err(error) => {
-                    failed_health_checks += 1;
-                    if failed_health_checks >= 2 {
-                        break;
+            Event::ServerCheck => {
+                match backend.still_serving().await {
+                    Ok(()) => {
+                        failed_health_checks = 0;
+                        broker.run_health_check().await;
                     }
-                    warn!(%error, source = "health", "health check failed; retrying");
+                    Err(error) => {
+                        failed_health_checks += 1;
+                        if failed_health_checks >= 2 {
+                            break;
+                        }
+                        warn!(%error, source = "health", "health check failed; retrying");
+                    }
                 }
-            },
+                // 処理し終えてから門を開く。開くのが先だと、この check を
+                // 処理している間に次の tick が積もる。
+                checks.release();
+            }
         }
     }
-
-    if shutdown_requested {
-        info!(source = "lifecycle", "stopping after shutdown request");
-    } else {
-        info!(source = "health", "stopping after herdr went away");
-    }
-    let _ = fs::remove_file(&broker.config.rpc_socket);
-    let _ = fs::remove_file(&broker.config.http_socket);
-    Ok(())
+    shutdown_requested
 }
 
 /// 旧 (tmux 命名) journal の一回きりの引き継ぎ。
@@ -1044,6 +1144,9 @@ struct Broker {
     config: Config,
     /// peer PID → pane identity の解決関数。test では表引きに差し替える。
     pane_resolver: fn(i32, &Path) -> std::result::Result<String, String>,
+    /// agent 一覧の取得が落ちている間のログ状態。`/api/who` 経由と定期 snapshot で
+    /// **共有する** (別々に持つと同じ障害が二重に記録される)。
+    herdr_health: SnapshotHealth,
 }
 
 impl Broker {
@@ -1082,8 +1185,8 @@ impl Broker {
         }
     }
 
-    async fn web_agents(&self) -> Result<Vec<WebAgent>> {
-        let panes = self.backend.panes().await?;
+    async fn web_agents(&mut self) -> Result<Vec<WebAgent>> {
+        let panes = self.herdr_snapshot().await?;
         let mut agents = Vec::new();
         for pane in panes {
             if let Some(agent) = self.state.agents.get(&pane.pane_id) {
@@ -1502,10 +1605,54 @@ impl Broker {
         let _ = self.refresh_herdr_registry().await;
     }
 
+    /// health tick 1 回分の仕事。**herdr 呼び出しはここで直列に起きる。**
+    ///
+    /// 受領催促は自分でもう一度 `pane.list` を引く。この tick の一覧取得が
+    /// 既に失敗している (= 黙って期限で切れた) なら、2 度目も同じだけ待たされて
+    /// 同じ結果 (催促候補ゼロ) にしかならないので、畳んで次の tick へ回す。
+    /// 一覧が取れた tick の呼び出し回数と順序は今までどおり。
+    async fn run_health_check(&mut self) {
+        let listed = self.refresh_herdr_registry().await.is_ok();
+        self.drain_queued().await;
+        if listed {
+            self.nag_unacked().await;
+        }
+    }
+
     async fn refresh_herdr_registry(&mut self) -> Result<()> {
-        let panes = self.backend.panes().await?;
+        let panes = self.herdr_snapshot().await?;
         self.apply_herdr_snapshot(panes).await;
         Ok(())
+    }
+
+    /// herdr から agent 一覧の snapshot を取り、**落ち始めと復旧だけ** を記録する。
+    ///
+    /// 失敗はそのまま呼び出し側へ返す — retry も前回一覧への fallback もしない。
+    /// どちらも「生きている agent 一覧」を偽るので、`/api/who` は 503 のままにし、
+    /// registry も古い値で更新しない。
+    async fn herdr_snapshot(&mut self) -> Result<Vec<PaneInfo>> {
+        let snapshot = self.backend.panes().await;
+        match self.herdr_health.observe(snapshot.is_ok()) {
+            SnapshotLog::Quiet => {}
+            SnapshotLog::Failed => {
+                let error = snapshot
+                    .as_ref()
+                    .err()
+                    .map_or_else(String::new, ToString::to_string);
+                warn!(
+                    %error,
+                    source = "herdr",
+                    "herdr snapshot failed; the agent listing is unavailable"
+                );
+            }
+            SnapshotLog::Recovered => {
+                info!(
+                    source = "herdr",
+                    "herdr snapshot recovered; the agent listing is available again"
+                );
+            }
+        }
+        snapshot
     }
 
     async fn apply_herdr_snapshot(&mut self, panes: Vec<PaneInfo>) {
@@ -2952,6 +3099,7 @@ mod tests {
     use std::{
         collections::BTreeMap,
         path::{Path, PathBuf},
+        sync::Arc,
     };
 
     use hyper::{
@@ -2961,16 +3109,17 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        Broker, Event, HttpEvent, HttpRoute, Journal, MAX_BODY_BYTES, MailboxPageError, Request,
-        SendChannel, SendIntent, SendOptions, SendReport, WebAgent, adopt_legacy_journal,
-        capture_failure, classify_http, decode_path_segment, installed_skills_for_runtime,
+        Broker, Event, HEALTH_TICK, HealthGate, HttpEvent, HttpRoute, Journal, MAX_BODY_BYTES,
+        MailboxPageError, Request, SendChannel, SendIntent, SendOptions, SendReport,
+        SnapshotHealth, SnapshotLog, WebAgent, adopt_legacy_journal, capture_failure,
+        classify_http, decode_path_segment, installed_skills_for_runtime, mpsc, oneshot,
         parse_mailbox_page, parse_mailbox_query, peer_uid_allowed, request_web_agents, rfc3339,
-        static_response,
+        serve, spawn_health_ticks, static_response,
     };
     use crate::{
         backend::Backend,
         config::Config,
-        herdr::{AgentStatus, HerdrPane},
+        herdr::{AgentStatus, HerdrPane, READ_ONLY_TIMEOUT},
         state::AgentState,
     };
 
@@ -3016,6 +3165,7 @@ mod tests {
             state,
             journal,
             pane_resolver: |_, _| Err("tests は pane_resolver を明示注入する".to_owned()),
+            herdr_health: SnapshotHealth::default(),
             backend: Backend::scripted(panes),
             config: Config {
                 herdr_socket: PathBuf::new(),
@@ -3032,6 +3182,150 @@ mod tests {
                 allowed_sources: std::collections::BTreeSet::new(),
             },
         }
+    }
+
+    /// snapshot 失敗のログは「落ち始め」と「復旧」の 1 回ずつだけ。
+    /// refresh は最短 2 秒間隔で回るので、失敗中ずっと同じ行を吐くと洪水になる。
+    #[test]
+    fn a_snapshot_outage_is_logged_once_at_its_start_and_once_at_its_recovery() {
+        let mut health = SnapshotHealth::default();
+
+        assert_eq!(health.observe(true), SnapshotLog::Quiet, "健全なら黙る");
+        assert_eq!(health.observe(false), SnapshotLog::Failed, "落ち始めは記録");
+        assert_eq!(health.observe(false), SnapshotLog::Quiet, "失敗中は黙る");
+        assert_eq!(health.observe(false), SnapshotLog::Quiet, "失敗中は黙る");
+        assert_eq!(health.observe(true), SnapshotLog::Recovered, "復旧は記録");
+        assert_eq!(health.observe(true), SnapshotLog::Quiet, "復旧後は黙る");
+        assert_eq!(
+            health.observe(false),
+            SnapshotLog::Failed,
+            "次の障害はまた記録する"
+        );
+    }
+
+    /// health tick を送る側は、まだ処理されていない check があるうちは
+    /// 送らない。event loop は 1 本なので、check の処理より tick のほうが
+    /// 速いと mpsc に積もり、broker を通る要求がその後ろで待たされる。
+    /// 仮想時計で 30 tick 分の時間を流し、積もらないことを測る。
+    #[tokio::test(start_paused = true)]
+    async fn health_ticks_do_not_pile_up_while_a_check_is_still_unprocessed() {
+        let (tx, mut rx) = mpsc::channel::<Event>(64);
+        let checks = Arc::new(HealthGate::default());
+        spawn_health_ticks(tx, Arc::clone(&checks), HEALTH_TICK);
+
+        tokio::time::sleep(HEALTH_TICK * 30).await;
+        assert!(
+            matches!(rx.try_recv(), Ok(Event::ServerCheck)),
+            "tick が 1 件も届いていない"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "未処理の check は同時に 1 件までのはず"
+        );
+
+        // 捨てた tick は取り戻せる: 1 件処理し終えたら次の tick がまた通る。
+        checks.release();
+        tokio::time::sleep(HEALTH_TICK * 30).await;
+        assert!(
+            matches!(rx.try_recv(), Ok(Event::ServerCheck)),
+            "門を開けたのに次の tick が来ない"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "未処理の check は同時に 1 件までのはず"
+        );
+    }
+
+    /// 集約そのものの規則。処理し終えるまで次を通さず、開けば 1 件だけ通す。
+    #[test]
+    fn a_health_gate_admits_one_outstanding_check_at_a_time() {
+        let gate = HealthGate::default();
+
+        assert!(gate.admit(), "最初の tick は通る");
+        assert!(!gate.admit(), "未処理の check がある間は通さない");
+        assert!(!gate.admit(), "何度 tick が来ても通さない");
+        gate.release();
+        assert!(gate.admit(), "処理し終えたら次の tick を通す");
+        assert!(!gate.admit(), "通したら再び閉じる");
+    }
+
+    /// 1 tick が一覧 (`pane.list`) を叩く回数。正常時は pull 同期と受領催促で
+    /// 2 回。**黙っていると分かった tick では 2 度目を試さない** — 2 度目も
+    /// 期限ぶん待たされるだけで、その分 tick の処理が tick 間隔より遅くなる。
+    #[tokio::test(start_paused = true)]
+    async fn a_health_tick_stops_asking_for_a_listing_that_just_went_silent() {
+        let dir = TempDir::new().unwrap();
+        let mut broker = broker(&dir, vec![pane_info("w1:p2", Some("claude"))]);
+        let herdr = broker.backend.herdr().clone();
+
+        broker.run_health_check().await;
+        assert_eq!(
+            herdr.pane_calls(),
+            2,
+            "正常時の呼び出し回数は変えない (pull 同期と受領催促で 1 回ずつ)"
+        );
+
+        herdr.stall_panes(Some(READ_ONLY_TIMEOUT));
+        let started = tokio::time::Instant::now();
+        broker.run_health_check().await;
+        assert_eq!(
+            herdr.pane_calls(),
+            3,
+            "黙ったと分かった一覧を同じ tick で 2 度取りに行かない"
+        );
+        assert!(
+            started.elapsed() < READ_ONLY_TIMEOUT * 2,
+            "1 tick が期限 2 回分待っている: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// 継続的に黙る `pane.list` の下でも、**broker event loop を通る** 要求が
+    /// 有限時間で答える。`/api/mailboxes` (`HttpEvent::Mailboxes`) を使うのは、
+    /// broker を経由しつつ herdr に一切触らないため — 答えないなら原因は
+    /// event loop が health check で埋まっていることに限られる。
+    /// 仮想時計なので実時間は待たない。
+    #[tokio::test(start_paused = true)]
+    async fn a_broker_routed_request_answers_while_pane_list_stays_silent() {
+        let dir = TempDir::new().unwrap();
+        let mut broker = broker(&dir, vec![pane_info("w1:p2", Some("claude"))]);
+        let backend = broker.backend.clone();
+        let herdr = backend.herdr().clone();
+        herdr.stall_panes(Some(READ_ONLY_TIMEOUT));
+        let (tx, mut rx) = mpsc::channel::<Event>(64);
+        let checks = Arc::new(HealthGate::default());
+        spawn_health_ticks(tx.clone(), Arc::clone(&checks), HEALTH_TICK);
+        tokio::spawn(async move { serve(&mut broker, &mut rx, &backend, &checks).await });
+
+        // 一覧が黙ったまま 30 tick 分が過ぎる。
+        tokio::time::sleep(HEALTH_TICK * 30).await;
+        // health check 自体は回り続けている。集約は tick を捨てるだけで、
+        // 巡回そのものを止めてしまってはならない (止めると pull 同期が死ぬ)。
+        assert!(
+            herdr.pane_calls() >= 2,
+            "障害中に health check が 1 度しか回っていない: {}",
+            herdr.pane_calls()
+        );
+
+        let (reply, receive) = oneshot::channel();
+        tx.send(Event::Http(HttpEvent::Mailboxes { reply }))
+            .await
+            .unwrap();
+        let started = tokio::time::Instant::now();
+        let answered = tokio::time::timeout(HEALTH_TICK + READ_ONLY_TIMEOUT * 2, receive).await;
+        // 外側の timeout が Ok でも、内側が Err なら応答口が切れただけで
+        // 「答えた」ことにはならない。滞留 (外側) と serve の死 (内側) を
+        // 読み分けたうえで、実際に応答が返ったときだけ通す。
+        let cause = match &answered {
+            Ok(Ok(_)) => "",
+            Ok(Err(_)) => "serve task が落ちて応答口 (oneshot) が切れた",
+            Err(_) => "health check の後ろで滞留し、期限内に返らなかった",
+        };
+        assert!(
+            matches!(answered, Ok(Ok(_))),
+            "broker を通る要求が有限時間で答えなかった ({:?} 経過): {cause}",
+            started.elapsed()
+        );
     }
 
     fn request(command: &str, pane: Option<&str>, args: &[&str]) -> Request {
@@ -3059,6 +3353,7 @@ mod tests {
                 state,
                 journal,
                 pane_resolver: |_, _| Err("tests は pane_resolver を明示注入する".to_owned()),
+                herdr_health: SnapshotHealth::default(),
                 backend: Backend::scripted(vec![
                     pane_info("w1:p1", Some("codex")),
                     pane_info("w1:p2", Some("claude")),

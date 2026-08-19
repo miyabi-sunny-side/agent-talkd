@@ -37,6 +37,9 @@ struct FakeHerdr {
     /// true の間、`pane.process_info` にだけ応答を返さない (接続は開いたまま)。
     /// 他の method は普通に答える。
     mute_process_info: Arc<Mutex<bool>>,
+    /// true の間、`pane.list` に **即座に壊れた応答** を返す。待たずに
+    /// 一覧取得の失敗経路へ入れるための failpoint。
+    broken_pane_list: Arc<Mutex<bool>>,
 }
 
 impl FakeHerdr {
@@ -50,10 +53,12 @@ impl FakeHerdr {
             ("w1:p2".to_owned(), "claude".to_owned()),
         ]));
         let mute_process_info = Arc::new(Mutex::new(false));
+        let broken_pane_list = Arc::new(Mutex::new(false));
         let recorded = Arc::clone(&requests);
         let reported = Arc::clone(&status);
         let listing = Arc::clone(&panes);
         let muted = Arc::clone(&mute_process_info);
+        let broken = Arc::clone(&broken_pane_list);
         thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(stream) = stream else { break };
@@ -61,7 +66,10 @@ impl FakeHerdr {
                 let reported = Arc::clone(&reported);
                 let listing = Arc::clone(&listing);
                 let muted = Arc::clone(&muted);
-                thread::spawn(move || serve_one(stream, &recorded, &reported, &listing, &muted));
+                let broken = Arc::clone(&broken);
+                thread::spawn(move || {
+                    serve_one(stream, &recorded, &reported, &listing, &muted, &broken);
+                });
             }
         });
         Self {
@@ -70,7 +78,14 @@ impl FakeHerdr {
             status,
             panes,
             mute_process_info,
+            broken_pane_list,
         }
+    }
+
+    /// `pane.list` を壊す / 直す。無応答ではなく **即座の error 応答** なので、
+    /// 実時間を待たずに一覧取得の失敗経路と復旧を測れる。
+    fn set_pane_list_broken(&self, broken: bool) {
+        *self.broken_pane_list.lock().unwrap() = broken;
     }
 
     /// `pane.process_info` にだけ答えない herdr を模す (接続は開けたまま黙る)。
@@ -111,12 +126,41 @@ impl FakeHerdr {
     }
 }
 
+/// 実機封筒 (2026-08-17 採取): pane の foreground process group だけが載る。
+/// agent 本体の process 名は herdr の runtime 検出名と一致し、その agent が
+/// spawn した子 agent はここに現れない。daemon はこの PID と cc-socks の
+/// socket 名を完全一致させる。
+fn process_info(listing: &[(String, String)], requested_pane: &str) -> Value {
+    let agent = listing
+        .iter()
+        .find(|(id, _)| id == requested_pane)
+        .map(|(_, agent)| agent.clone());
+    json!({
+        "type": "pane_process_info",
+        "process_info": {
+            "pane_id": requested_pane,
+            "shell_pid": 4_000_000,
+            "foreground_process_group_id": 4_000_001,
+            "foreground_processes": agent.as_deref().map_or_else(Vec::new, |agent| {
+                vec![json!({
+                    "pid": 4_000_001,
+                    "name": agent,
+                    "argv": [agent],
+                    "cmdline": agent,
+                    "cwd": "/tmp",
+                })]
+            }),
+        },
+    })
+}
+
 fn serve_one(
     stream: UnixStream,
     recorded: &Arc<Mutex<Vec<Value>>>,
     status: &Arc<Mutex<String>>,
     panes: &Arc<Mutex<Vec<(String, String)>>>,
     mute_process_info: &Arc<Mutex<bool>>,
+    broken_pane_list: &Arc<Mutex<bool>>,
 ) {
     let mut reader = BufReader::new(stream.try_clone().unwrap());
     let mut line = String::new();
@@ -136,6 +180,13 @@ fn serve_one(
     // 期限を持たなければ、ここで永久に待つ。
     if method == "pane.process_info" && *mute_process_info.lock().unwrap() {
         thread::sleep(Duration::from_mins(1));
+        return;
+    }
+    // 壊れた herdr: 待たせずに error を返す (失敗経路へ即座に入る)。
+    if method == "pane.list" && *broken_pane_list.lock().unwrap() {
+        let mut stream = stream;
+        let error = json!({"id": "x", "error": {"code": "internal", "message": "pane.list broke"}});
+        let _ = stream.write_all(format!("{error}\n").as_bytes());
         return;
     }
     let agent_status = status.lock().unwrap().clone();
@@ -187,33 +238,7 @@ fn serve_one(
         // 実 herdr は method 別の封筒を持つ (2026-08-03 実機採取)。
         // pane.get の中身は result.pane にネストする。
         "pane.get" => json!({"type": "pane", "pane": pane}),
-        // 実機封筒 (2026-08-17 採取): pane の foreground process group だけが
-        // 載る。agent 本体の process 名は herdr の runtime 検出名と一致し、
-        // その agent が spawn した子 agent はここに現れない。
-        // daemon はこの PID と cc-socks の socket 名を完全一致させる。
-        "pane.process_info" => {
-            let agent = listing
-                .iter()
-                .find(|(id, _)| *id == requested_pane)
-                .map(|(_, agent)| agent.clone());
-            json!({
-                "type": "pane_process_info",
-                "process_info": {
-                    "pane_id": requested_pane,
-                    "shell_pid": 4_000_000,
-                    "foreground_process_group_id": 4_000_001,
-                    "foreground_processes": agent.as_deref().map_or_else(Vec::new, |agent| {
-                        vec![json!({
-                            "pid": 4_000_001,
-                            "name": agent,
-                            "argv": [agent],
-                            "cmdline": agent,
-                            "cwd": "/tmp",
-                        })]
-                    }),
-                },
-            })
-        }
+        "pane.process_info" => process_info(&listing, &requested_pane),
         "pane.read" => json!({
             "type": "read",
             "read": {
@@ -296,6 +321,23 @@ impl Harness {
         let mut response = Vec::new();
         stream.read_to_end(&mut response).unwrap();
         response
+    }
+
+    /// broker event loop の生死を測るための GET。応答を待つ上限を切るので、
+    /// loop が health check の後ろで塞がっているときに **ぶら下がらず落ちる**。
+    fn http_get_within(&self, path: &str, limit: Duration) -> String {
+        let mut stream = TcpStream::connect(("127.0.0.1", self.http_port)).unwrap();
+        stream.set_read_timeout(Some(limit)).unwrap();
+        write!(
+            stream,
+            "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+        )
+        .unwrap();
+        let mut response = Vec::new();
+        stream
+            .read_to_end(&mut response)
+            .unwrap_or_else(|error| panic!("{path} が {limit:?} 以内に返らない: {error}"));
+        String::from_utf8_lossy(&response).into_owned()
     }
 
     fn http_post(&self, path: &str, content_type: &str, body: &str) -> String {
@@ -681,6 +723,84 @@ fn resolve_json_gives_up_on_a_herdr_that_never_answers_process_info() {
     assert!(
         elapsed < Duration::from_secs(20),
         "期限なしで応答を待っている: {elapsed:?}"
+    );
+
+    let _ = harness.as_herdr_pane("w1:p2", &["internal-daemon-shutdown"]);
+}
+
+/// daemon が snapshot の落ち始め / 復旧に書くログ行 (`src/daemon.rs`)。
+const SNAPSHOT_FAILED: &str = "herdr snapshot failed";
+const SNAPSHOT_RECOVERED: &str = "herdr snapshot recovered";
+
+fn occurrences(haystack: &str, needle: &str) -> usize {
+    haystack.matches(needle).count()
+}
+
+/// 一覧取得 (`pane.list`) だけが壊れた herdr でも、daemon は面を保つ:
+/// `/api/who` は 503 のままで古い一覧を返さず、broker を経由しない静的配信は
+/// 200 を保ち、以後の要求も普通に通る。
+///
+/// ログは落ち始めに 1 行、復旧に 1 行だけ。snapshot は最短 2 秒間隔で回るので、
+/// 失敗中ずっと同じ行を吐くとログが洪水になる。無応答ではなく **即座に壊れた
+/// 応答** を使うので、この検証は実時間を待たない。
+#[test]
+#[ignore = "spawns a background daemon; run explicitly"]
+fn a_broken_pane_list_keeps_the_surface_alive_and_is_logged_once() {
+    let harness = Harness::start();
+    harness.ok(&harness.as_herdr_pane("w1:p2", &["register", "claude"]));
+    wait_for(|| harness.rpc_socket().exists());
+
+    let healthy = harness.http_get("/api/who");
+    assert!(healthy.starts_with("HTTP/1.1 200"), "{healthy}");
+    assert!(healthy.contains("claude"), "{healthy}");
+
+    // ping は答え続けるので daemon は生き残り、一覧取得だけが壊れる。
+    harness.herdr.set_pane_list_broken(true);
+    for _ in 0..3 {
+        let outage = harness.http_get("/api/who");
+        assert!(outage.starts_with("HTTP/1.1 503"), "{outage}");
+        assert!(outage.contains("registry_unavailable"), "{outage}");
+        assert!(
+            !outage.contains("claude"),
+            "古い一覧へ fallback してはならない: {outage}"
+        );
+    }
+    // 静的配信は broker を経由しないので 200 のまま。
+    let index = harness.http_get("/");
+    assert!(index.starts_with("HTTP/1.1 200"), "{index}");
+    // **broker event loop を通る** 要求も通る。`/api/mailboxes` は
+    // `HttpEvent::Mailboxes` として event loop へ渡り、そこで herdr に一切
+    // 触らずに答える (`src/daemon.rs` の `route_http` / `handle_http_event`)。
+    // `/api/hello` は route_http 内で直接返るので、loop の生死を測れない。
+    let mailboxes = harness.http_get_within("/api/mailboxes", Duration::from_secs(5));
+    assert!(mailboxes.starts_with("HTTP/1.1 200"), "{mailboxes}");
+    assert!(mailboxes.contains("mailboxes"), "{mailboxes}");
+
+    wait_for(|| harness.log().contains(SNAPSHOT_FAILED));
+    let during = harness.log();
+    assert_eq!(
+        occurrences(&during, SNAPSHOT_FAILED),
+        1,
+        "落ち始めの 1 行だけを記録する: {during}"
+    );
+    assert_eq!(occurrences(&during, SNAPSHOT_RECOVERED), 0, "{during}");
+
+    // 復旧: 一覧が戻り、INFO が 1 行だけ出る。
+    harness.herdr.set_pane_list_broken(false);
+    wait_for(|| harness.http_get("/api/who").starts_with("HTTP/1.1 200"));
+    let restored = harness.http_get("/api/who");
+    assert!(restored.contains("claude"), "{restored}");
+    wait_for(|| harness.log().contains(SNAPSHOT_RECOVERED));
+    let after = harness.log();
+    assert_eq!(
+        occurrences(&after, SNAPSHOT_RECOVERED),
+        1,
+        "復旧の 1 行だけを記録する: {after}"
+    );
+    assert_eq!(
+        occurrences(&after, SNAPSHOT_FAILED),
+        1,
+        "復旧後も落ち始めは 1 行のまま: {after}"
     );
 
     let _ = harness.as_herdr_pane("w1:p2", &["internal-daemon-shutdown"]);

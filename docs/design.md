@@ -192,6 +192,63 @@ pull側の規則:
 - 手動`unregister`は拒否する。pullが次tickで登録し直すため、
   受理すると解除→再登録の振動になるだけで、意図した効果を持たない。
 
+### herdrの読み出しRPCには期限があり、mutating RPCには無い
+
+herdrの**読み出し専用RPC**（`ping` / `pane.list` / `workspace.list` / `tab.list` /
+`pane.get` / `pane.read` / `pane.process_info`）は名前付き定数1つ（`READ_ONLY_TIMEOUT`、
+**5秒**）で打ち切り、method名を含むエラーにします。この値は正常応答の上限ではなく
+**異常検知の閾値**です。ローカルUDSの読み出しが5秒かかる時点でherdr側が固まっており、
+一方2秒では4 MiB近い`pane.read`や高負荷時の正当に遅い応答を切りかねません。
+
+期限が要るのはHTTPの経路が2本あるためです。静的配信はHTTP task内で直接応答し、
+API系は単一のbroker event loopへ渡って応答を待ちます。読み出しに期限が無いと、
+herdrが黙り込んだtickでloopが止まり、**プロセスは生きていて静的ページも200のまま、
+agent一覧だけが永久に返らない**という落ち方をします（例外が飛ばないのでlogにも
+何も出ません）。期限はこの無期限待ちを構造的に消すためのもので、event loopの
+並行化ではありません。
+
+**`agent.prompt`は対象外です。** これはpaneへ入力を注入するmutating RPCで、応答を
+失うと「herdr側で実行済みか」が分かりません。期限でエラーにするとdaemonは
+「送れなかった」と判断してrequeue・再配送するため、呼び鈴の**二重配送**になりえます。
+配送を止めないほうが害が小さい読み出しと、実行済みか分からないmutatingを
+同じ規則で扱いません。
+
+失敗時の応答は既存のまま変えません。`GET /api/who`は503 (`registry_unavailable`) で、
+retryも前回一覧へのfallbackもしません（どちらも「生きているagent一覧」を偽ります）。
+registryも古い値で更新しません — pull同期は「snapshot取得に失敗した間は判定を
+進めない」規則をそのまま守ります。
+
+### health tickは同時に1件だけ
+
+読み出しに期限を付けても、それだけでは同じ症状が残ります。health tickは2秒間隔
+（`HEALTH_TICK`）で回り、1回のcheckは`pane.list`が黙ると期限ぶん（5秒）止まります。
+tickのほうが速いので素直に送り続けるとcheckが処理速度より速くmpscへ積もり、broker経由の
+`/api/who`が大量のcheckの後ろで滞留します — 「静的面は生きているのに一覧APIが返らない」
+という当の症状が、期限を入れても実質的に残ります。
+
+そこで**未処理の`ServerCheck`を同時に1件へ集約**します。tickを送る側は門
+（`HealthGate`）が開いているときだけ送り、門はevent loopがそのcheckを**処理し終えてから**
+開きます。捨てたtickは次のtickで取り戻せます — health checkは状態を持ち越さない冪等な
+巡回で、pull同期・queue drain・受領催促はいずれも次の巡回で同じ判断をやり直します。
+これでbroker経由の要求の前に立つcheckは高々1件になり、herdrが黙り続けても
+**broker経由のAPIは有限時間で応答します**。
+
+1つのtickの中でも畳みます。受領催促（`nag_unacked`）は自分でもう一度`pane.list`を引くので、
+そのtickの一覧取得が既に期限で切れているなら、2度目も同じだけ待たされて同じ結果
+（催促候補ゼロ）にしかなりません。一覧の取れなかったtickでは催促を次のtickへ回します。
+一覧の取れたtickの呼び出し回数と順序は変えません。
+
+集約はevent loopの並行化ではありません。herdr呼び出しは今までどおり単一のevent loopの
+中で直列に起きます。集約の規則そのものは副作用のない`HealthGate::admit` /
+`HealthGate::release`に切り出してあり、tickの積もり方はそこだけを見れば決まります。
+
+一覧取得の失敗はdaemonのlog（`agent-talkd.log`、既存の`tracing` file writer）に
+記録しますが、**落ち始めに1行 (WARN)、復旧に1行 (INFO) だけ**です。snapshotは最短2秒
+間隔で回るため、失敗中ずっと記録するとlogが洪水になり、次の障害の始まりが埋もれます。
+この状態遷移は`/api/who`経由の取得と定期snapshotで**共有**します（別々に持つと同じ
+障害が二重に出ます）。判定は副作用のない状態遷移（`SnapshotHealth::observe`）に
+切り出してあり、logの出方はそこだけを見れば決まります。
+
 配送入口は1つです。
 
 1. メッセージヘッダと本文をID付きでjournalへ永続化します。

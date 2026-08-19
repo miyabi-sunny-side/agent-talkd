@@ -22,6 +22,11 @@ use tokio::{
 /// 応答 1 行の上限。壊れた相手からの無限読み出しを防ぐ。
 const MAX_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
 
+/// 読み出し専用 RPC の期限。**正常応答の上限ではなく異常検知の閾値** —
+/// local UDS の read-only 応答が 5 秒かかる時点で herdr 側が固まっており、
+/// 一方 2 秒だと 4MiB 近い `pane.read` や高負荷時の正当に遅い応答を切りかねない。
+pub(crate) const READ_ONLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// `pane.process_info` の応答封筒に載る `type`。
 const PROCESS_INFO_TYPE: &str = "pane_process_info";
 
@@ -128,6 +133,15 @@ pub struct Herdr {
     /// その tick を daemon 側テストから再現するために使う。
     #[cfg(test)]
     pub(crate) scripted_fail: std::sync::Arc<std::sync::Mutex<bool>>,
+    /// scripted モードで `panes()` が黙る時間 (test 専用 failpoint)。
+    /// 実装では黙った `pane.list` を [`READ_ONLY_TIMEOUT`] が打ち切るので、
+    /// 「黙る herdr が 1 tick に費やさせる時間」をこの長さで再現する。
+    #[cfg(test)]
+    pub(crate) scripted_stall: std::sync::Arc<std::sync::Mutex<Option<std::time::Duration>>>,
+    /// scripted モードで `panes()` が呼ばれた回数 (test 専用)。
+    /// 1 tick が黙る `pane.list` を何度叩くかを測るために使う。
+    #[cfg(test)]
+    pub(crate) scripted_pane_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// scripted モードで `deliver` された (pane, text) の記録 (test 専用)。
     /// clone 間で共有されるので、broker へ渡した後からでも観測できる。
     #[cfg(test)]
@@ -161,6 +175,10 @@ impl Herdr {
             #[cfg(test)]
             scripted_fail: std::sync::Arc::default(),
             #[cfg(test)]
+            scripted_stall: std::sync::Arc::default(),
+            #[cfg(test)]
+            scripted_pane_calls: std::sync::Arc::default(),
+            #[cfg(test)]
             delivered: std::sync::Arc::default(),
             #[cfg(test)]
             scripted_processes: std::sync::Arc::default(),
@@ -174,6 +192,8 @@ impl Herdr {
             socket: PathBuf::new(),
             scripted: Some(std::sync::Arc::new(std::sync::Mutex::new(panes))),
             scripted_fail: std::sync::Arc::default(),
+            scripted_stall: std::sync::Arc::default(),
+            scripted_pane_calls: std::sync::Arc::default(),
             delivered: std::sync::Arc::default(),
             scripted_processes: std::sync::Arc::default(),
         }
@@ -228,13 +248,27 @@ impl Herdr {
         self.scripted_processes.lock().unwrap().remove(pane_id);
     }
 
+    /// scripted モードで `panes()` を `stall` だけ黙らせてから失敗させる
+    /// (test 専用)。`None` で黙るのをやめる。
+    #[cfg(test)]
+    pub(crate) fn stall_panes(&self, stall: Option<std::time::Duration>) {
+        *self.scripted_stall.lock().unwrap() = stall;
+    }
+
+    /// scripted モードで `panes()` が呼ばれた回数 (test 専用)。
+    #[cfg(test)]
+    pub(crate) fn pane_calls(&self) -> usize {
+        self.scripted_pane_calls
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// protocol 番号を返す。daemon の health check に使う。
     pub async fn protocol(&self) -> Result<u64> {
         #[cfg(test)]
         if self.scripted.is_some() {
             return Ok(17);
         }
-        let result = self.call("ping", json!({})).await?;
+        let result = self.call_read_only("ping", json!({})).await?;
         result
             .get("protocol")
             .and_then(Value::as_u64)
@@ -244,12 +278,20 @@ impl Herdr {
     pub async fn panes(&self) -> Result<Vec<HerdrPane>> {
         #[cfg(test)]
         if let Some(scripted) = &self.scripted {
+            self.scripted_pane_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // 黙る `pane.list` は期限いっぱい待たせてから諦める (実装と同じ形)。
+            let stall = *self.scripted_stall.lock().unwrap();
+            if let Some(stall) = stall {
+                tokio::time::sleep(stall).await;
+                bail!("scripted silent pane.list");
+            }
             if *self.scripted_fail.lock().unwrap() {
                 bail!("scripted snapshot failure (tab.list)");
             }
             return Ok(scripted.lock().unwrap().clone());
         }
-        let result = self.call("pane.list", json!({})).await?;
+        let result = self.call_read_only("pane.list", json!({})).await?;
         let panes = result
             .get("panes")
             .and_then(Value::as_array)
@@ -277,7 +319,7 @@ impl Herdr {
     /// `workspace.list` から `workspace_id` → label の対応を作る。
     /// 宛先構文 (`scope/name`, `w1:p2`) と誤解される文字を含む label は捨てる。
     async fn workspace_labels(&self) -> Result<std::collections::HashMap<String, String>> {
-        let result = self.call("workspace.list", json!({})).await?;
+        let result = self.call_read_only("workspace.list", json!({})).await?;
         let workspaces = result
             .get("workspaces")
             .and_then(Value::as_array)
@@ -297,7 +339,7 @@ impl Herdr {
     /// 宛先構文と衝突する文字を含む label は捨てる。純数字 label (custom 名の
     /// 無い tab) の解釈は名前決定側 (`backend::pane_info`) が行う。
     async fn tab_labels(&self) -> Result<std::collections::HashMap<String, String>> {
-        let result = self.call("tab.list", json!({})).await?;
+        let result = self.call_read_only("tab.list", json!({})).await?;
         let tabs = result
             .get("tabs")
             .and_then(Value::as_array)
@@ -385,7 +427,7 @@ impl Herdr {
             bail!("herdr pane {pane_id} は存在しません");
         }
         let result = self
-            .call(
+            .call_read_only(
                 "pane.read",
                 json!({"pane_id": pane_id, "source": "visible"}),
             )
@@ -425,14 +467,14 @@ impl Herdr {
             };
         }
         let result = self
-            .call("pane.process_info", json!({"pane_id": pane_id}))
+            .call_read_only("pane.process_info", json!({"pane_id": pane_id}))
             .await?;
         parse_process_info(&result, pane_id)
     }
 
     async fn status_of(&self, pane_id: &str) -> Result<AgentStatus> {
         let result = self
-            .call("pane.get", json!({"pane_id": pane_id}))
+            .call_read_only("pane.get", json!({"pane_id": pane_id}))
             .await
             .with_context(|| format!("herdr pane {pane_id} の状態を取得できません"))?;
         // `pane.get` の中身は `result.pane`。封筒の欠けた応答は Unknown に
@@ -445,6 +487,26 @@ impl Herdr {
                 format!("herdr pane.get 応答に pane object がありません ({pane_id})")
             })?;
         Ok(status_from(pane))
+    }
+
+    /// 読み出し専用 RPC を [`READ_ONLY_TIMEOUT`] 付きで呼ぶ。
+    ///
+    /// `call` 自身は接続・書き込み・行読みのどこにも期限を持たないので、herdr が
+    /// 黙ると単一 event loop がそこで止まる (静的配信は 200 のまま API だけが
+    /// 永久に返らなくなる)。超過は method 名を含む `Err` にして構造的に消す。
+    ///
+    /// **mutating な `agent.prompt` はここを通さない。** 応答を失っても
+    /// 「herdr 側で pane へ注入済みか」が分からず、期限で `Err` にすると daemon が
+    /// 「送れなかった」と判断して再配送し、呼び鈴の二重配送になりうる。
+    async fn call_read_only(&self, method: &str, params: Value) -> Result<Value> {
+        let Ok(result) = tokio::time::timeout(READ_ONLY_TIMEOUT, self.call(method, params)).await
+        else {
+            bail!(
+                "herdr {method} が {} 秒以内に応答しませんでした",
+                READ_ONLY_TIMEOUT.as_secs()
+            );
+        };
+        result
     }
 
     async fn call(&self, method: &str, params: Value) -> Result<Value> {
@@ -616,6 +678,23 @@ mod tests {
         where
             F: Fn(&str, &Value) -> Value + Send + Sync + 'static,
         {
+            Self::start_inner(None, responder)
+        }
+
+        /// `start` と同じだが、指定した 1 method にだけ **応答を返さない**
+        /// (接続は開けたまま黙り、EOF も返さない)。呼び出し側が期限を
+        /// 持たなければ永久に待つ状況を再現する。
+        fn start_silent<F>(silent: &str, responder: F) -> Self
+        where
+            F: Fn(&str, &Value) -> Value + Send + Sync + 'static,
+        {
+            Self::start_inner(Some(silent.to_owned()), responder)
+        }
+
+        fn start_inner<F>(silent: Option<String>, responder: F) -> Self
+        where
+            F: Fn(&str, &Value) -> Value + Send + Sync + 'static,
+        {
             let dir = TempDir::new().unwrap();
             let socket = dir.path().join("herdr.sock");
             let listener = UnixListener::bind(&socket).unwrap();
@@ -629,6 +708,7 @@ mod tests {
                     };
                     let recorded = Arc::clone(&recorded);
                     let responder = Arc::clone(&responder);
+                    let silent = silent.clone();
                     tokio::spawn(async move {
                         let mut reader = BufReader::new(stream);
                         let mut line = String::new();
@@ -643,6 +723,10 @@ mod tests {
                             .to_owned();
                         let params = request.get("params").cloned().unwrap_or(Value::Null);
                         recorded.lock().unwrap().push(request);
+                        if silent.as_deref() == Some(method.as_str()) {
+                            // 接続を握ったまま黙る (reader を落とさないので EOF も出ない)。
+                            std::future::pending::<()>().await;
+                        }
                         let response = responder(&method, &params);
                         let payload = format!("{response}\n");
                         let _ = reader.get_mut().write_all(payload.as_bytes()).await;
@@ -1228,6 +1312,70 @@ mod tests {
 
         assert!(error.contains("not_found"), "{error}");
         assert!(error.contains("no such pane"), "{error}");
+    }
+
+    /// 読み出し専用 RPC は期限を持つ。herdr が黙り込んでも event loop を
+    /// 永久に止めない。期限の直前ではまだ諦めず、越えたら **method 名を含む**
+    /// `Err` になる。仮想時計 (`start_paused`) で測るので実時間は待たない。
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_read_only_rpc_gives_up_at_the_deadline_with_its_method_name() {
+        let fake = FakeHerdr::start_silent("pane.list", |method, _| match method {
+            "ping" => ok(&json!({"type": "pong", "protocol": 17})),
+            "tab.list" => empty_tab_list(),
+            _ => ok(&json!({})),
+        });
+
+        // 期限の直前ではまだ諦めない (自前の期限のほうが先に切れたら失敗)。
+        let almost = tokio::time::timeout(
+            READ_ONLY_TIMEOUT.saturating_sub(std::time::Duration::from_millis(1)),
+            fake.client().panes(),
+        )
+        .await;
+        assert!(almost.is_err(), "期限の手前で諦めてはならない");
+
+        // 期限を越えたら method 名付きで失敗する。
+        let started = tokio::time::Instant::now();
+        let error = tokio::time::timeout(READ_ONLY_TIMEOUT * 4, fake.client().panes())
+            .await
+            .expect("期限を持たず永久に待っている")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("pane.list"), "{error}");
+        let waited = started.elapsed();
+        assert!(waited >= READ_ONLY_TIMEOUT, "{waited:?}");
+
+        // 黙っているのは pane.list だけ。同じ相手でも答える method は成功する。
+        assert_eq!(fake.client().protocol().await.unwrap(), 17);
+    }
+
+    /// mutating RPC (`agent.prompt`) は期限の対象外。応答を失っても
+    /// 「herdr 側で実行済みか」が分からず、`Err` にすると daemon が
+    /// 「送れなかった」と判断して再配送し、二重配送になりうる。
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_agent_prompt_is_never_cut_off_by_the_read_only_deadline() {
+        let fake = FakeHerdr::start_silent("agent.prompt", |method, _| match method {
+            "pane.get" => pane_get(&pane("w1:p2", "claude", "idle")),
+            _ => ok(&json!({})),
+        });
+
+        let client = fake.client();
+        let deliver = tokio::spawn(async move { client.deliver("w1:p2", "[agent-talk] #1").await });
+        // 呼び鈴の注入要求が herdr に届くまで仮想時計を進める。
+        for _ in 0..1000 {
+            if fake.methods().iter().any(|method| method == "agent.prompt") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        // 期限の無い RPC に入る前の pane.get は普通に答えている。
+        assert_eq!(fake.methods(), vec!["pane.get", "agent.prompt"]);
+
+        // 読み出し用の期限を遥かに超えても、注入は打ち切らない。
+        tokio::time::sleep(READ_ONLY_TIMEOUT * 100).await;
+        assert!(
+            !deliver.is_finished(),
+            "呼び鈴の注入を期限で打ち切ってはならない (二重配送になる)"
+        );
     }
 
     #[tokio::test]
