@@ -8,6 +8,7 @@
     type Agent,
     type MailboxEvent,
   } from "./api";
+  import { groupLetters, nextCursor } from "./letters";
 
   let mailboxes = $state<string[]>([]);
   let selected = $state("");
@@ -24,6 +25,7 @@
   let sending = $state(false);
   let composeMessage = $state("");
   let composeFailed = $state(false);
+  const groups = $derived(groupLetters(events, agents));
 
   async function loadAgents(): Promise<void> {
     try {
@@ -113,8 +115,7 @@
       phase = "loading";
     }
     try {
-      const after =
-        reset || events.length === 0 ? undefined : events.at(-1)?.id;
+      const after = reset ? undefined : nextCursor(events);
       const result = await fetchMailbox(mailbox, {
         after,
         limit: 100,
@@ -249,30 +250,45 @@
       <p>まだ letter はありません。</p>
     </div>
   {:else}
-    <ol class="letter-list" aria-label={`${selected} letter history`}>
-      {#each events as event (event.id)}
-        <li
-          class:incoming={event.direction === "in"}
-          class:outgoing={event.direction === "out"}
-        >
-          <div class="letter-meta">
-            <strong>{event.direction === "in" ? "IN" : "OUT"}</strong>
-            <span>#{event.id}</span>
-            <time datetime={event.created_at}
-              >{formatTime(event.created_at)}</time
-            >
-          </div>
-          <p>{event.body}</p>
-          <footer>
-            <span>{event.source_label}</span>
-            <span
-              >{event.direction === "in"
-                ? `→ ${event.target_name}`
-                : `← ${event.target_name}`}</span
-            >
-            {#if event.reply_to !== null}<span>reply #{event.reply_to}</span
+    <ol class="letter-groups" aria-label={`${selected} letter history`}>
+      {#each groups as group (group.key)}
+        <li class="letter-group" data-workspace={group.key}>
+          <h3 class="letter-group-head" id={`letter-group-${group.key}`}>
+            <span class="group-label">{group.label}</span>
+            {#if group.label !== group.key}<span class="group-id"
+                >{group.key}</span
               >{/if}
-          </footer>
+            <span class="group-count">{group.events.length} 通</span>
+          </h3>
+          <ol class="letter-list" aria-labelledby={`letter-group-${group.key}`}>
+            {#each group.events as event (event.id)}
+              <li
+                data-pane={event.target_pane}
+                class:incoming={event.direction === "in"}
+                class:outgoing={event.direction === "out"}
+              >
+                <div class="letter-meta">
+                  <strong>{event.direction === "in" ? "IN" : "OUT"}</strong>
+                  <span>#{event.id}</span>
+                  <time datetime={event.created_at}
+                    >{formatTime(event.created_at)}</time
+                  >
+                </div>
+                <p>{event.body}</p>
+                <footer>
+                  <span>{event.source_label}</span>
+                  <span
+                    >{event.direction === "in"
+                      ? `→ ${event.target_name}`
+                      : `← ${event.target_name}`}</span
+                  >
+                  {#if event.reply_to !== null}<span
+                      >reply #{event.reply_to}</span
+                    >{/if}
+                </footer>
+              </li>
+            {/each}
+          </ol>
         </li>
       {/each}
     </ol>

@@ -250,10 +250,47 @@ agent-terrace の letter-dock 構造を踏襲する。全幅 launcher バーは�
 
 ### 7.7 Letters 画面
 
-現行仕様を維持: mailbox selector + IN/OUT timeline (teal/kaki は文字 IN/OUT
-の補強)、poll なし・ID cursor による手動追記 fetch、inline compose
-(source = 選択 mailbox、宛先 = 稼働 agent select)。この画面の compose は
-dock 化の対象外。
+取得契約は現行のまま。mailbox selector と IN/OUT timeline を保つ
+(teal/kaki は文字 IN/OUT の補強)。fetch は poll なし・ID cursor による
+手動追記のまま。inline compose も現行どおり (source = 選択 mailbox、
+宛先 = 稼働 agent select)。この画面の compose は dock 化の対象外。
+
+**表示順と grouping** — client 側の表示変換のみで行い、取得配列・cursor・
+サーバ契約は変えない。
+
+- letter を workspace (herdr の space) で group 化する。key は `target_pane`
+  の `:` より前の prefix (`w2:p3` → `w2`)。`:` を含まない旧形式 pane は pane id
+  全体を key とする。
+- 並びは **新着が上**: group は「group 内の最大 id」の降順、group 内の letter は
+  id 降順。読むために末尾まで scroll させない。
+- **group 見出しは sticky な 1 行の非対話 `h3`** とする。§7.3 の session
+  カードは Letters に流用しない。理由は 2 つ。カードの padding + gap が
+  group ごとに縦を約 36px 奪う (モバイル縦スペース優先 §1)。そして全幅
+  hairline を既に持つ letter list と枠が二重になる。
+  - `position: sticky; top: 48px` (app header の直下)。地は `--surface`
+    (不透過)、下辺のみ 1px `--border`、高さ 32px 以上。letter はその下を潜る。
+  - 内容は 3 要素まで: label / workspace id / 件数。
+    - **label**: live registry (`/api/who`) に同 prefix の agent がいればその
+      `session` (workspace label)、いなければ workspace id。13px・weight 600・
+      letter-spacing 0.04em・1 行 ellipsis。
+    - **workspace id**: label と異なるときだけ併記 (同じ文字列を 2 度出さない)。
+      10px mono `--muted`。
+    - **件数**: 行末 (`margin-left: auto`) に `N 通`。10px mono `--muted`。
+    - **相手 agent 名は見出しに置かない**。1 workspace には複数 agent が同居
+      し得るため (§3) 見出しの単一名は誤導になる。宛先の所有者は各 letter の
+      footer (`→ / ← {target_name}`) 1 箇所に保つ。pane id は §7.3 と同じく
+      非表示。
+- letter item の意匠 (4px 方向バー・IN/OUT・#id・時刻・本文・footer) は現行
+  のまま。group ごとの `ol.letter-list` は上辺 border を持たない (見出しの下辺
+  と二重にしない)。group 由来の追加 indent は与えず、見出しの text 左端は
+  letter 本文の左端 (list 左端から 20px) に揃える。
+- group の折りたたみ・並べ替え・group 単位 fetch は置かない。tab 停止も増やさ
+  ない (selector → 更新 → 宛先 → 本文 → 送信)。見出しに entrance animation は
+  付けない (更新のたびに再生させないため)。
+- loading / empty / error / status 行 (`N letters`) は現行のまま。group は
+  events から導出するので空 group は構造上発生しない。
+- a11y: 各 group は `h3` + `ol[aria-labelledby]`。外側 list の
+  `${mailbox} letter history` は保つ。
 
 ### 7.8 Footer
 
@@ -400,3 +437,6 @@ registry 画面では aria-live output にのみ失敗を示す。
   contrast 比、theme 永続化、deep-link reload、Back/Forward、eyebrow 不在、
   session カード、pane 座標非表示) を実測する。prefers-color-scheme と
   prefers-reduced-motion は DevTools emulation で両値を検証する。
+- Letters の grouping (§7.7) は browser で実測する。対象は id の降順、
+  workspace ごとの分割、見出しの sticky 位置 (top 48px)、見出し高さ 32px 以上、
+  件数の一致。unit は純関数 (events → groups) を対象にする。

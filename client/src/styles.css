@@ -457,6 +457,47 @@ output.failed,
   background: var(--surface-raised);
   font-size: 11px;
 }
+.letter-groups {
+  display: grid;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.letter-group-head {
+  position: sticky;
+  top: 48px;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 32px;
+  margin: 0;
+  padding: 6px 16px 6px 20px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+.group-label {
+  overflow: hidden;
+  color: var(--on-surface);
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.group-id,
+.group-count {
+  color: var(--muted);
+  font:
+    10px "SFMono-Regular",
+    Consolas,
+    monospace;
+  letter-spacing: 0.08em;
+}
+.group-count {
+  margin-left: auto;
+  white-space: nowrap;
+}
 .letter-list {
   display: grid;
   gap: 1px;
@@ -465,6 +506,9 @@ output.failed,
   border-block: 1px solid var(--border);
   list-style: none;
   background: var(--border);
+}
+.letter-group .letter-list {
+  border-block-start: 0;
 }
 .letter-list li {
   position: relative;
