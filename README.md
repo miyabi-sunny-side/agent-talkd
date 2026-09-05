@@ -67,6 +67,11 @@ adapterはアーカイブ側から配置してください。
 `build.rs`からnpmは起動しません。`client/dist`がない状態でもCargoビルド自体は成功しますが、
 そのバイナリの静的ページは503を返します。
 
+release profile は `opt-level=3`、`lto=false`、`codegen-units=16`、`strip=true`
+とし、最適化を保ちながらビルド待ち時間を抑えます。PR・手動CIではfrontendとRustの
+検査および偽herdrを使うbridgeテストを実行し、配布用releaseビルドはtag・手動の
+release workflowで行います。
+
 ## CLI
 
 `run`, `register`, `unregister`, `who`, `resolve`,

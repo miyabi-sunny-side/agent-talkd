@@ -48,12 +48,6 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install integration test dependencies
-        run: sudo apt-get update && sudo apt-get install -y tmux psmisc
-
-      - name: Show tmux version
-        run: tmux -V
-
       - name: Check formatting
         run: cargo fmt --check
 
@@ -63,8 +57,5 @@ jobs:
       - name: Run tests
         run: cargo test --locked
 
-      - name: Build release binary
-        run: cargo build --locked --release
-
-      - name: Run real tmux integration test
-        run: cargo test --locked --test tmux_integration -- --ignored
+      - name: Run herdr bridge integration tests
+        run: cargo test --locked --test bridge -- --ignored

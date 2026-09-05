@@ -86,7 +86,7 @@ jobs:
           fi
 
       # 梱包の書き忘れを同じ job で落とす: archive の内容と、取り出した
-      # agent-talk-mcp が名乗る version を tag の版と突き合わせる。
+      # 両バイナリが名乗る version を tag の版と突き合わせる。
       - name: Verify archive contents
         shell: bash
         run: |
@@ -95,6 +95,7 @@ jobs:
           check_dir="$(mktemp -d)"
           tar -xzf "${{ matrix.artifact }}" -C "$check_dir"
           version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          test "$("$check_dir/agent-talk" --version)" = "agent-talk $version"
           test "$("$check_dir/agent-talk-mcp" --version)" = "agent-talk-mcp $version"
 
       - name: Upload workflow artifact

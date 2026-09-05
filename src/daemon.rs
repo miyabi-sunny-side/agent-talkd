@@ -4585,7 +4585,7 @@ mod tests {
             "通知が durable になった時点で original は退役している"
         );
         // 配達に失敗した通知は queue に残り、次の health tick で再試行する。
-        assert!(broker.state.agents["w1:p1"].queue.len() == 1);
+        assert_eq!(broker.state.agents["w1:p1"].queue.len(), 1);
 
         for _ in 0..3 {
             broker.sync_herdr_registry().await;
