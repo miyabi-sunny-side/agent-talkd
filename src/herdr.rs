@@ -1,5 +1,9 @@
 //! Thin, bounded Herdr adapter. Session identity is checked immediately before input.
-use std::{fmt, path::PathBuf, time::Duration};
+use std::{
+    fmt,
+    path::{Path, PathBuf},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -11,6 +15,7 @@ use tokio::{
 };
 
 const MAX_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_SCREEN_BYTES: usize = 256 * 1024;
 const RPC_TIMEOUT: Duration = Duration::from_secs(5);
 pub const MAX_MESSAGE_BYTES: usize = 32 * 1024;
 
@@ -55,6 +60,17 @@ pub struct Agent {
     // Keep the native Herdr field name in the observation API.
     #[allow(clippy::struct_field_names)]
     pub agent_session: Option<AgentSession>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Screen {
+    pub pane_id: String,
+    pub terminal_id: String,
+    pub session_id: Option<String>,
+    pub text: String,
+    /// Unix epoch milliseconds at completion of the pane read.
+    pub captured_at: u64,
+    pub format: &'static str,
 }
 
 #[derive(Clone)]
@@ -106,6 +122,10 @@ impl Herdr {
                 .and_then(|result| result["tabs"].as_array())
                 .and_then(|tabs| tabs.iter().find(|tab| tab["tab_id"] == row["tab_id"]));
             agent.name = agent_name(row, tab);
+            agents.push(agent);
+        }
+        distinguish_agent_names(&mut agents);
+        for agent in &mut agents {
             if let Some(label) = labels
                 .as_ref()
                 .and_then(|r| r["workspaces"].as_array())
@@ -115,7 +135,6 @@ impl Herdr {
             {
                 label.clone_into(&mut agent.workspace);
             }
-            agents.push(agent);
         }
         Ok(agents)
     }
@@ -151,6 +170,65 @@ impl Herdr {
             }
         }
         Ok(agent)
+    }
+
+    /// Read the visible terminal without accepting output from a changed session.
+    /// # Errors
+    /// Rejects stale identities, malformed output, oversized screens, and unavailable panes.
+    pub async fn screen(
+        &self,
+        pane: &str,
+        expected_terminal: &str,
+        expected_session: Option<&str>,
+    ) -> Result<Screen> {
+        if expected_terminal.is_empty()
+            || expected_terminal.len() > 256
+            || expected_session.is_some_and(|session| session.is_empty() || session.len() > 4096)
+        {
+            return Err(error("invalid_input", "Invalid terminal or session ID"));
+        }
+        let before = self.get(pane).await?;
+        validate_screen_session(&before, expected_terminal, expected_session)?;
+        let result = self
+            .call(
+                "pane.read",
+                json!({"pane_id":pane,"source":"visible","format":"text","strip_ansi":true}),
+                false,
+            )
+            .await?;
+        let captured_at = u64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())?;
+        let read = &result["read"];
+        if result["type"] != "pane_read"
+            || read["pane_id"] != pane
+            || read["source"] != "visible"
+            || read["format"] != "text"
+            || read["truncated"] != false
+        {
+            return Err(error("unavailable", "Herdr returned an invalid screen"));
+        }
+        let text = read["text"]
+            .as_str()
+            .filter(|text| text.len() <= MAX_SCREEN_BYTES)
+            .ok_or_else(|| error("unavailable", "Herdr screen is missing or too large"))?;
+        let after = self.get(pane).await?;
+        validate_screen_session(&after, expected_terminal, expected_session)?;
+        if before.agent_session != after.agent_session
+            || before.session_id != after.session_id
+            || before.harness != after.harness
+        {
+            return Err(error(
+                "session_changed",
+                "The selected session changed while reading the screen",
+            ));
+        }
+        Ok(Screen {
+            pane_id: pane.into(),
+            terminal_id: expected_terminal.into(),
+            session_id: after.session_id,
+            text: text.into(),
+            captured_at,
+            format: "text",
+        })
     }
 
     /// A failed prompt acknowledgement is indeterminate and must never be retried automatically.
@@ -325,23 +403,75 @@ fn parse_agent(row: &Value) -> Result<Agent> {
     })
 }
 
+fn distinguish_agent_names(agents: &mut [Agent]) {
+    let mut groups = std::collections::BTreeMap::<_, Vec<usize>>::new();
+    for (index, agent) in agents.iter().enumerate() {
+        groups
+            .entry((agent.workspace.clone(), agent.name.clone()))
+            .or_default()
+            .push(index);
+    }
+    for ((_, name), indices) in groups {
+        if indices.len() < 2 {
+            continue;
+        }
+        // Keep the pane's own number: neighboring panes may appear or disappear.
+        for index in indices {
+            if let Some((_, number)) = agents[index].pane_id.split_once(":p") {
+                agents[index].name = format!("{name} · 端末 {number}");
+            }
+        }
+    }
+}
+
 fn agent_name(row: &Value, tab: Option<&Value>) -> String {
-    row["name"]
+    if let Some(name) = row["name"]
         .as_str()
+        .map(str::trim)
         .filter(|name| !name.is_empty())
-        .or_else(|| {
-            tab.and_then(|tab| {
-                let label = tab["label"].as_str().filter(|label| !label.is_empty())?;
-                (tab["number"]
-                    .as_u64()
-                    .is_some_and(|number| label != number.to_string()))
-                .then_some(label)
-            })
-        })
+    {
+        return name.into();
+    }
+    if let Some(label) = tab.and_then(|tab| {
+        let label = tab["label"].as_str()?.trim();
+        (!label.is_empty()
+            && tab["number"]
+                .as_u64()
+                .is_none_or(|number| label != number.to_string()))
+        .then_some(label)
+    }) {
+        return label.into();
+    }
+    let directory = row["foreground_cwd"]
+        .as_str()
+        .filter(|cwd| !cwd.is_empty())
+        .or_else(|| row["cwd"].as_str())
+        .and_then(|cwd| Path::new(cwd).file_name())
+        .and_then(|name| name.to_str());
+    let base = directory
         .or_else(|| row["agent"].as_str().filter(|name| !name.is_empty()))
-        .or_else(|| row["pane_id"].as_str())
-        .unwrap_or("unknown")
-        .to_owned()
+        .unwrap_or("セッション");
+    let number = tab.and_then(|tab| tab["number"].as_u64()).or_else(|| {
+        row["tab_id"]
+            .as_str()?
+            .split_once(":t")?
+            .1
+            .parse::<u64>()
+            .ok()
+    });
+    number.map_or_else(|| base.into(), |number| format!("{base} · タブ {number}"))
+}
+
+fn validate_screen_session(agent: &Agent, terminal: &str, session: Option<&str>) -> Result<()> {
+    if agent.terminal_id != terminal
+        || session.is_some_and(|session| agent.session_id.as_deref() != Some(session))
+    {
+        return Err(error(
+            "session_changed",
+            "The selected session ended or restarted; refresh the target",
+        ));
+    }
+    Ok(())
 }
 
 fn process_identity(result: &Value, pane: &str, harness: &str) -> Result<u64> {
@@ -560,7 +690,7 @@ mod tests {
         }
     }
     #[test]
-    fn display_name_prefers_registered_name_then_custom_tab_then_harness() {
+    fn display_name_prefers_registered_name_then_custom_tab_then_directory_and_tab() {
         let mut value = row();
         value["tab_id"] = json!("w1:t2");
         let custom = json!({"tab_id":"w1:t2","label":"backend delivery","number":2});
@@ -569,7 +699,49 @@ mod tests {
         assert_eq!(agent_name(&value, Some(&custom)), "named agent");
         value["name"] = Value::Null;
         let numbered = json!({"tab_id":"w1:t2","label":"2","number":2});
-        assert_eq!(agent_name(&value, Some(&numbered)), "codex");
-        assert_eq!(agent_name(&value, None), "codex");
+        value["cwd"] = json!("/home/user/project");
+        assert_eq!(agent_name(&value, Some(&numbered)), "project · タブ 2");
+        assert_eq!(agent_name(&value, None), "project · タブ 2");
+        value["foreground_cwd"] = json!("/home/user/other");
+        assert_eq!(agent_name(&value, Some(&numbered)), "other · タブ 2");
+        value["tab_id"] = json!("w1:t3");
+        assert_eq!(agent_name(&value, None), "other · タブ 3");
+        value["cwd"] = Value::Null;
+        value["foreground_cwd"] = Value::Null;
+        assert_eq!(agent_name(&value, None), "codex · タブ 3");
+    }
+    #[test]
+    fn split_panes_with_matching_labels_are_distinguished_only_within_their_workspace() {
+        for explicit in [None, Some("review")] {
+            let mut agents = Vec::new();
+            for (workspace, pane, tab) in [
+                ("w1", "w1:p9", "w1:t2"),
+                ("w1", "w1:p2", "w1:t2"),
+                ("w2", "w2:p1", "w2:t2"),
+                ("w1", "w1:p7", "w1:t3"),
+                ("w1", "w1:p8", "w1:t2"),
+            ] {
+                let mut value = row();
+                value["pane_id"] = json!(pane);
+                value["workspace_id"] = json!(workspace);
+                value["tab_id"] = json!(tab);
+                value["cwd"] = json!("/home/user/project");
+                if tab.ends_with("t2") {
+                    value["name"] = json!(explicit);
+                }
+                agents.push(parse_agent(&value).unwrap());
+            }
+            let mut after_exit = agents.clone();
+            after_exit.retain(|agent| agent.pane_id != "w1:p2");
+            distinguish_agent_names(&mut after_exit);
+            distinguish_agent_names(&mut agents);
+            let base = explicit.unwrap_or("project · タブ 2");
+            assert_eq!(agents[0].name, format!("{base} · 端末 9"));
+            assert_eq!(agents[1].name, format!("{base} · 端末 2"));
+            assert_eq!(agents[2].name, base);
+            assert_eq!(agents[3].name, "project · タブ 3");
+            assert_eq!(after_exit[0].name, agents[0].name);
+            assert_eq!(after_exit[3].name, agents[4].name);
+        }
     }
 }

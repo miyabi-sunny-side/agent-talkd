@@ -10,6 +10,8 @@
   import { currentRoute, navigate, onPopstate, type Route } from "./router";
   import ConversationPanel from "./ConversationPanel.svelte";
   import ThemeModal from "./ThemeModal.svelte";
+  let visualHeight = $state<number | undefined>();
+  let visualTop = $state(0);
   let agents = $state<Agent[]>([]);
   let phase = $state<"loading" | "ready" | "error">("loading");
   let reason = $state("");
@@ -129,6 +131,14 @@
     menuButton?.focus();
   }
   onMount(() => {
+    const visual = window.visualViewport;
+    const resize = () => {
+      visualHeight = visual?.height;
+      visualTop = visual?.offsetTop ?? 0;
+    };
+    resize();
+    visual?.addEventListener("resize", resize);
+    visual?.addEventListener("scroll", resize);
     void refresh();
     schedule();
     const unsubscribe = onPopstate((next) => {
@@ -146,6 +156,8 @@
     };
     document.addEventListener("visibilitychange", visibility);
     return () => {
+      visual?.removeEventListener("resize", resize);
+      visual?.removeEventListener("scroll", resize);
       disposed = true;
       generation++;
       if (timer) clearTimeout(timer);
@@ -191,7 +203,11 @@
   </div>
 {/snippet}
 {#if route.view === "agent"}
-  <main class="detail-view">
+  <main
+    class="detail-view"
+    style:--visual-height={visualHeight ? `${visualHeight}px` : "100dvh"}
+    style:--visual-top={`${visualTop}px`}
+  >
     <header class="detail-chrome">
       <div class="detail-bar-primary">
         <button

@@ -1,5 +1,6 @@
 export interface Agent {
   pane_id: string;
+  terminal_id?: string;
   name: string;
   workspace: string;
   cwd: string;
@@ -161,4 +162,38 @@ export function unavailableReason(agent: Agent): string {
       `現在の状態 (${agent.status}) では送信できません。`
     );
   return "";
+}
+
+export interface ScreenCapture {
+  pane_id: string;
+  terminal_id: string;
+  session_id: string | null;
+  text: string;
+  captured_at: number;
+  format: "text";
+}
+export async function fetchScreen(
+  pane: string,
+  terminal: string,
+  session: string | null,
+  signal?: AbortSignal,
+): Promise<ScreenCapture> {
+  const query = new URLSearchParams({ pane, terminal });
+  if (session) query.set("session", session);
+  const body = await request(`/api/screen?${query}`, { signal });
+  if (
+    !record(body) ||
+    body.pane_id !== pane ||
+    body.terminal_id !== terminal ||
+    !nullable(body.session_id) ||
+    (session !== null && body.session_id !== session) ||
+    typeof body.text !== "string" ||
+    body.format !== "text" ||
+    typeof body.captured_at !== "number" ||
+    !Number.isFinite(body.captured_at) ||
+    body.captured_at <= 0 ||
+    body.captured_at > 8640000000000000
+  )
+    invalid();
+  return body as unknown as ScreenCapture;
 }

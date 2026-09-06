@@ -1,6 +1,6 @@
 ---
 name: agent-talkd remote messages UI
-version: 4
+version: 5
 description: >
   Project design authority for the agent-talkd web client. Self-contained:
   everything needed to implement and verify the UI lives in this file.
@@ -26,6 +26,8 @@ Codex / Claude Code を対象とし、その他の CLI は実際の adapter 対�
 mailbox・skill 選択・エージェント間通信・呼び鈴・ack の操作は置かない。
 brush loader は loading 表示として残す。長い native CLI 履歴は直近から開き、
 古い会話のページ取得と差分更新で、同じ session の原文を継続して読める。
+「画面」は Herdr `pane.read` の visible text を確認する閲覧専用の補助面とする。
+窓の画像や端末の完全再現ではなく、取得できた行・空白を読む表示である。
 
 ## 2. 画面と URL (router contract)
 
@@ -37,7 +39,7 @@ fallback するため、サーバ変更は不要。
 |---|---|
 | `/` | Registry (agent 一覧) |
 | `/letters` | 旧 URL。Registry へ `replaceState` で正規化 |
-| `/agent?pane=<id>` | Agent detail (同一 CLI session の会話・報告 + 手紙 dock) |
+| `/agent?pane=<id>` | Agent detail (同一 CLI session の会話 / 閲覧専用画面 + 共通の手紙 dock) |
 
 規則:
 
@@ -76,6 +78,10 @@ view/selectedAgent を URL と別に持つ state にしない (単一情報源)�
 - **送信結果**: API 受理・対象への入力・エージェントの処理・完了は別の事実。
   adapter が確認できた段階だけ表示し、HTTP 成功から処理完了を推測しない。
   進捗・完了の根拠は実際の assistant 報告であり、idle への遷移だけではない。
+- **宛先の短い表示**: Herdr の明示名 / タブ名を優先し、runtime 名だけでは区別
+  できない対象には作業ディレクトリの末尾等の実データを添える。同名なら親 directory
+  等で区別を補う。省略した作業パスは title 等から確認できる。opaque pane / session
+  ID は通常の見出し・タブ・フォーム・accessible name に出さず、内部照合に保持する。
 - **状態色**: idle = `--idle`、busy = `--busy`。一覧ボタンの border と詳細タブの
   文字色で補強する。accessible name に name と状態を含め、送信可否の理由は
   可視テキストでも説明する。danger は失敗表示専用。
@@ -213,7 +219,7 @@ viewport 全幅。左右 gutter は詳細 `.detail-bar-primary` と共通 token�
 
 - 1 段目 48px: brand (`aria-label="agent talk — 一覧へ戻る"`) + session 名
   (Herdr workspace label)。
-  session の title/aria-label に `session · pane_id`。pane id は非表示。
+  session の title/aria-label に省略前の workspace label。opaque ID は含めない。
 - 2 段目 40px: 同一 workspace の agent タブを常時表示。active は下線、状態は
   文字色 (idle/busy/退出)。切替は replaceState。tap ≥36px。
 
@@ -221,7 +227,12 @@ viewport 全幅。左右 gutter は詳細 `.detail-bar-primary` と共通 token�
 
 - 詳細の主面は選択中の CLI session の履歴。user は「あなた」、assistant は
   「エージェント」と可視ラベルで区別し、本文を通常フォント・テーマ追従で表示する。
-  改行を保ち、長い文字列は折り返す。コードブロックの横 scroll は内部に限定する。
+  assistant の報告は段落・リスト・強調・インラインコード・コードブロック・リンク・
+  表を安全な Markdown として表示する。user の原文は改行と記号を保つ。コード内の
+  改行・空白・記号は保持し、コードと表の横 scroll は各領域内に限定する。
+  raw HTML は実行せず文字列として扱い、script / event handler や危険な URL scheme
+  を実行可能にしない。外部埋め込みは行わない。本文は長い文字列を折り返し、
+  ページ取得上限・時系列・読み位置の契約は Markdown 化後も維持する。
 - 原文の時系列を維持し、Web から送った内容と端末上の内容を同じ履歴で読む。
   ローカル送信結果を履歴に重複追加しない。実履歴に未反映の間は送信状態欄で示す。
 - 初回 loading / 履歴なし / 取得失敗 + 再試行を別表示にする。更新失敗時は取得済み
@@ -244,6 +255,8 @@ viewport 全幅。左右 gutter は詳細 `.detail-bar-primary` と共通 token�
   ページ切替または「最新へ」の明示操作で旧表示を解放する。背景の差分更新で
   読んでいる本文を追い出したり、無断で別ページへ切り替えたりしない。
 - 詳細 chrome 直下に高さ 44px の操作バーを確保し、本文の scroll から独立させる。
+  共通の「会話 / 画面」選択をここに置く。選択状態は可視の下線と ARIA で示し、
+  keyboard で切り替えられる。両操作は高さ 44px を確保する。
   状態と「最新へ戻る」quiet-button はこのバーに置く。状態のないときは
   「会話・報告」と表示する。長い状態・エラー文は高さ 44px 以内の内部 scroll で
   全文へ到達できるようにし、状態変化で本文の開始位置を動かさない。
@@ -255,20 +268,22 @@ viewport 全幅。左右 gutter は詳細 `.detail-bar-primary` と共通 token�
   本文や手紙 dock を覆わず、320px 幅でも折り返して到達できること。keyboard
   操作と focus-visible を備え、touch target は 44px 以上。非同期取得で focus を
   奪わず、操作元が消えるページ切替では会話領域へ focus を移して操作を継続する。
-- terminal 画面・キー送信 UI は主面に置かない。承認待ちを含め、スマホで端末キーを
-  再現する操作を解決手段として要求しない。
+- 初期面は会話とし、閲覧専用の「画面」は §7.10 に従う。端末入力・キー送信 UI は
+  置かない。承認待ちを含め、スマホで端末キーを再現する操作を要求しない。
 
 ### 7.6 手紙 dock — 詳細画面下部
 
 既存の ribbon composer を継承し、宛先は表示中の pane + CLI session に固定する。
+会話 / 画面の両面で同じ dock・draft・送信状態を共有し、切替で再初期化しない。
 
 - **tab**: 右寄せ、右 inset `max(10px, safe-area-right)`、`min-width: 108px`、
   `height: 44px`、上角 9px、地は `--surface-raised`。上辺に全幅 1px border。
   封筒 SVG + `手紙` + chevron、`aria-expanded` / `aria-controls` を持つ。
   draft があれば accent 枠と accessible name の「下書きあり」で示す。
-- **panel**: `max-height: min(62dvh, 420px)`、内部 scroll。閉時は `inert` と
+- **panel**: 通常は `max-height: min(62dvh, 420px)`、内部 scroll。実際の可視領域が
+  小さいときは §10 の高さ制約を優先し、送信・閉じるまで必ず到達できる。閉時は `inert` と
   `aria-hidden="true"`。開くと本文へ focus、閉じる / Escape で tab へ戻す。
-- 内容は `{agent.name} へ手紙を出す`、宛先の runtime / session、本文 textarea、
+- 内容は `{短い宛先表示} へ手紙を出す`、必要な場合の runtime / 作業先、本文 textarea、
   送信ボタン、状態説明。mailbox source・skill picker・独立の授権ゲートは置かない。
 - textarea は通常の日本語入力と改行を扱う。明示した「送信」ボタンで原文を送り、
   Enter / IME 確定だけでは送信しない。送信ボタンは min-height 44px。
@@ -354,6 +369,28 @@ maskable 版は通常版の描画を中心 (256,256) 基準で `scale(0.875)` �
 **manifest の色**: `background_color` / `theme_color` はいずれも `#171714` とし、
 `client/index.html` の `<meta name="theme-color">` と同値に保つ。
 
+### 7.10 閲覧専用の「画面」
+
+- Herdr `pane.read` が返す現在の visible text を情報源とし、「端末テキスト・閲覧専用」
+  と明示する。会話履歴から画面を作らず、常駐記録や端末入力を追加しない。
+- 既存 terminal token と mono font を使う `pre` 相当で行・空白を保持する。折り返しで
+  行配置を変えず、上下左右の scroll は画面領域の内側に閉じる。選択・コピー可能。
+  ブラウザで raw HTML / 制御シーケンスを実行しない。テーマ切替でも terminal token
+  は §4.3 の固定色を維持し、周囲の chrome と状態説明は通常テーマに従う。
+- 取得成功時刻を可視表示し、自動更新の開始時刻で上書きしない。loading / 空の画面 /
+  初回失敗 + 再試行を区別する。更新失敗・切断・終了後は取得済み表示と成功時刻を
+  残し、「古い表示」と理由を併記する。切替後の再取得前も現在確認済みとは表示しない。
+- 画面閲覧は送信可否と独立する。native session 未登録 / unsupported / blocked でも、
+  Herdr の端末実体を特定できれば閲覧できる。API は pane + terminal identity を必須、
+  native CLI session identity を任意とし、native 登録を閲覧の必須条件にしない。
+- pane + terminal identity と、指定した場合の CLI session identity を固定して取得する。
+  対象変更後の遅延応答は混ぜない。固定した identity の変更では旧画面を古い表示と
+  明示して停止し、新しい対象を明示的に開き直す。端末終了時も更新を止める。
+  手紙の draft 保護と送信可否は引き続き §7.7 に従う。
+- 会話 / 画面切替は対象・draft・会話ページ・読み位置を保持し、戻る履歴を増やさない。
+  hidden の本文は focus 対象にしない。非同期更新で操作 focus や画面の scroll 位置を
+  奪わず、状態だけ `aria-live="polite"` で伝える。端末全文を live announcement しない。
+
 ## 8. モーダル共通規約 (copy-then-own)
 
 - 中央配置・`border-radius: 12px`・`padding: 16px`・地は `--surface-raised`。
@@ -372,11 +409,14 @@ maskable 版は通常版の描画を中心 (256,256) 基準で `scale(0.875)` �
 
 | 対象 | 周期 | 条件 |
 |---|---|---|
-| 選択 session の会話・報告 (`/api/conversation`) | 2s | `/agent` 表示中 + document visible。初回は直近、その後は前方差分 |
+| 選択 session の会話・報告 (`/api/conversation`) | 2s | `/agent` の会話表示中 + document visible。初回は直近、その後は前方差分 |
+| 選択端末のテキスト (Herdr `pane.read` 経由) | 2s | `/agent` の画面表示中 + document visible + 同じ生存 terminal identity。native 登録・送信可否は条件にしない |
 | registry (`/api/agents`) | 5s | 全 view で document visible (App level 単一 poller) |
 
-hidden で停止し、visible 復帰で即時 refresh。古い宛先の遅延レスポンスを新しい
-宛先の履歴へ混ぜない。poll 失敗で取得済み内容を消さず、可視状態と aria-live で
+非表示の面・document hidden で取得を停止し、表示復帰で即時 refresh。
+画面の取得済み応答は §7.10 の固定した identity と表示世代を照合し、
+切替前の遅延応答を採用しない。
+古い宛先の遅延レスポンスを新しい宛先の履歴へ混ぜない。poll 失敗で取得済み内容を消さず、可視状態と aria-live で
 失敗を示す。切断・再接続中も取得済みの本文と読み位置を保持し、初回 loading に
 戻さない。同じ session への復帰は前方差分から再開する。cursor が無効になり
 直近の再取得が必要な場合も、本文を残したまま説明と「最新へ」の操作を示す。
@@ -389,6 +429,12 @@ hidden で停止し、visible 復帰で即時 refresh。古い宛先の遅延レ
 - 390×844 / 412×915 (mobile): app/detail 1 段目 48px、detail 2 段目 40px、
   dock 閉時の会話・報告領域は viewport の 55% 以上。dock 展開中はこの最低値を
   課さず、本文入力・送信・状態表示が縦 scroll で到達できること。
+- 320×440 / 390×440 と横向きの低い viewport でも、dock の閉じる・textarea・
+  送信・状態説明へ到達できる。`visualViewport` がある場合はその height / offset と
+  resize / scroll に追従し、無い場合は `dvh` に fallback する。safe-area の左右・下
+  inset を含めて可視領域に収める。入力欄の最小高さで送信を押し出さない。
+  panel の padding と border を高さに含め、内部 scroll の末尾で送信ボタン全体が
+  可視領域内に入ること。状態説明が長くても閉じる・送信が到達不能にならない。
 - ≥1020px: 一覧の本文 main は 1020px で中央固定。app header は viewport 全幅
   のまま (詳細 1 段目と brand/menu の端を揃える)。詳細は viewport 全幅を使い、
   本文は折り返して表示。dock の tab は右寄せ、上辺の線は全幅。
@@ -430,6 +476,9 @@ hidden で停止し、visible 復帰で即時 refresh。古い宛先の遅延レ
 - **history**: 直近追従 ⇄ 過去閲覧。後方取得中 / 後方取得失敗は本文・位置保持。
   過去閲覧中の新着は最新への導線で知らせる。表示上限でのページ切替と直近への
   移動は明示操作で行う。切断 → 復帰は取得済み表示を保ち、identity を混ぜない。
+- **content view**: 会話 ⇄ 画面。切替で対象・draft・会話の読み位置を維持。
+  画面は loading → ready / empty / error、継続失敗・切断・終了で stale。
+  identity 変更で旧表示の更新を停止する。
 - **composer**: closed ⇄ open。送信 idle → sending → accepted / delivered /
   failed / result-unknown。状態名は API が確かめた事実に合わせる。
   accepted / delivered を agent の処理完了へ自動遷移させない。
@@ -444,7 +493,10 @@ hidden で停止し、visible 復帰で即時 refresh。古い宛先の遅延レ
 - `npm run check` (svelte-check) と `npm run format:check` を green に保つ。
 - Chromium + Playwright による browser 実測: 320px 幅 / 390×844 / 412×915 /
   1020×800、両テーマで横 overflow なし、header 48px、detail chrome 89px、
-  dock tab 44px / 108px、panel ≤min(62dvh,420px)、本文の可読性・contrast 比を測る。
+  dock tab 44px / 108px、通常 panel ≤min(62dvh,420px)、本文の可読性・contrast 比を測る。
+  320×440 / 390×440 と横向きでも送信・閉じるの全 bounding box が可視領域内に
+  到達し、クリックできることを確認する。visualViewport 追従の確認と実機 IME の
+  確認は区別し、実スマホを未確認ならその制約を報告する。
 - 実操作で deep-link reload、Back/Forward、テーマ保存、IME 改行、focus 復帰、
   disabled 理由、loading / empty / error、draft 復元と再起動時の隔離を確認する。
   prefers-color-scheme / reduced-motion も emulation で確認する。
@@ -453,6 +505,12 @@ hidden で停止し、visible 復帰で即時 refresh。古い宛先の遅延レ
   viewport 内の縦座標を測り、変化が 2px 以内であることを確認する。
   上限到達時は明示操作による切替のみ許可し、「最新へ」で直近末尾に戻れること、
   取得失敗・切断・復帰で既存本文を消さないこと、focus と狭幅の操作性を確認する。
+- Markdown の通常表示・長いコードと表・raw HTML / 危険リンクを DOM と実操作で
+  確認する。会話 / 画面の両方から同じ draft を送れ、切替で会話の読み位置が変わらず、
+  opaque ID が通常表示されないことを確認する。画面タブの非表示中は画面取得が増えず、
+  復帰で即時取得すること、取得時刻・更新失敗・切断・終了・identity 変更時の古い表示を
+  確認する。専用 Herdr pane の実際の行・空白と Web 表示を比較し、画像との違いを
+  記録する。利用者の作業 pane にテスト入力を送らない。
 - 実ブラウザ経路で Codex と Claude Code の対象確認 → 原文指示 → 実 session 受信
   → assistant 報告表示を確認する。追加指示と接続切断・終了時の表示も確認し、
   送信成功だけで実 session の処理・報告検証を代替しない。

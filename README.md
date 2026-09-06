@@ -2,7 +2,9 @@
 
 Tailscale 越しに Herdr の Codex / Claude Code セッションへメッセージを送り、返答・報告を読むための小さなブラウザ画面です。スマホから送った原文は選んだ CLI の会話に残るので、帰宅後そのセッションで作業を続けられます。
 
-一覧で作業先・CLI・状態を確認し、対象を開いて手紙を送ります。返答は各 CLI が保存する会話履歴から表示します。端末画面を操作するための記号キーや Ctrl / Shift 操作はありません。
+一覧で作業先・CLI・状態を確認し、対象を開いて手紙を送ります。返答は各 CLI が保存する会話履歴から Markdown で表示します。利用者の文面とコードの文字・空白は保持します。「会話」「画面」を切り替えても同じ宛先へ手紙を送れ、下書きも保たれます。短いタブ名や作業ディレクトリで宛先を区別できます。端末画面を操作するための記号キーや Ctrl / Shift 操作はありません。
+
+「画面」は Herdr の `pane.read` (`visible` / `text` / `strip_ansi`) が返す現在の表示テキストです。ピクセル単位の窓画像ではなく、色・カーソル・端末の装飾は再現しません。行と空白を保持し、縦横にスクロールできます。取得成功時刻を表示し、切断・終了・入替・取得失敗時は以前の表示であることを示します。表示中だけ2秒ごとに取得し、別タブや非表示では停止します。送信できない未登録・対応外 CLI・承認待ちの画面も閲覧できます。画面の常駐記録やキー転送は行いません。
 
 ## 起動と配布
 
@@ -37,7 +39,10 @@ Herdr は session identity を原子的に比較して prompt を送る API を�
 | Herdr 内の対象一覧 | `GET /api/agents` |
 | 対象 CLI の会話 | `GET /api/conversation?pane=<pane>&session=<session_id>` |
 | 会話の前後ページ | 同 URL に `before=<cursor>` または `after=<cursor>`（排他） |
+| 閲覧専用の現在画面 | `GET /api/screen?pane=<pane>&terminal=<terminal_id>`（任意で `session=<session_id>`） |
 | 原文メッセージ入力 | `POST /api/messages` |
+
+画面取得は最大256 KiBです。取得前後の端末・セッションの一致を確認し、`pane_id`、`terminal_id`、`session_id`（未登録なら `null`）、`text`、`format: "text"`、`captured_at`（epoch milliseconds）を返します。
 
 送信は `Content-Type: application/json` で `{"pane_id":"w1:p3","session_id":"一覧の識別子","body":"原文"}` を渡します。本文は最大 32 KiB、空白だけの本文と改行・タブ以外の制御文字を拒否します。成功応答は `{"status":"submitted"}`。エラーは `{"error":{"code":"...","message":"..."}}` です。CORS を開放せず、異なる Origin と cross-site fetch を拒否します。
 

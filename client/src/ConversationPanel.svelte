@@ -1,5 +1,7 @@
 <script lang="ts">
   import { onMount, tick, untrack } from "svelte";
+  import ScreenPanel from "./ScreenPanel.svelte";
+  import Markdown from "./Markdown.svelte";
   import { appendMessages } from "./conversation";
   import {
     fetchConversation,
@@ -18,6 +20,7 @@
   }: { agent: Agent; available: boolean; connected: boolean } = $props();
   const target = untrack(() => ({
     pane: agent.pane_id,
+    terminal: agent.terminal_id,
     session: agent.session_id,
     name: agent.name,
     harness: agent.harness,
@@ -32,6 +35,7 @@
   }
   let draft = $state(loadDraft());
   let open = $state(false);
+  let view = $state<"conversation" | "screen">("conversation");
   let sending = $state(false);
   let result = $state("");
   let failed = $state(false);
@@ -57,6 +61,10 @@
   let fetching = false;
   let queued: "latest" | "older" | "newer" | undefined;
   const changed = $derived(agent.session_id !== target.session);
+  const screenChanged = $derived(
+    agent.terminal_id !== target.terminal ||
+      (target.session !== null && changed),
+  );
   const blocked = $derived(
     changed
       ? "別のセッションに変わりました。下書きは以前の宛先に保管しています。一覧から対象を開き直してください。"
@@ -85,6 +93,7 @@
     }
     if (
       disposed ||
+      view !== "conversation" ||
       !target.session ||
       changed ||
       !available ||
@@ -108,7 +117,7 @@
         target.session,
         cursor,
       );
-      if (disposed || changed) return;
+      if (disposed || changed || view !== "conversation") return;
       // Read the position after the request: the person may have scrolled while it was in flight.
       const follow =
         !loaded ||
@@ -192,7 +201,11 @@
   }
   function schedule() {
     if (timer) clearTimeout(timer);
-    if (!disposed && document.visibilityState === "visible")
+    if (
+      !disposed &&
+      view === "conversation" &&
+      document.visibilityState === "visible"
+    )
       timer = setTimeout(() => {
         void refresh().finally(schedule);
       }, 2000);
@@ -212,6 +225,12 @@
       document.removeEventListener("visibilitychange", visibility);
     };
   });
+  async function switchView(next: "conversation" | "screen") {
+    view = next;
+    if (timer) clearTimeout(timer);
+    await tick();
+    if (view === "conversation") void refresh().finally(schedule);
+  }
   async function toggle() {
     open = !open;
     await tick();
@@ -269,42 +288,58 @@
 />
 <div class="conversation-workspace">
   <div class="history-controls">
-    <output aria-live="polite"
-      >{historyError
-        ? `会話を更新できません: ${historyError}`
-        : paging
-          ? "会話のページを読み込んでいます…"
-          : limited
-            ? "表示上限に達しました。新しい会話、または最新へ戻ると続きを読めます。"
-            : detached
-              ? unread
-                ? "新しい会話があります。過去の会話を表示しています。"
-                : "過去の会話を表示しています。"
-              : unread
-                ? "新しい会話があります。"
-                : "会話・報告"}</output
-    >
-    {#if historyError && !cursorChanged}<button
-        class="quiet-button"
-        onclick={() => refresh(retryMode)}>再試行</button
-      >{/if}
-    {#if loaded && (!atBottom || detached || unread || cursorChanged)}<button
-        class="quiet-button"
-        disabled={paging}
-        onclick={() => refresh("latest")}>最新へ戻る</button
-      >{/if}
+    <nav class="view-tabs" aria-label="表示内容">
+      <button
+        class:active={view === "conversation"}
+        aria-pressed={view === "conversation"}
+        onclick={() => switchView("conversation")}>会話</button
+      >
+      <button
+        class:active={view === "screen"}
+        aria-pressed={view === "screen"}
+        onclick={() => switchView("screen")}>画面</button
+      >
+    </nav>
+    {#if view === "conversation"}
+      <output aria-live="polite"
+        >{historyError
+          ? `会話を更新できません: ${historyError}`
+          : paging
+            ? "会話のページを読み込んでいます…"
+            : limited
+              ? "表示上限に達しました。新しい会話、または最新へ戻ると続きを読めます。"
+              : detached
+                ? unread
+                  ? "新しい会話があります。過去の会話を表示しています。"
+                  : "過去の会話を表示しています。"
+                : unread
+                  ? "新しい会話があります。"
+                  : "会話・報告"}</output
+      >
+      {#if historyError && !cursorChanged}<button
+          class="quiet-button"
+          onclick={() => refresh(retryMode)}>再試行</button
+        >{/if}
+      {#if loaded && (!atBottom || detached || unread || cursorChanged)}<button
+          class="quiet-button"
+          disabled={paging}
+          onclick={() => refresh("latest")}>最新へ戻る</button
+        >{/if}
+    {:else}<span class="view-caption">閲覧専用</span>{/if}
   </div>
   <!-- svelte-ignore a11y_no_noninteractive_tabindex (Scrollable conversation needs keyboard scrolling.) -->
   <section
     class="conversation-panel"
+    hidden={view !== "conversation"}
     aria-label="会話・報告"
     bind:this={viewport}
     onscroll={trackScroll}
     tabindex="0"
   >
     <div class="conversation-meta">
-      <span>{target.harness} · セッション {target.session ?? "未登録"}</span
-      ><span>{statusLabel(agent.status)}</span>
+      <span>{target.name} · {target.harness}</span><span
+        >{statusLabel(agent.status)}</span
+      >
     </div>
     <p class="conversation-cwd">{agent.cwd}</p>
     {#if blocked}<p class="availability" role="status">{blocked}</p>{/if}
@@ -344,7 +379,9 @@
                 >{message.timestamp}</time
               >{/if}
           </div>
-          <p>{message.text}</p>
+          {#if message.role === "assistant"}<Markdown
+              text={message.text}
+            />{:else}<p>{message.text}</p>{/if}
         </li>
       {/each}
     </ol>
@@ -354,6 +391,15 @@
         onclick={() => refresh("newer")}>新しい会話</button
       >{/if}
   </section>
+  <ScreenPanel
+    pane={target.pane}
+    terminal={target.terminal}
+    session={target.session}
+    active={view === "screen"}
+    {available}
+    {connected}
+    changed={screenChanged}
+  />
   <aside class="letter-dock" class:expanded={open} aria-label="手紙">
     <div class="letter-dock-tab">
       <button
@@ -391,9 +437,7 @@
             ></button
           >
         </div>
-        <p class="composer-source">
-          {target.harness} · セッション {target.session ?? "未登録"}
-        </p>
+
         <label for="message-body">本文</label><textarea
           id="message-body"
           bind:this={textarea}

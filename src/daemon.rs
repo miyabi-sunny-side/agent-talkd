@@ -76,6 +76,7 @@ async fn handle(console: Arc<Console>, request: Request<Incoming>) -> HttpRespon
             Ok(agents) => json_response(StatusCode::OK, &json!({"agents":agents})),
             Err(error) => adapter_error(&error),
         },
+        (&Method::GET, "/api/screen") => screen(&console, request.uri().query()).await,
         (&Method::GET, "/api/conversation") => conversation(&console, request.uri().query()).await,
         (&Method::POST, "/api/messages") => submit(&console, request).await,
         (_, path) if path.starts_with("/api/") || path == "/api" => {
@@ -90,6 +91,41 @@ async fn handle(console: Arc<Console>, request: Request<Incoming>) -> HttpRespon
     }
 }
 
+async fn screen(console: &Console, query: Option<&str>) -> HttpResponse {
+    let Ok(query) = parse_query(query.unwrap_or_default()) else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_query",
+            "宛先と端末を指定してください",
+        );
+    };
+    let (Some(pane), Some(terminal)) = (query.get("pane"), query.get("terminal")) else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_query",
+            "宛先と端末を指定してください",
+        );
+    };
+    if query
+        .keys()
+        .any(|key| !matches!(key.as_str(), "pane" | "terminal" | "session"))
+    {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_query",
+            "画面取得の指定を確認してください",
+        );
+    }
+    match console
+        .herdr
+        .screen(pane, terminal, query.get("session").map(String::as_str))
+        .await
+    {
+        Ok(screen) => json_response(StatusCode::OK, &json!(screen)),
+        Err(error) => adapter_error(&error),
+    }
+}
+
 async fn conversation(console: &Console, query: Option<&str>) -> HttpResponse {
     let Ok(query) = parse_query(query.unwrap_or_default()) else {
         return error_response(
@@ -98,6 +134,13 @@ async fn conversation(console: &Console, query: Option<&str>) -> HttpResponse {
             "宛先とセッションを指定してください",
         );
     };
+    if query.contains_key("terminal") {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_query",
+            "履歴取得の指定を確認してください",
+        );
+    }
     let (Some(pane), Some(session)) = (query.get("pane"), query.get("session")) else {
         return error_response(
             StatusCode::BAD_REQUEST,
@@ -259,12 +302,16 @@ fn adapter_error(error: &anyhow::Error) -> HttpResponse {
 }
 
 fn parse_query(query: &str) -> Result<BTreeMap<String, String>> {
+    anyhow::ensure!(query.len() <= 16 * 1024, "query too long");
     let mut fields = BTreeMap::new();
     for field in query.split('&').filter(|field| !field.is_empty()) {
         let (key, value) = field.split_once('=').context("query field has no value")?;
         let key = decode(key)?;
         anyhow::ensure!(
-            matches!(key.as_str(), "pane" | "session" | "before" | "after"),
+            matches!(
+                key.as_str(),
+                "pane" | "terminal" | "session" | "before" | "after"
+            ),
             "unknown query field"
         );
         anyhow::ensure!(
@@ -279,7 +326,7 @@ fn parse_query(query: &str) -> Result<BTreeMap<String, String>> {
     for (key, value) in &fields {
         anyhow::ensure!(!value.is_empty(), "empty query field");
         match key.as_str() {
-            "pane" => anyhow::ensure!(value.len() <= 256, "pane too long"),
+            "pane" | "terminal" => anyhow::ensure!(value.len() <= 256, "target too long"),
             "session" => anyhow::ensure!(value.len() <= 4096, "session too long"),
             _ => history::validate_cursor(value)?,
         }

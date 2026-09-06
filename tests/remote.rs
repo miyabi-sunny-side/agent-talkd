@@ -41,6 +41,8 @@ fn browser_api_routes_original_text_to_the_verified_session_and_reads_native_out
     let row = Arc::new(Mutex::new(
         json!({"pane_id":"w1:p2","terminal_id":"terminal-1","workspace_id":"w1","agent":"codex","agent_status":"working","agent_session":{"source":"herdr:codex","agent":"codex","kind":"id","value":"session-a"}}),
     ));
+    let screen_mode = Arc::new(Mutex::new(String::new()));
+    let server_screen_mode = screen_mode.clone();
     let prompts = Arc::new(Mutex::new(Vec::new()));
     let server_row = row.clone();
     let received = prompts.clone();
@@ -60,6 +62,21 @@ fn browser_api_routes_original_text_to_the_verified_session_and_reads_native_out
                 "agent.get" => json!({"agent":row}),
                 "pane.process_info" => {
                     json!({"type":"pane_process_info","process_info":{"pane_id":"w1:p2","foreground_processes":[{"pid":123,"name":"codex"}]}})
+                }
+                "pane.read" => {
+                    assert_eq!(
+                        request["params"],
+                        json!({"pane_id":"w1:p2","source":"visible","format":"text","strip_ansi":true})
+                    );
+                    let mode = server_screen_mode.lock().unwrap().clone();
+                    if mode == "restart" {
+                        server_row.lock().unwrap()["agent_session"]["value"] = json!("session-b");
+                    } else if mode == "terminal-restart" {
+                        server_row.lock().unwrap()["terminal_id"] = json!("terminal-2");
+                    } else if mode == "ended" {
+                        server_row.lock().unwrap()["agent_session"] = Value::Null;
+                    }
+                    json!({"type":"pane_read","read":{"pane_id":if mode == "wrong-pane" {"w1:p9"} else {"w1:p2"},"source":"visible","format":"text","text":if mode == "oversized" {"x".repeat(256 * 1024 + 1)} else {"確認してください\n[許可] [拒否]".into()},"truncated":false}})
                 }
                 "agent.prompt" => {
                     received.lock().unwrap().push(request["params"].clone());
@@ -175,6 +192,58 @@ fn browser_api_routes_original_text_to_the_verified_session_and_reads_native_out
         request(port, "POST", "/api/messages", Some(&body), "").1["error"]["code"],
         "blocked"
     );
+    let screen_path = format!("/api/screen?pane=w1%3Ap2&terminal=terminal-1&session={token}");
+    let (status, screen) = request(port, "GET", &screen_path, None, "");
+    assert_eq!(status, 200, "blocked targets remain readable: {screen}");
+    assert_eq!(screen["pane_id"], "w1:p2");
+    assert_eq!(screen["session_id"], token);
+    assert_eq!(screen["terminal_id"], "terminal-1");
+    assert_eq!(screen["text"], "確認してください\n[許可] [拒否]");
+    assert_eq!(screen["format"], "text");
+    assert!(screen["captured_at"].as_u64().unwrap() > 1_700_000_000_000);
+    for suffix in ["&pane=w1:p3", "&other=x", "&before=x"] {
+        assert_eq!(
+            request(port, "GET", &format!("{screen_path}{suffix}"), None, "").0,
+            400
+        );
+    }
+    assert_eq!(
+        request(port, "GET", "/api/screen?pane=w1:p2", None, "").0,
+        400
+    );
+    let terminal_path = "/api/screen?pane=w1:p2&terminal=terminal-1";
+    for (mode, expected) in [
+        ("wrong-pane", 503),
+        ("oversized", 503),
+        ("restart", 409),
+        ("ended", 409),
+        ("terminal-restart", 409),
+    ] {
+        row.lock().unwrap()["agent_session"] =
+            json!({"source":"herdr:codex","agent":"codex","kind":"id","value":"session-a"});
+        *screen_mode.lock().unwrap() = mode.into();
+        let (status, failure) = request(port, "GET", terminal_path, None, "");
+        assert_eq!(status, expected, "{mode}: {failure}");
+        assert!(failure.get("text").is_none());
+    }
+    row.lock().unwrap()["agent_session"] =
+        json!({"source":"herdr:codex","agent":"codex","kind":"id","value":"session-a"});
+    *screen_mode.lock().unwrap() = String::new();
+    row.lock().unwrap()["terminal_id"] = json!("terminal-1");
+    for harness in ["codex", "bash"] {
+        row.lock().unwrap()["agent"] = json!(harness);
+        row.lock().unwrap()["agent_session"] = Value::Null;
+        let (status, screen) = request(port, "GET", terminal_path, None, "");
+        assert_eq!(status, 200, "{harness}: {screen}");
+        assert_eq!(screen["session_id"], Value::Null);
+        assert_eq!(screen["terminal_id"], "terminal-1");
+    }
+    row.lock().unwrap()["terminal_id"] = json!("terminal-2");
+    assert_eq!(request(port, "GET", terminal_path, None, "").0, 409);
+    row.lock().unwrap()["terminal_id"] = json!("terminal-1");
+    row.lock().unwrap()["agent"] = json!("codex");
+    row.lock().unwrap()["agent_session"] =
+        json!({"source":"herdr:codex","agent":"codex","kind":"id","value":"session-a"});
     row.lock().unwrap()["agent_session"]["value"] = json!("session-b");
     assert_eq!(
         request(port, "POST", "/api/messages", Some(&body), "").1["error"]["code"],

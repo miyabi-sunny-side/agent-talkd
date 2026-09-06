@@ -12,6 +12,7 @@
 - `src/main.rs` owns daemon/update command dispatch. `src/config.rs` owns environment discovery.
 - `src/daemon.rs` owns HTTP input validation, origin checks, embedded assets, and connection handling.
 - `src/herdr.rs` owns bounded Herdr RPC and checks the expected native session and foreground process immediately before prompting. Rejected, missing, unregistered, unknown, or blocked destinations receive no input. Input acknowledgement is not work completion; lost acknowledgements are indeterminate and must not be automatically retried.
+- The read-only `/api/screen` uses Herdr `pane.read` visible text, checks terminal identity, and marks stale display in the UI. Reading does not require native registration or permission to send. It never forwards terminal input or replaces native history.
 - `src/history.rs` reads bounded native Codex/Claude transcripts. Do not accept arbitrary user-supplied file paths or replace reports with terminal screenshots.
 - `src/update.rs` verifies release checksums and replaces the executable. The operator restarts the managed service.
 - `DESIGN.md` owns browser interaction and visual design. Preserve draft text and keep it bound to the selected CLI session. Mobile users must not need terminal modifier keys.

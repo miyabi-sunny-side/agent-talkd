@@ -911,3 +911,175 @@ textarea:focus-visible,
 .history-page {
   margin-block: 8px;
 }
+
+/* Keep every detail control inside the visible viewport, including an open IME. */
+main.detail-view {
+  position: fixed;
+  top: var(--visual-top, 0px);
+  left: 0;
+  height: var(--visual-height, 100dvh);
+  overflow: hidden;
+}
+.detail-chrome {
+  flex-shrink: 0;
+}
+.conversation-workspace {
+  min-width: 0;
+  overflow: hidden;
+}
+[hidden] {
+  display: none !important;
+}
+.letter-dock.expanded .letter-dock-panel {
+  max-height: min(
+    420px,
+    62dvh,
+    calc(var(--visual-height, 100dvh) - 179px - env(safe-area-inset-bottom))
+  );
+}
+.composer-form {
+  padding-bottom: 12px;
+  gap: 6px;
+}
+.composer-head .icon-button {
+  width: 44px;
+  height: 44px;
+}
+.compose-status:empty {
+  display: none;
+}
+.view-tabs {
+  display: flex;
+  align-self: stretch;
+  flex-shrink: 0;
+}
+.view-tabs button {
+  min-width: 48px;
+  padding: 0 8px;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  color: var(--muted);
+  background: none;
+  cursor: pointer;
+}
+.view-tabs button.active {
+  color: var(--on-surface);
+  border-bottom-color: var(--accent);
+}
+.view-caption {
+  margin-left: auto;
+}
+.screen-panel {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+.screen-status {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  padding: 4px 12px;
+  font-size: 11px;
+  color: var(--muted);
+}
+.screen-status output {
+  flex: 1;
+  min-width: 120px;
+  overflow-wrap: anywhere;
+  align-self: center;
+  max-height: 64px;
+  overflow: auto;
+}
+.screen-status button {
+  min-height: 44px;
+}
+.screen-status time,
+.screen-status > span {
+  align-self: center;
+}
+.screen-panel pre {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  margin: 0;
+  padding: 12px;
+  overflow: auto;
+  white-space: pre;
+  tab-size: 8;
+  background: var(--terminal-bg);
+  color: var(--terminal-fg);
+  font:
+    12px/1.5 "SFMono-Regular",
+    Consolas,
+    monospace;
+}
+.screen-panel pre.stale {
+  border-top: 2px solid var(--busy);
+}
+.conversation-list > li {
+  min-width: 0;
+}
+.conversation-list .markdown-body {
+  font-size: 13px;
+  line-height: 1.75;
+  overflow-wrap: anywhere;
+}
+.conversation-list .markdown-body p {
+  white-space: normal;
+}
+.markdown-body pre {
+  max-width: 100%;
+  overflow: auto;
+  white-space: pre;
+  overflow-wrap: normal;
+  padding: 12px;
+  background: var(--surface-raised);
+}
+.markdown-body code {
+  font-family: "SFMono-Regular", Consolas, monospace;
+}
+.markdown-body :not(pre) > code {
+  white-space: break-spaces;
+  background: var(--surface-raised);
+}
+.markdown-body table {
+  display: block;
+  max-width: 100%;
+  overflow: auto;
+  border-collapse: collapse;
+}
+.markdown-body th,
+.markdown-body td {
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+}
+.markdown-body blockquote {
+  margin-inline: 0;
+  padding-left: 12px;
+  border-left: 2px solid var(--border);
+  color: var(--muted);
+}
+.conversation-list .markdown-body li {
+  border: 0;
+  padding: 0;
+}
+.markdown-body a {
+  color: var(--link);
+  text-decoration: underline;
+}
+.markdown-body h1,
+.markdown-body h2,
+.markdown-body h3 {
+  font-size: 15px;
+}
+@media (max-width: 400px) {
+  .screen-panel pre {
+    font-size: 11px;
+  }
+  .history-controls {
+    gap: 4px;
+    padding-inline: 6px;
+  }
+}

@@ -3,7 +3,9 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=24 <25" },
+  "engines": {
+    "node": ">=24 <25"
+  },
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "build": "vite build",
@@ -24,5 +26,9 @@
     "typescript": "6.0.3",
     "vite": "8.1.5",
     "vitest": "4.1.10"
+  },
+  "dependencies": {
+    "dompurify": "3.4.14",
+    "marked": "18.0.11"
   }
 }
