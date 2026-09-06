@@ -12,4 +12,6 @@ Screen reads use `herdr pane read <pane> --source visible --format text`, bounde
 
 Transcript paths come from Herdr session metadata or a bounded search under the appropriate CLI history root. User input cannot select a filesystem path. Readers validate native identity, bound bytes/entries, ignore partial records at the live append boundary, and expose user/assistant text only. The basic response reports truncation so the interface never claims full-history completeness.
 
+The native reader remains in place until Herdr can own history acquisition. Herdr 0.8.2 supplies native references but no conversation-page API. The [history ownership contract](history-ownership.md) records the required capability and deletion map. Delivery scope is unresolved. The transfer and removal of the app's HOME requirement are not implemented. Terminal snapshots must not replace conversation history during that transition.
+
 The embedded Svelte app is built before Cargo. Releases for Linux and macOS contain one executable and LICENSE. No background worker or companion MCP binary is installed. Historical broker decisions in `docs/decisions` are superseded records, not current implementation requirements.
