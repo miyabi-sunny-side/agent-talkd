@@ -31,7 +31,7 @@ struct Console {
 
 pub async fn run(config: Config) -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(config.log_level)
+        .with_max_level(config.log_level)
         .with_writer(std::io::stderr)
         .try_init()
         .ok();
@@ -411,6 +411,88 @@ fn static_response(path: &str) -> HttpResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn logging_probe() {
+        if std::env::var_os("AGENT_TALK_TEST_LOGGING").is_none() {
+            return;
+        }
+        // A held port makes run return after its real logging initialization.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut config = Config::discover().unwrap();
+        config.http_addr = listener.local_addr().unwrap();
+        assert!(run(config).await.is_err());
+        tracing::error!("logging-probe-error");
+        tracing::warn!("logging-probe-warn");
+        tracing::info!("logging-probe-info");
+        tracing::debug!("logging-probe-debug");
+        tracing::trace!("logging-probe-trace");
+    }
+
+    #[test]
+    fn log_level_controls_server_output_and_ignores_legacy_variables() {
+        let cases = [
+            (Some("off"), 0),
+            (Some("error"), 1),
+            (Some("warn"), 2),
+            (Some("info"), 3),
+            (Some("debug"), 4),
+            (Some("trace"), 5),
+            (None, 3),
+            (Some(""), 3),
+            (Some("invalid"), 3),
+            (Some("DEBUG"), 3),
+            (Some("Info"), 3),
+            (Some(" debug"), 3),
+            (Some("debug "), 3),
+            (Some("trace\n"), 3),
+            (Some("agent_talk=trace"), 3),
+            (Some("warn,agent_talk=trace"), 3),
+        ];
+        let home = tempfile::tempdir().unwrap();
+        for (level, count) in cases {
+            for (legacy, rust_log) in [
+                (None, None),
+                (Some("off"), None),
+                (Some("trace"), None),
+                (None, Some("off")),
+                (None, Some("trace")),
+                (Some("off"), Some("trace")),
+                (Some("trace"), Some("off")),
+            ] {
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command
+                    .args(["--exact", "daemon::tests::logging_probe", "--nocapture"])
+                    .env("AGENT_TALK_TEST_LOGGING", "1")
+                    .env("HOME", home.path())
+                    .env("AGENT_TALK_HTTP_ADDR", "127.0.0.1:0");
+                for (name, value) in [
+                    ("LOG_LEVEL", level),
+                    ("AGENT_TALK_LOG_LEVEL", legacy),
+                    ("RUST_LOG", rust_log),
+                ] {
+                    if let Some(value) = value {
+                        command.env(name, value);
+                    } else {
+                        command.env_remove(name);
+                    }
+                }
+                let output = command.output().unwrap();
+                let stderr = String::from_utf8(output.stderr).unwrap();
+                assert!(output.status.success(), "{stderr}");
+                for (index, severity) in ["error", "warn", "info", "debug", "trace"]
+                    .into_iter()
+                    .enumerate()
+                {
+                    assert_eq!(
+                        stderr.contains(&format!("logging-probe-{severity}")),
+                        index < count,
+                        "LOG_LEVEL={level:?}, legacy={legacy:?}, RUST_LOG={rust_log:?}, severity={severity}: {stderr}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn query_preserves_opaque_identity_and_rejects_ambiguity() {

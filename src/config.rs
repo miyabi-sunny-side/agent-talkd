@@ -1,11 +1,12 @@
 use std::{env, net::SocketAddr, path::PathBuf};
 
 use anyhow::{Context, Result};
+use tracing::level_filters::LevelFilter;
 
 pub struct Config {
     pub http_addr: SocketAddr,
     pub home: PathBuf,
-    pub log_level: String,
+    pub log_level: LevelFilter,
 }
 
 impl Config {
@@ -18,7 +19,14 @@ impl Config {
         Ok(Self {
             http_addr,
             home,
-            log_level: env::var("AGENT_TALK_LOG_LEVEL").unwrap_or_else(|_| "info".into()),
+            log_level: match env::var("LOG_LEVEL").as_deref() {
+                Ok("off") => LevelFilter::OFF,
+                Ok("error") => LevelFilter::ERROR,
+                Ok("warn") => LevelFilter::WARN,
+                Ok("debug") => LevelFilter::DEBUG,
+                Ok("trace") => LevelFilter::TRACE,
+                _ => LevelFilter::INFO,
+            },
         })
     }
 }
