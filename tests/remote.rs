@@ -1,14 +1,14 @@
 //! Exercise the shipped HTTP binary against isolated Herdr and transcript fixtures.
 use serde_json::{Value, json};
 use std::{
-    io::{BufRead, BufReader, Read, Write},
+    io::{Read, Write},
     net::{TcpListener, TcpStream},
-    os::unix::net::UnixListener,
     process::{Child, Command, Stdio},
-    sync::{Arc, Mutex},
     thread,
     time::Duration,
 };
+
+mod support;
 
 struct Process(Child);
 impl Drop for Process {
@@ -33,60 +33,11 @@ fn request(port: u16, method: &str, path: &str, body: Option<&Value>, extra: &st
 }
 
 #[test]
-#[allow(clippy::too_many_lines)] // One end-to-end lifecycle, with shared isolated sockets.
+#[allow(clippy::too_many_lines)] // One end-to-end lifecycle, with shared isolated CLI state.
 fn browser_api_routes_original_text_to_the_verified_session_and_reads_native_output() {
     let directory = tempfile::tempdir().unwrap();
-    let socket = directory.path().join("herdr.sock");
-    let listener = UnixListener::bind(&socket).unwrap();
-    let row = Arc::new(Mutex::new(
-        json!({"pane_id":"w1:p2","terminal_id":"terminal-1","workspace_id":"w1","agent":"codex","agent_status":"working","agent_session":{"source":"herdr:codex","agent":"codex","kind":"id","value":"session-a"}}),
-    ));
-    let screen_mode = Arc::new(Mutex::new(String::new()));
-    let server_screen_mode = screen_mode.clone();
-    let prompts = Arc::new(Mutex::new(Vec::new()));
-    let server_row = row.clone();
-    let received = prompts.clone();
-    thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(mut stream) = stream else {
-                break;
-            };
-            let mut line = String::new();
-            BufReader::new(&stream).read_line(&mut line).unwrap();
-            let request: Value = serde_json::from_str(&line).unwrap();
-            let row = server_row.lock().unwrap().clone();
-            let result = match request["method"].as_str().unwrap() {
-                "agent.list" => json!({"agents":[row]}),
-                "workspace.list" => json!({"workspaces":[]}),
-                "tab.list" => json!({"tabs":[]}),
-                "agent.get" => json!({"agent":row}),
-                "pane.process_info" => {
-                    json!({"type":"pane_process_info","process_info":{"pane_id":"w1:p2","foreground_processes":[{"pid":123,"name":"codex"}]}})
-                }
-                "pane.read" => {
-                    assert_eq!(
-                        request["params"],
-                        json!({"pane_id":"w1:p2","source":"visible","format":"text","strip_ansi":true})
-                    );
-                    let mode = server_screen_mode.lock().unwrap().clone();
-                    if mode == "restart" {
-                        server_row.lock().unwrap()["agent_session"]["value"] = json!("session-b");
-                    } else if mode == "terminal-restart" {
-                        server_row.lock().unwrap()["terminal_id"] = json!("terminal-2");
-                    } else if mode == "ended" {
-                        server_row.lock().unwrap()["agent_session"] = Value::Null;
-                    }
-                    json!({"type":"pane_read","read":{"pane_id":if mode == "wrong-pane" {"w1:p9"} else {"w1:p2"},"source":"visible","format":"text","text":if mode == "oversized" {"x".repeat(256 * 1024 + 1)} else {"確認してください\n[許可] [拒否]".into()},"truncated":false}})
-                }
-                "agent.prompt" => {
-                    received.lock().unwrap().push(request["params"].clone());
-                    json!({"type":"agent_prompted","agent":row})
-                }
-                method => panic!("unexpected Herdr operation {method}"),
-            };
-            writeln!(stream, "{}", json!({"id":request["id"],"result":result})).unwrap();
-        }
-    });
+    let row = json!({"pane_id":"w1:p2","terminal_id":"terminal-1","workspace_id":"w1","agent":"codex","agent_status":"working","agent_session":{"source":"herdr:codex","agent":"codex","kind":"id","value":"session-a"}});
+    let fixture = support::CliFixture::new(&row);
     let history_dir = directory.path().join(".codex/sessions");
     std::fs::create_dir_all(&history_dir).unwrap();
     std::fs::write(history_dir.join("rollout-session-a.jsonl"),concat!(
@@ -103,7 +54,16 @@ fn browser_api_routes_original_text_to_the_verified_session_and_reads_native_out
         Command::new(env!("CARGO_BIN_EXE_agent-talk"))
             .arg("daemon")
             .env("HOME", directory.path())
-            .env("AGENT_TALK_HERDR_SOCKET", &socket)
+            .env(
+                "PATH",
+                std::env::join_paths(
+                    std::iter::once(fixture.directory.path().to_path_buf())
+                        .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+                )
+                .unwrap(),
+            )
+            .env_remove("AGENT_TALK_HERDR_SOCKET")
+            .env_remove("HERDR_SOCKET_PATH")
             .env("AGENT_TALK_HTTP_ADDR", format!("127.0.0.1:{port}"))
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -126,7 +86,7 @@ fn browser_api_routes_original_text_to_the_verified_session_and_reads_native_out
         json!({"status":"submitted"})
     );
     assert_eq!(
-        *prompts.lock().unwrap(),
+        fixture.prompts(),
         vec![json!({"target":"w1:p2","text":body["body"]})]
     );
     let path = format!("/api/conversation?pane=w1%3Ap2&session={token}");
@@ -187,7 +147,7 @@ fn browser_api_routes_original_text_to_the_verified_session_and_reads_native_out
         .0,
         403
     );
-    row.lock().unwrap()["agent_status"] = json!("blocked");
+    fixture.update(|state| state["row"]["agent_status"] = json!("blocked"));
     assert_eq!(
         request(port, "POST", "/api/messages", Some(&body), "").1["error"]["code"],
         "blocked"
@@ -213,44 +173,49 @@ fn browser_api_routes_original_text_to_the_verified_session_and_reads_native_out
     );
     let terminal_path = "/api/screen?pane=w1:p2&terminal=terminal-1";
     for (mode, expected) in [
-        ("wrong-pane", 503),
         ("oversized", 503),
         ("restart", 409),
         ("ended", 409),
         ("terminal-restart", 409),
     ] {
-        row.lock().unwrap()["agent_session"] =
-            json!({"source":"herdr:codex","agent":"codex","kind":"id","value":"session-a"});
-        *screen_mode.lock().unwrap() = mode.into();
+        fixture.update(|state| {
+            state["row"]["agent_session"] =
+                json!({"source":"herdr:codex","agent":"codex","kind":"id","value":"session-a"});
+        });
+        fixture.update(|state| state["screen_mode"] = json!(mode));
         let (status, failure) = request(port, "GET", terminal_path, None, "");
         assert_eq!(status, expected, "{mode}: {failure}");
         assert!(failure.get("text").is_none());
     }
-    row.lock().unwrap()["agent_session"] =
-        json!({"source":"herdr:codex","agent":"codex","kind":"id","value":"session-a"});
-    *screen_mode.lock().unwrap() = String::new();
-    row.lock().unwrap()["terminal_id"] = json!("terminal-1");
+    fixture.update(|state| {
+        state["row"]["agent_session"] =
+            json!({"source":"herdr:codex","agent":"codex","kind":"id","value":"session-a"});
+    });
+    fixture.update(|state| state["screen_mode"] = json!(""));
+    fixture.update(|state| state["row"]["terminal_id"] = json!("terminal-1"));
     for harness in ["codex", "bash"] {
-        row.lock().unwrap()["agent"] = json!(harness);
-        row.lock().unwrap()["agent_session"] = Value::Null;
+        fixture.update(|state| state["row"]["agent"] = json!(harness));
+        fixture.update(|state| state["row"]["agent_session"] = Value::Null);
         let (status, screen) = request(port, "GET", terminal_path, None, "");
         assert_eq!(status, 200, "{harness}: {screen}");
         assert_eq!(screen["session_id"], Value::Null);
         assert_eq!(screen["terminal_id"], "terminal-1");
     }
-    row.lock().unwrap()["terminal_id"] = json!("terminal-2");
+    fixture.update(|state| state["row"]["terminal_id"] = json!("terminal-2"));
     assert_eq!(request(port, "GET", terminal_path, None, "").0, 409);
-    row.lock().unwrap()["terminal_id"] = json!("terminal-1");
-    row.lock().unwrap()["agent"] = json!("codex");
-    row.lock().unwrap()["agent_session"] =
-        json!({"source":"herdr:codex","agent":"codex","kind":"id","value":"session-a"});
-    row.lock().unwrap()["agent_session"]["value"] = json!("session-b");
+    fixture.update(|state| state["row"]["terminal_id"] = json!("terminal-1"));
+    fixture.update(|state| state["row"]["agent"] = json!("codex"));
+    fixture.update(|state| {
+        state["row"]["agent_session"] =
+            json!({"source":"herdr:codex","agent":"codex","kind":"id","value":"session-a"});
+    });
+    fixture.update(|state| state["row"]["agent_session"]["value"] = json!("session-b"));
     assert_eq!(
         request(port, "POST", "/api/messages", Some(&body), "").1["error"]["code"],
         "session_changed"
     );
     assert_eq!(request(port, "GET", &path, None, "").0, 409);
-    assert_eq!(prompts.lock().unwrap().len(), 1);
+    assert_eq!(fixture.prompts().len(), 1);
     for path in [
         "/api/letters",
         "/api/mailboxes",

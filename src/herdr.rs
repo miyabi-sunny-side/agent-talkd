@@ -2,6 +2,7 @@
 use std::{
     fmt,
     path::{Path, PathBuf},
+    process::Stdio,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -9,14 +10,11 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    net::UnixStream,
-};
+use tokio::{io::AsyncReadExt, process::Command};
 
 const MAX_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_SCREEN_BYTES: usize = 256 * 1024;
-const RPC_TIMEOUT: Duration = Duration::from_secs(5);
+const CLI_TIMEOUT: Duration = Duration::from_secs(5);
 pub const MAX_MESSAGE_BYTES: usize = 32 * 1024;
 
 #[derive(Debug)]
@@ -75,12 +73,12 @@ pub struct Screen {
 
 #[derive(Clone)]
 pub struct Herdr {
-    socket: PathBuf,
+    executable: PathBuf,
 }
 impl Herdr {
     #[must_use]
-    pub fn new(socket: PathBuf) -> Self {
-        Self { socket }
+    pub fn new(executable: PathBuf) -> Self {
+        Self { executable }
     }
 
     /// # Errors
@@ -92,7 +90,7 @@ impl Herdr {
     }
 
     async fn list_inner(&self) -> Result<Vec<Agent>> {
-        let result = self.call("agent.list", json!({}), false).await?;
+        let result = self.call_json(&["agent", "list"], false).await?;
         let rows = result
             .get("agents")
             .and_then(Value::as_array)
@@ -100,7 +98,7 @@ impl Herdr {
         if rows.len() > 256 {
             bail!("Herdr returned too many agents");
         }
-        let labels = self.call("workspace.list", json!({}), false).await.ok();
+        let labels = self.call_json(&["workspace", "list"], false).await.ok();
         let mut tabs = std::collections::BTreeMap::new();
         for workspace in rows
             .iter()
@@ -108,7 +106,7 @@ impl Herdr {
             .collect::<std::collections::BTreeSet<_>>()
         {
             if let Ok(result) = self
-                .call("tab.list", json!({"workspace_id":workspace}), false)
+                .call_json(&["tab", "list", "--workspace", workspace], false)
                 .await
             {
                 tabs.insert(workspace, result);
@@ -143,9 +141,7 @@ impl Herdr {
     /// Returns an error for invalid, absent, or unreachable targets.
     pub async fn get(&self, pane: &str) -> Result<Agent> {
         validate_pane(pane)?;
-        let result = self
-            .call("agent.get", json!({"target":pane}), false)
-            .await?;
+        let result = self.call_json(&["agent", "get", pane], false).await?;
         let row = result
             .get("agent")
             .context("Herdr agent.get has no agent")?;
@@ -162,7 +158,7 @@ impl Herdr {
             && matches!(agent.harness.as_str(), "codex" | "claude")
         {
             let process = self
-                .call("pane.process_info", json!({"pane_id":agent.pane_id}), false)
+                .call_json(&["pane", "process-info", "--pane", &agent.pane_id], false)
                 .await;
             match process.and_then(|v| process_identity(&v, &agent.pane_id, &agent.harness)) {
                 Ok(pid) => agent.session_id = Some(session_token(&agent, pid)),
@@ -189,27 +185,18 @@ impl Herdr {
         }
         let before = self.get(pane).await?;
         validate_screen_session(&before, expected_terminal, expected_session)?;
-        let result = self
+        // Herdr's read command emits plain UTF-8 text, not a JSON envelope.
+        let output = self
             .call(
-                "pane.read",
-                json!({"pane_id":pane,"source":"visible","format":"text","strip_ansi":true}),
+                &[
+                    "pane", "read", pane, "--source", "visible", "--format", "text",
+                ],
                 false,
+                MAX_SCREEN_BYTES as u64,
             )
             .await?;
+        let text = String::from_utf8(output).context("Herdr screen is not UTF-8")?;
         let captured_at = u64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())?;
-        let read = &result["read"];
-        if result["type"] != "pane_read"
-            || read["pane_id"] != pane
-            || read["source"] != "visible"
-            || read["format"] != "text"
-            || read["truncated"] != false
-        {
-            return Err(error("unavailable", "Herdr returned an invalid screen"));
-        }
-        let text = read["text"]
-            .as_str()
-            .filter(|text| text.len() <= MAX_SCREEN_BYTES)
-            .ok_or_else(|| error("unavailable", "Herdr screen is missing or too large"))?;
         let after = self.get(pane).await?;
         validate_screen_session(&after, expected_terminal, expected_session)?;
         if before.agent_session != after.agent_session
@@ -225,7 +212,7 @@ impl Herdr {
             pane_id: pane.into(),
             terminal_id: expected_terminal.into(),
             session_id: after.session_id,
-            text: text.into(),
+            text,
             captured_at,
             format: "text",
         })
@@ -240,12 +227,10 @@ impl Herdr {
         validate_destination(&agent, expected_session)?;
         // Herdr accepts pane IDs, not terminal UUIDs, and has no compare-and-prompt
         // primitive. A process change between this check and input is not atomic.
+        // Herdr consumes TEXT as a fixed positional argument, including leading
+        // dashes. Its parser does not accept a separate `--` delimiter.
         let response = self
-            .call(
-                "agent.prompt",
-                json!({"target":agent.pane_id,"text":text}),
-                true,
-            )
+            .call_json(&["agent", "prompt", &agent.pane_id, text], true)
             .await?;
         if response["type"] != "agent_prompted"
             || response["agent"]["terminal_id"] != agent.terminal_id
@@ -258,64 +243,93 @@ impl Herdr {
         Ok(())
     }
 
-    async fn call(&self, method: &str, params: Value, mutating: bool) -> Result<Value> {
-        let result = tokio::time::timeout(RPC_TIMEOUT, self.exchange(method, params)).await;
-        match result {
-            Ok(Ok(value)) => Ok(value),
-            Ok(Err(err)) if err.downcast_ref::<RemoteError>().is_some() => Err(err),
-            Ok(Err(err)) => Err(error(
-                if mutating {
-                    "delivery_unknown"
-                } else {
-                    "unavailable"
-                },
-                err.to_string(),
-            )),
-            Err(_) => Err(error(
-                if mutating {
-                    "delivery_unknown"
-                } else {
-                    "unavailable"
-                },
-                format!("Herdr {method} timed out"),
-            )),
-        }
-    }
-
-    async fn exchange(&self, method: &str, params: Value) -> Result<Value> {
-        let mut stream = UnixStream::connect(&self.socket)
-            .await
-            .context("Cannot connect to Herdr")?;
-        let request = format!(
-            "{}\n",
-            json!({"id":"agent-talk","method":method,"params":params})
-        );
-        stream.write_all(request.as_bytes()).await?;
-        let mut reader = BufReader::new(stream.take(MAX_RESPONSE_BYTES + 1));
-        let mut line = String::new();
-        reader.read_line(&mut line).await?;
-        if line.len() as u64 > MAX_RESPONSE_BYTES || !line.ends_with('\n') {
-            bail!("Herdr response is incomplete or too large");
-        }
-        let response: Value = serde_json::from_str(&line)?;
-        if response["id"] != "agent-talk" {
-            bail!("Herdr response ID mismatch");
-        }
-        if let Some(err) = response.get("error") {
-            let message = err["message"].as_str().unwrap_or("Herdr rejected request");
-            let code = match err["code"].as_str() {
-                Some("agent_blocked") => "blocked",
-                Some("agent_not_found" | "pane_not_found" | "target_not_found") => "unavailable",
-                _ if method == "agent.prompt" => "delivery_unknown",
-                _ => "unavailable",
-            };
-            return Err(error(code, message));
+    async fn call_json(&self, args: &[&str], mutating: bool) -> Result<Value> {
+        let output = self.call(args, mutating, MAX_RESPONSE_BYTES).await?;
+        let response: Value = serde_json::from_slice(&output)
+            .map_err(|_| error(failure_code(mutating), "Herdr CLI returned invalid JSON"))?;
+        if response.get("error").is_some() {
+            return Err(cli_error(&response, mutating));
         }
         response
             .get("result")
             .cloned()
-            .context("Herdr response has no result")
+            .ok_or_else(|| error(failure_code(mutating), "Herdr CLI response has no result"))
     }
+
+    async fn call(&self, args: &[&str], mutating: bool, limit: u64) -> Result<Vec<u8>> {
+        tokio::time::timeout(CLI_TIMEOUT, self.execute(args, mutating, limit))
+            .await
+            .map_err(|_| error(failure_code(mutating), "Herdr CLI timed out"))?
+            .map_err(|err| {
+                if err.downcast_ref::<RemoteError>().is_some() {
+                    err
+                } else {
+                    error(failure_code(mutating), err.to_string())
+                }
+            })
+    }
+
+    async fn execute(&self, args: &[&str], mutating: bool, limit: u64) -> Result<Vec<u8>> {
+        // Herdr owns socket discovery. Pass arguments verbatim, with no shell,
+        // and kill the CLI on cancellation or timeout; never retry a prompt.
+        let mut child = Command::new(&self.executable)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .context("Cannot start Herdr CLI (herdr must be on PATH)")?;
+        let stdout = child.stdout.take().context("Herdr CLI stdout is absent")?;
+        let stderr = child.stderr.take().context("Herdr CLI stderr is absent")?;
+        let (stdout, stderr, status) = tokio::try_join!(
+            read_bounded(stdout, limit),
+            read_bounded(stderr, 64 * 1024),
+            async { child.wait().await.context("Cannot wait for Herdr CLI") },
+        )?;
+        if !status.success() {
+            if let Ok(response) = serde_json::from_slice::<Value>(&stderr) {
+                return Err(cli_error(&response, mutating));
+            }
+            return Err(error(
+                failure_code(mutating),
+                format!("Herdr CLI exited with {status}"),
+            ));
+        }
+        Ok(stdout)
+    }
+}
+
+const fn failure_code(mutating: bool) -> &'static str {
+    if mutating {
+        "delivery_unknown"
+    } else {
+        "unavailable"
+    }
+}
+
+fn cli_error(response: &Value, mutating: bool) -> anyhow::Error {
+    let err = &response["error"];
+    let code = match err["code"].as_str() {
+        Some("agent_blocked") => "blocked",
+        Some("agent_not_found" | "pane_not_found" | "target_not_found") => "unavailable",
+        _ => failure_code(mutating),
+    };
+    error(
+        code,
+        err["message"]
+            .as_str()
+            .unwrap_or("Herdr CLI rejected request"),
+    )
+}
+
+async fn read_bounded(reader: impl tokio::io::AsyncRead + Unpin, limit: u64) -> Result<Vec<u8>> {
+    let mut output = Vec::new();
+    reader.take(limit + 1).read_to_end(&mut output).await?;
+    if output.len() as u64 > limit {
+        bail!("Herdr CLI output is too large");
+    }
+    Ok(output)
 }
 
 fn validate_pane(pane: &str) -> Result<()> {
@@ -538,6 +552,10 @@ pub fn validate_destination(agent: &Agent, expected: &str) -> Result<()> {
 }
 
 #[cfg(test)]
+#[path = "../tests/support/mod.rs"]
+mod support;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     fn row() -> Value {
@@ -610,83 +628,68 @@ mod tests {
         );
     }
 
-    fn fake_herdr(
-        status: &str,
-        pid: u64,
-        expect_prompt: bool,
-        text: &'static str,
-    ) -> (tempfile::TempDir, Herdr, tokio::task::JoinHandle<()>) {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("herdr.sock");
-        let listener = tokio::net::UnixListener::bind(&path).unwrap();
-        let mut agent = row();
-        agent["agent_status"] = json!(status);
-        let task = tokio::spawn(async move {
-            let mut responses = vec![
-                ("agent.get", json!({"type":"agent_info","agent":agent})),
-                (
-                    "pane.process_info",
-                    json!({"type":"pane_process_info","process_info":{"pane_id":"w1:p2","foreground_processes":[{"pid":pid,"name":"codex"}]}}),
-                ),
-            ];
-            if expect_prompt {
-                responses.push((
-                    "agent.prompt",
-                    json!({"type":"agent_prompted","agent":agent}),
-                ));
-            }
-            for (method, result) in responses {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let mut line = String::new();
-                BufReader::new(&mut stream)
-                    .read_line(&mut line)
-                    .await
-                    .unwrap();
-                let request: Value = serde_json::from_str(&line).unwrap();
-                assert_eq!(request["method"], method);
-                if method == "agent.prompt" {
-                    assert_eq!(request["params"]["target"], "w1:p2");
-                    assert_eq!(request["params"]["text"], text);
-                }
-                stream
-                    .write_all(
-                        format!("{}\n", json!({"id":request["id"],"result":result})).as_bytes(),
-                    )
-                    .await
-                    .unwrap();
-            }
-        });
-        (directory, Herdr::new(path), task)
-    }
-
     #[tokio::test]
     async fn sends_verbatim_only_after_live_identity_check() {
-        let text = "原文\n$(echo untouched) `literal`";
-        let (_directory, herdr, server) = fake_herdr("working", 123, true, text);
+        let fixture = support::CliFixture::new(&row());
+        let herdr = Herdr::new(fixture.executable());
+        let text = "--wait\n原文 $(echo untouched) `literal` ";
         let expected = session_token(&parse_agent(&row()).unwrap(), 123);
         herdr.send("w1:p2", &expected, text).await.unwrap();
-        server.await.unwrap();
+        assert_eq!(
+            fixture.prompts(),
+            vec![json!({"target":"w1:p2","text":text})]
+        );
     }
 
     #[tokio::test]
-    async fn never_calls_prompt_after_restart_or_blocked_state() {
-        for (status, pid, reason) in [
-            ("working", 124, "session_changed"),
-            ("blocked", 123, "blocked"),
+    async fn never_calls_prompt_after_restart_blocked_or_wrong_pane() {
+        for (status, pid, pane, reason) in [
+            ("working", 124, "w1:p2", "session_changed"),
+            ("blocked", 123, "w1:p2", "blocked"),
+            ("working", 123, "w1:p9", "session_changed"),
         ] {
-            let (_directory, herdr, server) = fake_herdr(status, pid, false, "");
+            let fixture = support::CliFixture::new(&row());
+            fixture.update(|state| {
+                state["row"]["agent_status"] = json!(status);
+                state["row"]["pane_id"] = json!(pane);
+                state["pid"] = json!(pid);
+            });
+            let herdr = Herdr::new(fixture.executable());
             let expected = session_token(&parse_agent(&row()).unwrap(), 123);
+            let error = herdr.send("w1:p2", &expected, "text").await.unwrap_err();
+            assert_eq!(error.downcast_ref::<RemoteError>().unwrap().code, reason);
+            assert!(fixture.prompts().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_cli_acknowledgements_are_bounded_and_never_retried() {
+        for mode in [
+            "timeout",
+            "oversized",
+            "stderr-flood",
+            "invalid-json",
+            "exit-failure",
+            "wrong-terminal",
+            "blocked",
+        ] {
+            let fixture = support::CliFixture::new(&row());
+            fixture.update(|state| state["mode"] = json!(mode));
+            let herdr = Herdr::new(fixture.executable());
+            let expected = session_token(&parse_agent(&row()).unwrap(), 123);
+            let started = std::time::Instant::now();
+            let error = herdr.send("w1:p2", &expected, "text").await.unwrap_err();
             assert_eq!(
-                herdr
-                    .send("w1:p2", &expected, "text")
-                    .await
-                    .unwrap_err()
-                    .downcast_ref::<RemoteError>()
-                    .unwrap()
-                    .code,
-                reason
+                error.downcast_ref::<RemoteError>().unwrap().code,
+                if mode == "blocked" {
+                    "blocked"
+                } else {
+                    "delivery_unknown"
+                },
+                "{mode}: {error}"
             );
-            server.await.unwrap();
+            assert!(started.elapsed() < Duration::from_secs(7));
+            assert_eq!(fixture.prompts().len(), 1, "{mode}");
         }
     }
     #[test]

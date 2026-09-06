@@ -11,8 +11,8 @@
 
 - `src/main.rs` owns daemon/update command dispatch. `src/config.rs` owns environment discovery.
 - `src/daemon.rs` owns HTTP input validation, origin checks, embedded assets, and connection handling.
-- `src/herdr.rs` owns bounded Herdr RPC and checks the expected native session and foreground process immediately before prompting. Rejected, missing, unregistered, unknown, or blocked destinations receive no input. Input acknowledgement is not work completion; lost acknowledgements are indeterminate and must not be automatically retried.
-- The read-only `/api/screen` uses Herdr `pane.read` visible text, checks terminal identity, and marks stale display in the UI. Reading does not require native registration or permission to send. It never forwards terminal input or replaces native history.
+- `src/herdr.rs` owns bounded Herdr CLI execution and checks the expected native session and foreground process immediately before prompting. Rejected, missing, unregistered, unknown, or blocked destinations receive no input. Input acknowledgement is not work completion; lost acknowledgements are indeterminate and must not be automatically retried.
+- The read-only `/api/screen` uses Herdr `pane read --source visible --format text` output, checks terminal identity, and marks stale display in the UI. Reading does not require native registration or permission to send. It never forwards terminal input or replaces native history.
 - `src/history.rs` reads bounded native Codex/Claude transcripts. Do not accept arbitrary user-supplied file paths or replace reports with terminal screenshots.
 - `src/update.rs` verifies release checksums and replaces the executable. The operator restarts the managed service.
 - `DESIGN.md` owns browser interaction and visual design. Preserve draft text and keep it bound to the selected CLI session. Mobile users must not need terminal modifier keys.
@@ -36,4 +36,4 @@ cargo build --locked --release
 
 Build the frontend before Rust so `client/dist` is embedded. Cargo itself does not invoke npm; builds without client assets serve API routes but return 503 for the UI.
 
-Use Chromium + Playwright for browser E2E. Integration tests isolate HTTP and Herdr sockets. Changes to live input or transcript adapters also require dedicated real Codex/Claude sessions: select in the browser, submit original text, verify actual CLI receipt and visible assistant output. Never use another person's pane for tests.
+Use Chromium + Playwright for browser E2E. Integration tests isolate HTTP and replace the Herdr executable with a Python 3 CLI fixture. Changes to live input or transcript adapters also require dedicated real Codex/Claude sessions: select in the browser, submit original text, verify actual CLI receipt and visible assistant output. Never use another person's pane for tests.

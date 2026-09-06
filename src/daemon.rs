@@ -39,7 +39,7 @@ pub async fn run(config: Config) -> Result<()> {
         .await
         .context("cannot bind HTTP listener")?;
     let console = Arc::new(Console {
-        herdr: Herdr::new(config.herdr_socket),
+        herdr: Herdr::new("herdr".into()),
         home: config.home,
         input: Mutex::new(()),
     });

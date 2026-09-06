@@ -4,20 +4,19 @@ Tailscale 越しに Herdr の Codex / Claude Code セッションへメッセー
 
 一覧で作業先・CLI・状態を確認し、対象を開いて手紙を送ります。返答は各 CLI が保存する会話履歴から Markdown で表示します。利用者の文面とコードの文字・空白は保持します。「会話」「画面」を切り替えても同じ宛先へ手紙を送れ、下書きも保たれます。短いタブ名や作業ディレクトリで宛先を区別できます。端末画面を操作するための記号キーや Ctrl / Shift 操作はありません。
 
-「画面」は Herdr の `pane.read` (`visible` / `text` / `strip_ansi`) が返す現在の表示テキストです。ピクセル単位の窓画像ではなく、色・カーソル・端末の装飾は再現しません。行と空白を保持し、縦横にスクロールできます。取得成功時刻を表示し、切断・終了・入替・取得失敗時は以前の表示であることを示します。表示中だけ2秒ごとに取得し、別タブや非表示では停止します。送信できない未登録・対応外 CLI・承認待ちの画面も閲覧できます。画面の常駐記録やキー転送は行いません。
+「画面」は Herdr CLI の `pane read --source visible --format text` が返す現在の表示テキストです。ピクセル単位の窓画像ではなく、色・カーソル・端末の装飾は再現しません。行と空白を保持し、縦横にスクロールできます。取得成功時刻を表示し、切断・終了・入替・取得失敗時は以前の表示であることを示します。表示中だけ2秒ごとに取得し、別タブや非表示では停止します。送信できない未登録・対応外 CLI・承認待ちの画面も閲覧できます。画面の常駐記録やキー転送は行いません。
 
 ## 起動と配布
 
 Linux x86_64 / macOS arm64 向け release archive は `agent-talk` と `LICENSE` を含みます。Svelte 画面はバイナリに埋め込みます。
 
 ```sh
-AGENT_TALK_HERDR_SOCKET="$HOME/.config/herdr/herdr.sock" \
 AGENT_TALK_HTTP_ADDR=127.0.0.1:5002 agent-talk daemon
 ```
 
 HTTP は明示設定時だけ待ち受けます。sandbox の通常経路は loopback listener と Tailscale HTTPS です。アクセス範囲はこの外側の構成が管理します。同権限のプロセスが API を使うことまで禁止する認証機構はありません。
 
-設定は `AGENT_TALK_HERDR_SOCKET`（省略時 `HERDR_SOCKET_PATH`）、`AGENT_TALK_HTTP_ADDR`、任意の `AGENT_TALK_LOG_LEVEL` です。`HOME` は CLI 履歴の所在を解決します。CLI は `daemon`、`update`、`--help`、`--version` のみです。`update` は checksum を検証して実行ファイルを更新し、稼働サービスの再起動は運用側で行います。
+設定は `AGENT_TALK_HTTP_ADDR`、任意の `AGENT_TALK_LOG_LEVEL` です。実行ユーザーの `PATH` に `herdr` が必要です。接続先の解決と RPC 通信は Herdr CLI が所有し、agent-talk 独自のソケット設定はありません。Herdr 自身の接続設定が必要なら Herdr の環境へ設定します。`HOME` は CLI 履歴の所在を解決します。CLI は `daemon`、`update`、`--help`、`--version` のみです。`update` は checksum を検証して実行ファイルを更新し、稼働サービスの再起動は運用側で行います。
 
 ## 対応とセッションの接続
 
@@ -29,7 +28,7 @@ Herdr が原文入力を受け付けても、CLI の処理完了を意味しま�
 
 履歴は Codex の `~/.codex/sessions` と Claude の `~/.claude/projects` にある JSONL を読み、user / assistant のテキストを表示します。tool の内部応答や推論内容は表示しません。直近から開き、「古い会話」「新しい会話」で長い履歴をページ単位に辿れます。各取得は最大 2 MiB / 500 メッセージで、新着は差分取得します。過去を読んでいる間の更新や再接続で読み位置を保持し、「最新へ戻る」で直近末尾へ戻れます。表示は最大 1000 件 / 4 MiB の本文までとし、上限では既存の表示を保持してページ移動を案内します。巨大な単一記録や壊れた記録の省略は画面に示します。ページ再読込は同じセッションの直近から再開します。履歴が利用できない場合は端末画面を代替の報告として扱わずエラーを表示します。
 
-Herdr は session identity を原子的に比較して prompt を送る API を持たないため、照合直後に同じ pane のプロセスが入れ替わる短い競合窓は残ります。送信直前の session / foreground process 照合と Herdr の blocked 判定を使い、名前による曖昧な宛先解決を避けます。
+確認した Herdr 0.8.2 の CLI は session identity を原子的に比較して prompt を送る操作を持たないため、照合直後に同じ pane のプロセスが入れ替わる短い競合窓は残ります。送信直前の session / foreground process 照合と Herdr の blocked 判定を使い、名前による曖昧な宛先解決を避けます。
 
 ## HTTP API
 
@@ -56,4 +55,4 @@ Herdr は session identity を原子的に比較して prompt を送る API を�
 
 ## 開発
 
-Rust 1.96 / Node 24 / npm を使います。検証コマンドは [AGENTS.md](AGENTS.md)、UI 契約は [DESIGN.md](DESIGN.md)、内部境界は [docs/design.md](docs/design.md) を参照してください。実機テストでは専用 Herdr pane と検証用 HTTP port を使用します。
+Rust 1.96 / Node 24 / npm を使います。検証コマンドは [AGENTS.md](AGENTS.md)、UI 契約は [DESIGN.md](DESIGN.md)、内部境界は [docs/design.md](docs/design.md) を参照してください。CLI adapter の隔離テストは Python 3 の stub を使います。実機テストでは専用 Herdr pane と検証用 HTTP port を使用します。

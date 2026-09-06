@@ -35,7 +35,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [dev-dependencies]
-# Isolated socket tests can control time without delaying the suite.
+# Isolated adapter tests can control time without delaying the suite.
 tokio = { version = "1.49", features = ["test-util"] }
 
 [lints.clippy]
