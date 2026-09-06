@@ -110,7 +110,7 @@ main {
   padding: 0 clamp(16px, 5vw, 56px) 18px;
 }
 /* --- app chrome (template Header 相当, DESIGN.md §7.1) ---
-   Registry / Letters では main の sibling。viewport full-bleed で詳細 1 段目と
+   Registry では main の sibling。viewport full-bleed で詳細 1 段目と
    同じ左右 gutter を共有する。本文 max-width 中央とは独立。 */
 .app-header {
   position: sticky;
@@ -191,7 +191,6 @@ main {
 }
 output,
 .status,
-.screen-status,
 .quiet-button,
 .back-button,
 .letter-meta,
@@ -201,9 +200,7 @@ select {
   font-family: "SFMono-Regular", Consolas, monospace;
 }
 
-.registry,
-.screen-panel,
-.letters-panel {
+.registry {
   padding-top: 12px;
 }
 .registry-summary {
@@ -235,14 +232,12 @@ h2 {
   font-weight: 600;
   letter-spacing: 0.04em;
 }
-output,
-.screen-status {
+output {
   color: var(--muted);
   font-size: 10px;
   letter-spacing: 0.08em;
 }
-output.failed,
-.screen-status.failed {
+output.failed {
   color: var(--danger);
 }
 /* session カード (DESIGN.md §7.3) */
@@ -406,157 +401,6 @@ output.failed,
     Consolas,
     monospace;
 }
-.screen-status {
-  min-height: 24px;
-  text-align: right;
-}
-.terminal-frame {
-  min-height: min(62vh, 640px);
-  max-height: calc(100dvh - 250px);
-  overflow: auto;
-  border: 1px solid #48463e;
-  /* terminal は両テーマで dark 固定 — capture の忠実性のため (DESIGN.md §4.3) */
-  background: var(--terminal-bg);
-  box-shadow: inset 0 14px 35px rgba(0, 0, 0, 0.35);
-}
-.screen-panel pre {
-  margin: 0;
-  padding: 18px;
-  color: var(--terminal-fg);
-  font:
-    12px/1.5 "SFMono-Regular",
-    Consolas,
-    monospace;
-  tab-size: 4;
-  white-space: pre;
-}
-.screen-panel pre.dimmed {
-  opacity: 0.62;
-}
-
-.letter-actions {
-  display: flex;
-  align-items: end;
-  gap: 8px;
-}
-.letter-actions label {
-  display: grid;
-  gap: 3px;
-  color: var(--muted);
-  font:
-    9px "SFMono-Regular",
-    Consolas,
-    monospace;
-  letter-spacing: 0.08em;
-}
-.letter-actions select {
-  min-width: 110px;
-  padding: 6px 24px 6px 8px;
-  border: 1px solid var(--border);
-  color: var(--on-surface);
-  background: var(--surface-raised);
-  font-size: 11px;
-}
-.letter-groups {
-  display: grid;
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-.letter-group-head {
-  position: sticky;
-  top: 48px;
-  z-index: 2;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  min-height: 32px;
-  margin: 0;
-  padding: 6px 16px 6px 20px;
-  border-bottom: 1px solid var(--border);
-  background: var(--surface);
-}
-.group-label {
-  overflow: hidden;
-  color: var(--on-surface);
-  font-size: 13px;
-  font-weight: 600;
-  letter-spacing: 0.04em;
-  white-space: nowrap;
-  text-overflow: ellipsis;
-}
-.group-id,
-.group-count {
-  color: var(--muted);
-  font:
-    10px "SFMono-Regular",
-    Consolas,
-    monospace;
-  letter-spacing: 0.08em;
-}
-.group-count {
-  margin-left: auto;
-  white-space: nowrap;
-}
-.letter-list {
-  display: grid;
-  gap: 1px;
-  margin: 0;
-  padding: 0;
-  border-block: 1px solid var(--border);
-  list-style: none;
-  background: var(--border);
-}
-.letter-group .letter-list {
-  border-block-start: 0;
-}
-.letter-list li {
-  position: relative;
-  padding: 14px 16px 12px 20px;
-  background: var(--surface);
-}
-.letter-list li::before {
-  position: absolute;
-  inset: 0 auto 0 0;
-  width: 4px;
-  content: "";
-  background: var(--idle);
-}
-.letter-list li.outgoing::before {
-  background: var(--accent);
-}
-.letter-meta {
-  display: flex;
-  gap: 10px;
-  color: var(--muted);
-  font-size: 9px;
-}
-.letter-meta strong {
-  color: var(--idle);
-  letter-spacing: 0.12em;
-}
-.outgoing .letter-meta strong {
-  color: var(--accent);
-}
-.letter-meta time {
-  margin-left: auto;
-}
-.letter-list p {
-  margin: 10px 0 13px;
-  color: var(--on-surface);
-  font-size: 13px;
-  line-height: 1.65;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-}
-.letter-list footer {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 13px;
-  color: var(--muted);
-  font-size: 9px;
-}
-
 @keyframes ink-in {
   from {
     opacity: 0;
@@ -567,21 +411,6 @@ output.failed,
   to {
     opacity: 0.3;
     transform: scaleX(0.6);
-  }
-}
-@media (max-width: 620px) {
-  .panel-heading {
-    align-items: flex-start;
-  }
-  .letters-panel .panel-heading {
-    display: grid;
-  }
-  .letter-actions {
-    justify-content: space-between;
-  }
-  .screen-panel pre {
-    padding: 12px;
-    font-size: 11px;
   }
 }
 @media (prefers-reduced-motion: reduce) {
@@ -595,160 +424,15 @@ output.failed,
   }
 }
 
-/* --- 手紙を出す --- */
-.letter-compose {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  margin: 14px 0 20px;
-  padding: 14px;
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  background: var(--surface-raised);
-}
-
-.letter-compose label {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  font-size: 13px;
-  color: var(--muted);
-}
-
-.letter-compose select,
-.letter-compose textarea,
-.composer-form textarea {
-  font: inherit;
-  color: var(--on-surface);
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 8px 10px;
-}
-
-.letter-compose textarea,
-.composer-form textarea {
-  resize: vertical;
-  min-height: 72px;
-}
-
-.letter-compose .compose-actions,
-.composer-form .compose-actions {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  flex-wrap: wrap;
-}
-
-.composer-form .skill-button {
-  display: inline-flex;
-  min-height: 44px;
-  align-items: center;
-  gap: 8px;
-  padding: 8px 14px;
-  border: 1px solid var(--border);
-  border-radius: 999px;
-  color: var(--on-surface);
-  background: var(--surface);
-  font-size: 13px;
-  font-weight: 600;
-  cursor: pointer;
-}
-.composer-form .skill-button svg {
-  width: 16px;
-  height: 16px;
-  fill: none;
-  stroke: currentColor;
-  stroke-width: 1.7;
-}
-.composer-form .skill-button.active {
-  border-color: var(--accent);
-  color: var(--accent);
-}
-.composer-form .skill-button:disabled {
-  opacity: 0.45;
-  cursor: not-allowed;
-}
-
-.letter-compose button[type="submit"],
-.composer-form .send-button,
-.composer-form button[type="submit"] {
-  min-height: 44px;
-  margin-left: auto;
-  padding: 8px 20px;
-  border: 1px solid var(--on-surface);
-  border-radius: 999px;
-  background: var(--on-surface);
-  color: var(--surface);
-  font-weight: 600;
-  cursor: pointer;
-}
-
-.letter-compose button[type="submit"]:disabled,
-.composer-form .send-button:disabled,
-.composer-form button[type="submit"]:disabled {
-  opacity: 0.45;
-  cursor: not-allowed;
-}
-
-.composer-form .skill-menu {
-  display: flex;
-  max-height: min(40dvh, 240px);
-  flex-direction: column;
-  gap: 4px;
-  overflow-y: auto;
-  padding: 10px;
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  background: var(--surface);
-}
-.composer-form .skill-menu-label {
-  color: var(--muted);
-  font-family: "SFMono-Regular", Consolas, monospace;
-  font-size: 10px;
-  letter-spacing: 0.12em;
-}
-.composer-form .skill-menu button[role="menuitemradio"] {
-  min-height: 36px;
-  padding: 6px 10px;
-  border: 0;
-  border-radius: 8px;
-  color: var(--on-surface);
-  background: transparent;
-  text-align: left;
-  cursor: pointer;
-}
-.composer-form .skill-menu button[role="menuitemradio"].selected,
-.composer-form .skill-menu button[role="menuitemradio"]:hover {
-  background: var(--accent-subtle);
-}
-.composer-form .skill-menu-note {
-  margin: 0;
-  color: var(--danger);
-  font-size: 12px;
-}
-
-.letter-compose .compose-status,
-.composer-form .compose-status {
-  display: block;
-  min-height: 1.2em;
-  font-size: 13px;
-  color: var(--muted);
-}
-
-.letter-compose .compose-status.failed,
-.composer-form .compose-status.failed {
-  color: var(--danger);
-}
-
-/* --- agent 詳細: 2 段 chrome + 全画面 terminal (DESIGN.md §7.4–7.5) --- */
+/* --- agent 詳細: 2 段 chrome + 会話・報告 (DESIGN.md §7.4–7.5) --- */
 main.detail-view {
   width: 100%;
   max-width: none;
-  min-height: 100dvh;
+  height: 100dvh;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
   padding: 0;
-  padding-bottom: calc(56px + env(safe-area-inset-bottom));
 }
 .icon-button {
   display: grid;
@@ -838,32 +522,10 @@ main.detail-view {
   border-bottom-color: currentColor;
   font-weight: 700;
 }
-.detail-view .screen-panel {
-  padding-top: 0;
-}
-.detail-view .terminal-frame {
-  min-height: 0;
-  max-height: none;
-  /* chrome 48 + 40 + border 1 = 89; dock tab 44 + padding slack 12 = 56 */
-  height: calc(
-    100dvh - 89px - 56px - env(safe-area-inset-top) -
-      env(safe-area-inset-bottom)
-  );
-  margin: 0;
-  border: 0;
-  border-right: 1px solid #48463e;
-  border-bottom: 1px solid #48463e;
-  border-left: 1px solid #48463e;
-  border-radius: 0;
-  box-shadow: none;
-}
-
 /* --- letter dock (ribbon composer)。agent-terrace 踏襲 (DESIGN.md §7.6) --- */
 .letter-dock {
-  position: fixed;
-  right: 0;
-  bottom: 0;
-  left: 0;
+  position: relative;
+  flex: 0 0 auto;
   z-index: 5;
   padding-bottom: env(safe-area-inset-bottom);
   background: transparent;
@@ -1046,4 +708,179 @@ main.detail-view {
   border-color: var(--accent);
   color: var(--accent);
   background: var(--accent-subtle);
+}
+
+textarea {
+  font: inherit;
+}
+textarea:focus-visible,
+.conversation-panel:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+.brand-link {
+  min-height: 44px;
+}
+.quiet-button {
+  min-height: 44px;
+}
+.detail-chrome {
+  flex: 0 0 auto;
+}
+.conversation-workspace {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+.conversation-panel {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 12px clamp(16px, 5vw, 56px);
+}
+.conversation-meta,
+.message-meta {
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+  color: var(--muted);
+  font-size: 10px;
+  overflow-wrap: anywhere;
+}
+.conversation-meta span {
+  min-width: 0;
+}
+.conversation-cwd,
+.composer-source {
+  margin: 4px 0 12px;
+  overflow-wrap: anywhere;
+  color: var(--muted);
+  font-size: 11px;
+}
+.availability,
+.panel-note {
+  font-size: 13px;
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+}
+.availability {
+  padding: 10px;
+  border: 1px solid var(--border);
+}
+.history-error {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin: 10px 0;
+  color: var(--danger);
+  font-size: 13px;
+}
+.conversation-list {
+  list-style: none;
+  margin: 0 auto;
+  padding: 0;
+  max-width: 1020px;
+}
+.conversation-list li {
+  padding: 14px 12px 14px 16px;
+  border-top: 1px solid var(--border);
+  border-left: 3px solid var(--idle);
+}
+.conversation-list li.user {
+  border-left-color: var(--accent);
+}
+.message-meta {
+  flex-wrap: wrap;
+}
+.message-meta strong {
+  color: var(--idle);
+}
+.user .message-meta strong {
+  color: var(--accent);
+}
+.conversation-list p {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  line-height: 1.75;
+  font-size: 13px;
+  margin: 10px 0;
+}
+.agent-btn {
+  max-width: 100%;
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+.agent-btn span,
+.agent-btn small {
+  display: block;
+}
+.agent-btn small {
+  margin-top: 4px;
+  font-size: 10px;
+  font-weight: 400;
+  color: var(--muted);
+}
+.composer-head {
+  justify-content: space-between;
+  margin: 0;
+}
+.composer-head strong {
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+.composer-form {
+  font-size: 13px;
+}
+.composer-form textarea {
+  width: 100%;
+  resize: vertical;
+  min-height: 72px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--on-surface);
+  padding: 8px 10px;
+  font-size: 16px;
+}
+.compose-actions {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.compose-status {
+  flex: 1;
+  min-width: 140px;
+  line-height: 1.7;
+  font-size: 12px;
+}
+.compose-status.failed {
+  color: var(--danger);
+}
+.composer-form button[type="submit"] {
+  min-height: 44px;
+  margin-left: auto;
+  padding: 8px 20px;
+  border: 1px solid var(--on-surface);
+  border-radius: 999px;
+  background: var(--on-surface);
+  color: var(--surface);
+  font-weight: 600;
+  cursor: pointer;
+}
+.composer-form button[type="submit"]:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.composer-blocked {
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+}
+.letter-dock-panel {
+  visibility: hidden;
+}
+.letter-dock.expanded .letter-dock-panel {
+  visibility: visible;
 }

@@ -1,6 +1,6 @@
 ---
-name: agent-talkd observation & letters UI
-version: 2
+name: agent-talkd remote messages UI
+version: 3
 description: >
   Project design authority for the agent-talkd web client. Self-contained:
   everything needed to implement and verify the UI lives in this file.
@@ -15,17 +15,17 @@ theme 3択・token・モーダル/メニュー規約は本書が正。
 
 ## 1. 目的と範囲
 
-herdr 上で稼働する対話 agent の観測 (registry / terminal screen) と、許可された
-mailbox からの手紙送信 (letters) を行う、同一ホスト・同一 UID 向けの小さな
-操作面。視覚言語は「墨と和紙」— 墨色の地、和紙色の文字、柿色の accent。
-chrome はテンプレートの静かな 48px app header + compact summary を土台にし、
-session 単位カード・状態 border / 文字色・letter dock を agent-talk の差別化と
-する。モバイル縦スペースを優先する。
+既存の Tailscale / HTTPS 経路から Herdr 内の対象を選び、指示を原文で送り、
+同じ CLI session の返答・進捗・完了報告を読むための人間向け操作面。
+スマホで端末の記号・Shift/Ctrl 等を操作させず、帰宅後も同じ session で継続する。
+Codex / Claude Code を対象とし、その他の CLI は実際の adapter 対応状態を示す。
 
-過去の「read-only 専用」「composition 禁止」「Port-3 gate」、および
-eyebrow `HERDR / LOCAL BROKER`・角印「話」・縦書き masthead を identity と
-する記述は廃止済み。brush loader は loading 表示として残す。
-手紙送信は正式機能である。
+視覚言語は既存の「墨と和紙」— 墨色の地、和紙色の文字、柿色の accent。
+48px app header、compact summary、session 単位カード、状態 border / 文字色、
+下部の手紙 dock を継承し、モバイル縦スペースを優先する。
+mailbox・skill 選択・エージェント間通信・呼び鈴・ack の操作は置かない。
+brush loader は loading 表示として残す。長履歴の pagination / 継続閲覧の拡張は
+後続タスクの担当とし、本変更では既存 CLI 履歴の直近の出力を接続する。
 
 ## 2. 画面と URL (router contract)
 
@@ -36,15 +36,15 @@ fallback するため、サーバ変更は不要。
 | URL | 画面 |
 |---|---|
 | `/` | Registry (agent 一覧) |
-| `/letters` | Letters (mailbox timeline + inline compose) |
-| `/agent?pane=<id>` | Agent detail (terminal screen + letter dock) |
+| `/letters` | 旧 URL。Registry へ `replaceState` で正規化 |
+| `/agent?pane=<id>` | Agent detail (同一 CLI session の会話・報告 + 手紙 dock) |
 
 規則:
 
 - pane id は opaque (`%`, `/`, Unicode を含み得る)。必ず URLSearchParams で
   query に載せる。path segment にしない。
-- 一覧→詳細、任意画面→Letters は `pushState`。
-- 同一 session 内の agent タブ切替は `replaceState` (Back はタブ履歴を
+- 一覧→詳細は `pushState`。
+- 同一 workspace 内の agent タブ切替は `replaceState` (Back はタブ履歴を
   遡らず一覧へ戻る)。
 - `popstate` で再 fetch なしに view を復元する。reload は同じ画面を復元する。
 - 未知 path は Registry を描画し `replaceState` で `/` へ正規化する。
@@ -52,26 +52,31 @@ fallback するため、サーバ変更は不要。
   fetch 成功後も pane が不在なら silent redirect せず、URL を保ったまま
   「この agent は見つかりません」の説明 + 「一覧へ」導線 (quiet-button) を出す。
   fetch 失敗は registry と同型のエラー + 再試行。
-- `document.title` は view に追従する (`agent talk · observer` /
-  `agent talk · <agent name>` / `agent talk · letters`)。
+- `document.title` は view に追従する (`agent talk · agents` /
+  `agent talk · <agent name>`)。
 
 選択中 agent は「URL の pane + 最新 registry snapshot」から導出する。
 view/selectedAgent を URL と別に持つ state にしない (単一情報源)。
+送信時に固定した CLI session identity は宛先検証用に保持し、registry 更新で
+暗黙に別 identity へ差し替えない。
 
 ## 3. Domain model
 
-- **agent**: name (タブ名由来。custom タブ名が無ければ runtime 検出名
-  claude/codex/grok 等) / state (idle|busy) / pane_id (opaque) /
-  session (= workspace label) / location / cwd / backend (herdr)。
-- **session (workspace)**: 同一 session に複数 agent が同居する。詳細画面の
-  主タイトルは session であり、agent はその中のタブである。
-- **letter**: mailbox (source) → 対象 pane への本文送信。結果は
-  sent (即配達) | queued (配達待ち)。mailbox 一覧は許可制で、空 (empty) と
-  取得失敗 (error) は別状態。
-- **状態色**: idle = teal 系 (`--idle`)、busy = ochre 系 (`--busy`)。
-  registry の agent ボタンは **border 色**、詳細の agent タブは **文字色** で
-  視覚表現する。色だけに依存しないため、各 button / tab の `aria-label` に
-  `name (idle|busy|退出)` を必ず含める。danger は失敗表示専用。
+- **agent**: Herdr の name / state / opaque pane_id / workspace label / location /
+  cwd / runtime。対応状態と送信できない理由は adapter の実データから表示する。
+- **workspace**: 複数 agent をまとめる Herdr の作業領域。詳細主タイトルとタブの
+  grouping に使用する。CLI session identity とは区別する。
+- **CLI session identity**: 実際の対話セッションを識別する値。送信宛先と履歴と
+  draft は pane + この identity に紐付ける。同じ pane の再利用でも別 session へ
+  下書きを移したり、自動再送したりしない。
+- **message / report**: 対象 CLI の実履歴の user / assistant 本文。役割・時刻
+  (取得できた場合) を付けて原文を表示し、AI による要約や別の通信台帳を作らない。
+- **送信結果**: API 受理・対象への入力・エージェントの処理・完了は別の事実。
+  adapter が確認できた段階だけ表示し、HTTP 成功から処理完了を推測しない。
+  進捗・完了の根拠は実際の assistant 報告であり、idle への遷移だけではない。
+- **状態色**: idle = `--idle`、busy = `--busy`。一覧ボタンの border と詳細タブの
+  文字色で補強する。accessible name に name と状態を含め、送信可否の理由は
+  可視テキストでも説明する。danger は失敗表示専用。
 
 ## 4. Theme — 3択制
 
@@ -81,8 +86,8 @@ view/selectedAgent を URL と別に持つ state にしない (単一情報源)�
 応えるため、**墨 (dark) / 生成り (light) / システム追従** の3択制へ移行する。
 Washi (e-paper) は実 e-paper 用途専用であり、通常 screen の選択肢に出さない。
 
-再評価条件: e-paper クライアントを正式サポートする時、または Kinari で
-terminal 固定 dark (後述) が実用上の問題になった時に選択肢構成を見直す。
+再評価条件: e-paper クライアントを正式サポートする時、または通常 screen の
+用途が変化した時に選択肢構成を見直す。
 
 ### 4.2 保存と機構
 
@@ -128,13 +133,13 @@ terminal 固定 dark (後述) が実用上の問題になった時に選択肢�
 
 - **Sumi の解釈**: 共有テンプレートの中立 gray + 金 (#191919/#e0a800) では
   なく、実装済みの墨・和紙・柿 palette を本 Project の正準 Sumi とする。
-  理由: masthead・角印・brush loader と一体の確立した identity であり、
+  理由: 既存画面・brush loader と一体の確立した identity であり、
   テンプレートは bootstrap 入力に過ぎないため。
 - **Kinari の accent**: テンプレート既定 #9a6a00 (金) ではなく柿の hue を
   保った焦柿 #a84a17 を採る。理由: brand hue の連続性。cream 地で文字用途
   4.5:1 以上を実測で満たすこと (満たさない場合は hue を保ち明度のみ調整)。
-- **terminal は両テーマで dark 固定**: capture 対象の herdr pane は dark TTY
-  であり、反転は capture の忠実性を損なうため。
+- terminal token は既存資産として保持する。会話・報告本文には通常の
+  surface / on-surface を使い、両テーマに追従させる。
 - Kinari 固有規則 (テンプレート由来): accent-subtle の控えめ装飾は tint ≤12%
   とし意味は text/shape でも伝える。focus ring は cream 地で ≥3:1 を実測。
 
@@ -156,20 +161,21 @@ terminal 固定 dark (後述) が実用上の問題になった時に選択肢�
 
 ## 6. Layout と spacing
 
-- 一覧 / Letters の **app header** は `main` の sibling として viewport
+- 一覧の **app header** は `main` の sibling として viewport
   full-bleed (48px sticky)。左右 gutter は詳細 1 段目と同一 token
   (`--chrome-inline-start` / `--chrome-inline-end` =
   `max(12px, safe-area-left)` / `max(8px, safe-area-right)`)。
-- 一覧 / Letters の **本文 `main`**: `width: min(1020px, 100%)`、中央寄せ。
+- 一覧の **本文 `main`**: `width: min(1020px, 100%)`、中央寄せ。
   横 padding `clamp(16px, 5vw, 56px)`。`min-height: calc(100dvh - 48px)`。
   chrome の端位置と本文列の幅は独立 (header を本文 max-width に閉じ込めない)。
 - 詳細 (`/agent`): `main` は full-bleed。chrome 2 段 48+40 + hairline 1 =
-  outer **89px** + letter dock tab を除いた高さを terminal に与える。
+  outer **89px** と letter dock を除く領域を会話・報告に与える。dock 展開時も
+  本文末尾と送信結果を覆わず、会話と composer がそれぞれ scroll できる。
 - 横 scroll をページに出さない。最小対応幅 320px。カード内 agent ボタンは wrap。
 
 ## 7. Components
 
-### 7.1 App header (Registry / Letters)
+### 7.1 App header (Registry)
 
 テンプレート Header を copy-then-own した 48px sticky bar。`main` 外に置き
 viewport 全幅。左右 gutter は詳細 `.detail-bar-primary` と共通 token。
@@ -182,8 +188,7 @@ viewport 全幅。左右 gutter は詳細 `.detail-bar-primary` と共通 token�
 
 ### 7.2 Menu (template dropdown) とテーマモーダル
 
-- 右寄せ dropdown (overlay + panel)。項目: Agents / Letters / テーマ設定
-  (詳細では Letters + テーマ設定)。
+- 右寄せ dropdown (overlay + panel)。項目: Agents / テーマ設定。
 - 「テーマ設定」はテーマモーダル (§8) を開く。ラベルは §4.4 のとおり。
 - Escape / overlay で閉じ、起点 menu ボタンへ focus 復帰。
 
@@ -192,8 +197,9 @@ viewport 全幅。左右 gutter は詳細 `.detail-bar-primary` と共通 token�
 - compact summary (≤40px): 見出し「稼働中の agent」+ aria-live 件数。章番号なし。
 - agents を backend+session で group し session カード1枚に agent ボタンを並べる
   (優先: claude → codex → grok → 他)。ボタンは registry 実データから動的生成。
-- ボタン: 可視は name のみ、状態は 2px border 色、aria-label に state、
-  min-height 44px。location / pane_id / cwd は非表示。
+- ボタン: 可視は name、状態は 2px border 色、aria-label に state、
+  min-height 44px。カードに作業先を表示し、詳細では cwd / runtime を読める。
+  pane_id は通常非表示。送信不能でも詳細から理由と取得済み報告を読める。
 - loading / empty / error は従来どおり。
 
 ### 7.4 詳細ヘッダー (2段)
@@ -203,98 +209,67 @@ viewport 全幅。左右 gutter は詳細 `.detail-bar-primary` と共通 token�
 [ agent tab · agent tab · … (横 scroll)              ]
 ```
 
-- 1 段目 48px: brand (`aria-label="agent talk — 一覧へ戻る"`) + session 名。
+- 1 段目 48px: brand (`aria-label="agent talk — 一覧へ戻る"`) + session 名
+  (Herdr workspace label)。
   session の title/aria-label に `session · pane_id`。pane id は非表示。
-- 2 段目 40px: 同一 session の agent タブを常時表示。active は下線、状態は
+- 2 段目 40px: 同一 workspace の agent タブを常時表示。active は下線、状態は
   文字色 (idle/busy/退出)。切替は replaceState。tap ≥36px。
 
-### 7.5 Screen (terminal)
+### 7.5 会話・報告
 
-- 2秒間隔の visible-only poll を継続。手動更新 UI なし。
-- terminal: role=log、mono、固定 dark。詳細では viewport 全幅。accent border は
-  付けず、左右・下辺の暗色 border のみ。
-- 失敗・退出時の扱いは従来どおり (dim / 再試行 / タブ更新)。
+- 詳細の主面は選択中の CLI session の履歴。user は「あなた」、assistant は
+  「エージェント」と可視ラベルで区別し、本文を通常フォント・テーマ追従で表示する。
+  改行を保ち、長い文字列は折り返す。コードブロックの横 scroll は内部に限定する。
+- 原文の時系列を維持し、Web から送った内容と端末上の内容を同じ履歴で読む。
+  ローカル送信結果を履歴に重複追加しない。実履歴に未反映の間は送信状態欄で示す。
+- 初回 loading / 履歴なし / 取得失敗 + 再試行を別表示にする。更新失敗時は取得済み
+  本文を保持し「接続が切れています」等の理由を示す。報告がないことを完了としない。
+- 更新時に全文を live announcement せず、接続・送信状態を `aria-live="polite"`
+  で通知する。読んでいる途中の scroll 位置を更新で末尾へ飛ばさない。
+- terminal 画面・キー送信 UI は主面に置かない。承認待ちを含め、スマホで端末キーを
+  再現する操作を解決手段として要求しない。
 
-### 7.6 Letter dock (ribbon composer) — 詳細画面下部
+### 7.6 手紙 dock — 詳細画面下部
 
-agent-terrace の letter-dock 構造を踏襲する。全幅 launcher バーは廃止。
+既存の ribbon composer を継承し、宛先は表示中の pane + CLI session に固定する。
 
-- **dock**: 画面下端に固定。tab 行の上辺に viewport 全幅の 1px `--border`
-  線を敷き、tab はその線から生える。
-- **tab (launcher)**: 右寄せ (右 inset `max(10px, safe-area-right)`)。
-  `min-width: 108px`・`height: 44px`・`border-radius: 9px 9px 0 0`・
-  border は下辺なし・地は `--surface-raised`・mono 12px。内容 = 封筒 SVG
-  (17px) + `手紙` + chevron SVG (13px、開時 180° 回転)。hover / 開時は
-  accent 色。`aria-expanded` + `aria-controls`。未送信 draft (body または
-  skill) がある時は tab の寸法・可視内容を変えず、枠を `--accent` にする。
-  色だけに依存せず accessible name には `下書きあり` を加える。
-- **panel**: tab の下の線から下 → 上へ展開。`max-height: min(62dvh, 420px)`
-  で内部 scroll。展開 motion は max-height/transform/opacity 220ms
-  `cubic-bezier(0.22,1,0.36,1)` 以下。**閉時は `inert` + `aria-hidden="true"`**。
-- panel 内容:
-  - 見出し `{agent.name} へ手紙を出す` + source 表示 + 閉じる quiet icon
-    button。
-  - source phase: loading / ready / empty / error (混同させない)。
-  - 宛先は表示中 pane に固定。
-  - **actions 行**: 左 skill ボタン + 右送信ボタン (min-height 44px)。
-  - skill: 既定「なし」(trigger 表示も「なし」)。actions 直下に in-flow の
-    menu (`role=menu` / menuitemradio) を展開。開時は現選択へ focus、
-    Arrow/Home/End、Escape/選択後は trigger へ復帰。候補は
-    `GET /api/agents/{pane}/skills` (installed ∩ allowlist、skill_syntax の
-    無い runtime は空)。0 件でも「なし」のみ。draft に skill も保持。
-  - 送信は `POST /api/letters` に optional `skill`。失敗時は body+skill 保持、
-    成功時のみ clear。
-  - 送信結果 sent / queued を `aria-live` で区別。
-  - 開: panel 展開 + focus。閉: Escape / 閉じる → tab 復帰。skill popup 中の
-    Escape は popup のみ閉じる。
+- **tab**: 右寄せ、右 inset `max(10px, safe-area-right)`、`min-width: 108px`、
+  `height: 44px`、上角 9px、地は `--surface-raised`。上辺に全幅 1px border。
+  封筒 SVG + `手紙` + chevron、`aria-expanded` / `aria-controls` を持つ。
+  draft があれば accent 枠と accessible name の「下書きあり」で示す。
+- **panel**: `max-height: min(62dvh, 420px)`、内部 scroll。閉時は `inert` と
+  `aria-hidden="true"`。開くと本文へ focus、閉じる / Escape で tab へ戻す。
+- 内容は `{agent.name} へ手紙を出す`、宛先の runtime / session、本文 textarea、
+  送信ボタン、状態説明。mailbox source・skill picker・独立の授権ゲートは置かない。
+- textarea は通常の日本語入力と改行を扱う。明示した「送信」ボタンで原文を送り、
+  Enter / IME 確定だけでは送信しない。送信ボタンは min-height 44px。
+- 送信中は重複 submit を防ぐ。宛先を切り替えた後に前の送信が完了しても、
+  新しい宛先の draft を消さない。本文を後から編集した場合も編集分を消さない。
+- draft は pane + CLI session identity ごとに保持し、dock 開閉・タブ切替・
+  再読込で復元する。明確な送信成功時だけ送った本文を消す。エラー、終了、再起動、
+  通信切断、結果不明では保持する。session が変わった場合は旧 draft を保管して
+  再利用を止め、別 session になった説明を表示する。
+- 成功は確認できた範囲で「送信を受け付けました」または「対象へ入力しました」と
+  表示し、処理完了の印を付けない。結果不明時はその旨を説明し自動再送しない。
 
-### 7.7 Letters 画面
+### 7.7 対象・接続の状態
 
-取得契約は現行のまま。mailbox selector と IN/OUT timeline を保つ
-(teal/kaki は文字 IN/OUT の補強)。fetch は poll なし・ID cursor による
-手動追記のまま。inline compose も現行どおり (source = 選択 mailbox、
-宛先 = 稼働 agent select)。この画面の compose は dock 化の対象外。
+| 状態 | 可視説明と操作 |
+|---|---|
+| 未登録 / session 未特定 | 対象 session を特定できない理由を示し送信不可。draft 保持 |
+| unsupported | runtime 名と未対応を示し送信不可。閲覧可能なら履歴を表示 |
+| blocked | 承認待ち等の取得済み理由を示し送信不可。キー操作や迂回送信を促さない |
+| 終了 / 不在 | 退出を示し、取得済み報告と draft を保持。一覧へ戻れる |
+| 再起動 / identity 変更 | 別 session になったことを示し旧宛先への送信を止める。新しい対象は明示的に開き直す |
+| 接続切断 / 更新失敗 | 最新状態を確認できない説明と再試行。既存表示・draft を保持 |
+| busy | 稼働中と表示。追加指示の可否は adapter の capability に従う |
 
-**表示順と grouping** — client 側の表示変換のみで行い、取得配列・cursor・
-サーバ契約は変えない。
-
-- letter を workspace (herdr の space) で group 化する。key は `target_pane`
-  の `:` より前の prefix (`w2:p3` → `w2`)。`:` を含まない旧形式 pane は pane id
-  全体を key とする。
-- 並びは **新着が上**: group は「group 内の最大 id」の降順、group 内の letter は
-  id 降順。読むために末尾まで scroll させない。
-- **group 見出しは sticky な 1 行の非対話 `h3`** とする。§7.3 の session
-  カードは Letters に流用しない。理由は 2 つ。カードの padding + gap が
-  group ごとに縦を約 36px 奪う (モバイル縦スペース優先 §1)。そして全幅
-  hairline を既に持つ letter list と枠が二重になる。
-  - `position: sticky; top: 48px` (app header の直下)。地は `--surface`
-    (不透過)、下辺のみ 1px `--border`、高さ 32px 以上。letter はその下を潜る。
-  - 内容は 3 要素まで: label / workspace id / 件数。
-    - **label**: live registry (`/api/who`) に同 prefix の agent がいればその
-      `session` (workspace label)、いなければ workspace id。13px・weight 600・
-      letter-spacing 0.04em・1 行 ellipsis。
-    - **workspace id**: label と異なるときだけ併記 (同じ文字列を 2 度出さない)。
-      10px mono `--muted`。
-    - **件数**: 行末 (`margin-left: auto`) に `N 通`。10px mono `--muted`。
-    - **相手 agent 名は見出しに置かない**。1 workspace には複数 agent が同居
-      し得るため (§3) 見出しの単一名は誤導になる。宛先の所有者は各 letter の
-      footer (`→ / ← {target_name}`) 1 箇所に保つ。pane id は §7.3 と同じく
-      非表示。
-- letter item の意匠 (4px 方向バー・IN/OUT・#id・時刻・本文・footer) は現行
-  のまま。group ごとの `ol.letter-list` は上辺 border を持たない (見出しの下辺
-  と二重にしない)。group 由来の追加 indent は与えず、見出しの text 左端は
-  letter 本文の左端 (list 左端から 20px) に揃える。
-- group の折りたたみ・並べ替え・group 単位 fetch は置かない。tab 停止も増やさ
-  ない (selector → 更新 → 宛先 → 本文 → 送信)。見出しに entrance animation は
-  付けない (更新のたびに再生させないため)。
-- loading / empty / error / status 行 (`N letters`) は現行のまま。group は
-  events から導出するので空 group は構造上発生しない。
-- a11y: 各 group は `h3` + `ol[aria-labelledby]`。外側 list の
-  `${mailbox} letter history` は保つ。
+送信不可の理由はボタン付近に常時読めるテキストで置き、disabled の色だけにしない。
+API が返す理由と一致させ、未知の状態を送信可能と推測しない。
 
 ### 7.8 Footer
 
-Registry / Letters / 詳細のいずれにも site footer は置かない。
+Registry / 詳細のいずれにも site footer は置かない。
 
 ### 7.9 App icon (アプリマーク)
 
@@ -368,27 +343,27 @@ maskable 版は通常版の描画を中心 (256,256) 基準で `scale(0.875)` �
 
 | 対象 | 周期 | 条件 |
 |---|---|---|
-| screen capture (`/api/agents/<pane>/screen`) | 2s | `/agent` 表示中 + document visible |
+| 選択 session の会話・報告 | 2s | `/agent` 表示中 + document visible |
 | registry (`/api/who`) | 5s | 全 view で document visible (App level 単一 poller) |
-| letters timeline | poll なし | 手動更新のみ (ID cursor) |
 
-registry poll の目的: 一覧の鮮度と、詳細ヘッダーの state / タブ構成の追従。
-hidden で停止し、visible 復帰で即時 refresh。poll 失敗は表示中の内容を消さず、
-registry 画面では aria-live output にのみ失敗を示す。
+hidden で停止し、visible 復帰で即時 refresh。古い宛先の遅延レスポンスを新しい
+宛先の履歴へ混ぜない。poll 失敗で取得済み内容を消さず、可視状態と aria-live で
+失敗を示す。長履歴 pagination 用の UI や独立保存基盤は今回追加しない。
 
 ## 10. Responsive
 
 - 320px〜: ページ横 scroll なし。agent ボタンは wrap。
 - 390×844 / 412×915 (mobile): app/detail 1 段目 48px、detail 2 段目 40px、
-  terminal 高さ ≥55% viewport。
+  dock 閉時の会話・報告領域は viewport の 55% 以上。dock 展開中はこの最低値を
+  課さず、本文入力・送信・状態表示が縦 scroll で到達できること。
 - ≥1020px: 一覧の本文 main は 1020px で中央固定。app header は viewport 全幅
-  のまま (詳細 1 段目と brand/menu の端を揃える)。詳細 terminal は viewport
-  全幅。dock の tab は右寄せ、上辺の線は全幅。
+  のまま (詳細 1 段目と brand/menu の端を揃える)。詳細は viewport 全幅を使い、
+  本文は折り返して表示。dock の tab は右寄せ、上辺の線は全幅。
 
 ## 11. Keyboard / focus / touch
 
 - すべての操作 (agent ボタン / brand home / タブ / menu / dock tab / 送信 /
-  再試行 / selector / モーダル) はキーボード到達可能で focus-visible ring
+  再試行 / モーダル) はキーボード到達可能で focus-visible ring
   (accent 2px, offset 2–3px) を持つ。
 - touch target: 主要操作 44×44px 以上 (agent ボタン・menu・dock tab)。
   タブは ≥36px 高。
@@ -415,28 +390,28 @@ registry 画面では aria-live output にのみ失敗を示す。
 
 ## 14. State transitions
 
-- **router**: `/` ⇄ `/agent?pane` (push / Back)、任意 → `/letters` (push)、
-  タブ切替 = replace、未知 path → `/` (replace)、popstate = 復元のみ。
-- **detail 画面**: loading → ready / error(初回) / error(継続, dim)。
-  pane 消滅 → 「退出」表示。not-found → 説明 + 一覧導線。
-- **composer**: closed ⇄ open。open 内で source phase
-  loading → ready | empty | error(再試行)。送信 idle → sending →
-  sent | queued | failed(draft 保持)。
+- **router**: `/` ⇄ `/agent?pane` (push / Back)、タブ切替 = replace、
+  旧 `/letters` と未知 path → `/` (replace)、popstate = 復元。
+- **detail**: loading → ready / empty / error。継続 fetch の error は本文保持。
+  対象消滅や identity 変更で送信を止め、説明を示す。
+- **composer**: closed ⇄ open。送信 idle → sending → accepted / delivered /
+  failed / result-unknown。状態名は API が確かめた事実に合わせる。
+  accepted / delivered を agent の処理完了へ自動遷移させない。
 - **theme**: dark | light | system。選択即適用・即保存・reload 後も維持。
   system は OS 設定変更へ live 追従してよい (matchMedia)。
 
 ## 15. 検証方法
 
-- unit (vitest + jsdom): router の parse/serialize/navigate/popstate、theme
-  store (保存値 ⇄ data-theme)、draft key (pane+identity)、pane 消滅時の
-  header 状態。jsdom の History API で Back/replace を検証する。
+- 実行可能な router / draft / session identity の振る舞いを対象に検証する。
+  原文送信、送信中の対象切替・本文編集、遅延レスポンス、再起動後の誤送信防止、
+  失敗時の draft 保持を確認する。本文にある単語の存在をテストにしない。
 - `npm run check` (svelte-check) と `npm run format:check` を green に保つ。
-- browser (ui-checker): 390×844 / 412×915 / 1020×800 で、DOM・computed
-  style・getBoundingClientRect・実操作により本書の数値 (app header 48px、
-  detail chrome 89px (48+40+border 1)、dock tab 44px/108px、panel ≤min(62dvh,420px)、
-  contrast 比、theme 永続化、deep-link reload、Back/Forward、eyebrow 不在、
-  session カード、pane 座標非表示) を実測する。prefers-color-scheme と
-  prefers-reduced-motion は DevTools emulation で両値を検証する。
-- Letters の grouping (§7.7) は browser で実測する。対象は id の降順、
-  workspace ごとの分割、見出しの sticky 位置 (top 48px)、見出し高さ 32px 以上、
-  件数の一致。unit は純関数 (events → groups) を対象にする。
+- Chromium + Playwright による browser 実測: 320px 幅 / 390×844 / 412×915 /
+  1020×800、両テーマで横 overflow なし、header 48px、detail chrome 89px、
+  dock tab 44px / 108px、panel ≤min(62dvh,420px)、本文の可読性・contrast 比を測る。
+- 実操作で deep-link reload、Back/Forward、テーマ保存、IME 改行、focus 復帰、
+  disabled 理由、loading / empty / error、draft 復元と再起動時の隔離を確認する。
+  prefers-color-scheme / reduced-motion も emulation で確認する。
+- 実ブラウザ経路で Codex と Claude Code の対象確認 → 原文指示 → 実 session 受信
+  → assistant 報告表示を確認する。追加指示と接続切断・終了時の表示も確認し、
+  送信成功だけで実 session の処理・報告検証を代替しない。

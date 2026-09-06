@@ -4,13 +4,11 @@
 // 含み得る) なので path segment にせず、必ず URLSearchParams で query に
 // 載せる。URL が唯一の画面情報源で、view state を別に持たない。
 
-export type Route =
-  { view: "registry" } | { view: "letters" } | { view: "agent"; pane: string };
+export type Route = { view: "registry" } | { view: "agent"; pane: string };
 
 /// URL を Route へ解釈する。未知の形は null (呼び出し側が `/` へ正規化)。
 export function parseRoute(pathname: string, search: string): Route | null {
   if (pathname === "/") return { view: "registry" };
-  if (pathname === "/letters") return { view: "letters" };
   if (pathname === "/agent") {
     const pane = new URLSearchParams(search).get("pane");
     if (pane !== null && pane !== "") return { view: "agent", pane };
@@ -22,8 +20,6 @@ export function serializeRoute(route: Route): string {
   switch (route.view) {
     case "registry":
       return "/";
-    case "letters":
-      return "/letters";
     case "agent": {
       const params = new URLSearchParams({ pane: route.pane });
       return `/agent?${params}`;
@@ -39,7 +35,7 @@ export function currentRoute(): Route {
   return { view: "registry" };
 }
 
-/// 画面遷移。一覧→詳細・→Letters は push、同 session のタブ切替は replace
+/// 画面遷移。一覧→詳細 は push、同 session のタブ切替は replace
 /// (Back がタブ履歴を遡らず一覧へ戻るため。DESIGN.md §2)。
 export function navigate(
   route: Route,

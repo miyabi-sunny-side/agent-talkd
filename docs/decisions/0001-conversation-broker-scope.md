@@ -1,3 +1,5 @@
+> Superseded: historical broker design only. The current product is the [remote session console](../design.md); peer/MCP/journal behavior described below is removed.
+
 # 0001. agent-talkd を会話ブローカへ縮小し、agent 窓口を MCP に一本化する
 
 - Status: accepted

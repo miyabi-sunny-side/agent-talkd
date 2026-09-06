@@ -1,3 +1,5 @@
+> Superseded: historical broker design only. The current product is the [remote session console](../design.md); peer/MCP/journal behavior described below is removed.
+
 # 0002. メッセージの保持と受領
 
 - Status: accepted (amended)

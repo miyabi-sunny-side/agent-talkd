@@ -1,99 +1,34 @@
-mod backend;
-mod ccsock;
-mod client;
 mod config;
 mod daemon;
-mod help;
 mod herdr;
-mod journal;
-mod lifecycle;
-mod paths;
-mod procid;
-mod protocol;
-mod run;
-mod state;
+mod history;
 mod update;
 
-use std::{env, process::ExitCode};
+use anyhow::{Result, bail};
 
-use anyhow::Result;
-use config::Config;
+const HELP: &str = "agent-talk — remote messages for Herdr sessions\n\nUsage: agent-talk daemon | update | --version | --help\n\nThe daemon serves the embedded browser app and HTTP API.\nSet AGENT_TALK_HTTP_ADDR and AGENT_TALK_HERDR_SOCKET.\nPeer communication and broker commands have been removed.\n";
 
 #[tokio::main]
-async fn main() -> ExitCode {
+async fn main() -> std::process::ExitCode {
     match run().await {
-        Ok(code) => ExitCode::from(
-            u8::try_from(code.clamp(0, 255)).expect("clamped exit code fits into u8"),
-        ),
+        Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("agent-talk: {error:#}");
-            ExitCode::FAILURE
+            std::process::ExitCode::FAILURE
         }
     }
 }
 
-async fn run() -> Result<i32> {
-    let mut args = env::args().skip(1);
-    let Some(command) = args.next() else {
-        eprint!("{}", help::GLOBAL);
-        return Ok(1);
-    };
-    let args: Vec<_> = args.collect();
-    if command == "--help" && args.is_empty() {
-        print!("{}", help::GLOBAL);
-        return Ok(0);
-    }
-    if args.first().is_some_and(|arg| arg == "--help")
-        && let Some(text) = help::command(&command)
-    {
-        println!("{text}");
-        return Ok(0);
-    }
-    if command == "--version" {
-        println!("agent-talk {}", env!("CARGO_PKG_VERSION"));
-        return Ok(0);
-    }
-
-    if command == "update" {
-        if !args.is_empty() {
-            eprint!("{}", help::GLOBAL);
-            return Ok(1);
+async fn run() -> Result<()> {
+    let args: Vec<_> = std::env::args().skip(1).collect();
+    match args.as_slice() {
+        [arg] if arg == "--help" => print!("{HELP}"),
+        [arg] if arg == "--version" => println!("agent-talk {}", env!("CARGO_PKG_VERSION")),
+        [arg] if arg == "daemon" => daemon::run(config::Config::discover()?).await?,
+        [arg] if arg == "update" => {
+            update::run()?;
         }
-        return update::run().await;
+        _ => bail!("{HELP}"),
     }
-    if command == "ensure-daemon" {
-        if !args.is_empty() {
-            eprint!("{}", help::GLOBAL);
-            return Ok(1);
-        }
-        return lifecycle::run_ensure_command().await;
-    }
-    if command == "daemon-status" {
-        if !args.is_empty() {
-            eprint!("{}", help::GLOBAL);
-            return Ok(1);
-        }
-        return lifecycle::run_status_command().await;
-    }
-    if command == "run" {
-        return run::run(args).await;
-    }
-
-    if matches!(command.as_str(), "register" | "unregister") && backend::self_pane().is_none() {
-        return Ok(0);
-    }
-    if matches!(command.as_str(), "gc" | "watch") {
-        return Ok(0);
-    }
-
-    let config = Config::discover()?;
-    if command == "daemon" {
-        daemon::run(config).await?;
-        return Ok(0);
-    }
-    if !help::is_known(&command) {
-        eprint!("{}", help::GLOBAL);
-        return Ok(1);
-    }
-    client::run(config, command, args).await
+    Ok(())
 }

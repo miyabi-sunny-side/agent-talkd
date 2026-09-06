@@ -1,308 +1,157 @@
-export type AgentState = "idle" | "busy";
-
-export type Backend = "herdr";
-
 export interface Agent {
-  name: string;
-  state: AgentState;
   pane_id: string;
-  session: string;
-  location: string;
+  name: string;
+  workspace: string;
   cwd: string;
-  backend: Backend;
+  harness: string;
+  status: string;
+  session_id: string | null;
+  send_unavailable: string | null;
 }
-
-export interface ScreenCapture {
+export interface Message {
+  id: string;
+  role: "user" | "assistant";
+  text: string;
+  timestamp?: string | null;
+}
+export interface Conversation {
   pane_id: string;
-  screen: string;
+  session_id: string;
+  messages: Message[];
+  truncated: boolean;
 }
-
-export type MailboxDirection = "in" | "out";
-
-export interface MailboxEvent {
-  id: number;
-  created_at: string;
-  mailbox: string;
-  source_label: string;
-  direction: MailboxDirection;
-  body: string;
-  skill: string | null;
-  target_name: string;
-  target_pane: string;
-  reply_to: number | null;
-}
-
-interface WhoResponse {
-  agents: Agent[];
-}
-
-interface MailboxesResponse {
-  mailboxes: string[];
-}
-
-export interface MailboxResponse {
-  version: 1;
-  mailbox: string;
-  events: MailboxEvent[];
-}
-
-export type AgentsFetchKind = "status" | "content-type" | "schema" | "network";
-
-export class AgentsFetchError extends Error {
-  readonly kind: AgentsFetchKind;
-  readonly status?: number;
-
+export class ApiError extends Error {
   constructor(
-    kind: AgentsFetchKind,
-    options: { status?: number; cause?: unknown } = {},
+    readonly code: string,
+    message: string,
   ) {
-    super(agentsFetchReasonFrom(kind, options.status), {
-      cause: options.cause,
-    });
-    this.name = "AgentsFetchError";
-    this.kind = kind;
-    this.status = options.status;
+    super(message);
   }
 }
-
-export function agentsFetchReason(error: unknown): string {
-  return error instanceof AgentsFetchError
-    ? error.message
-    : agentsFetchReasonFrom("network");
-}
-
-function agentsFetchReasonFrom(kind: AgentsFetchKind, status?: number): string {
-  switch (kind) {
-    case "status":
-      return `HTTP ${status}`;
-    case "content-type":
-    case "schema":
-      return "応答形式が不正です";
-    case "network":
-      return "接続できません";
-  }
-}
-
-function isJsonContentType(value: string | null): boolean {
-  return (value ?? "").toLowerCase().includes("application/json");
-}
-
-async function getJson(path: string, signal?: AbortSignal): Promise<unknown> {
-  const response = await fetch(path, {
-    headers: { Accept: "application/json" },
-    signal,
-  });
-  if (!response.ok) throw new Error(`request failed (${response.status})`);
-  return response.json() as Promise<unknown>;
-}
-
-export async function fetchAgents(signal?: AbortSignal): Promise<Agent[]> {
-  let response: Response;
-  try {
-    response = await fetch("/api/who", {
-      headers: { Accept: "application/json" },
-      cache: "no-store",
-      signal,
-    });
-  } catch (cause) {
-    throw new AgentsFetchError("network", { cause });
-  }
-  if (!response.ok) {
-    throw new AgentsFetchError("status", { status: response.status });
-  }
-  const contentType = response.headers.get("content-type");
-  let body: unknown;
-  try {
-    body = await response.json();
-  } catch (cause) {
-    throw new AgentsFetchError(
-      isJsonContentType(contentType) ? "schema" : "content-type",
-      { cause },
-    );
-  }
-  if (!isWhoResponse(body)) throw new AgentsFetchError("schema");
-  return body.agents;
-}
-
-export async function fetchScreen(
-  paneId: string,
-  signal?: AbortSignal,
-): Promise<ScreenCapture> {
-  const body = await getJson(
-    `/api/agents/${encodeURIComponent(paneId)}/screen`,
-    signal,
-  );
-  if (!isScreenCapture(body) || body.pane_id !== paneId)
-    throw new Error("screen returned an invalid response");
-  return body;
-}
-
-export async function fetchMailboxes(signal?: AbortSignal): Promise<string[]> {
-  const body = await getJson("/api/mailboxes", signal);
-  if (!isMailboxesResponse(body))
-    throw new Error("mailboxes returned an invalid response");
-  return body.mailboxes;
-}
-
-export async function fetchMailbox(
-  mailbox: string,
-  options: { after?: number; limit?: number; signal?: AbortSignal } = {},
-): Promise<MailboxResponse> {
-  const query = new URLSearchParams();
-  if (options.after !== undefined) query.set("after", String(options.after));
-  if (options.limit !== undefined) query.set("limit", String(options.limit));
-  const suffix = query.size === 0 ? "" : `?${query}`;
-  const body = await getJson(
-    `/api/mailbox/${encodeURIComponent(mailbox)}${suffix}`,
-    options.signal,
-  );
-  if (!isMailboxResponse(body) || body.mailbox !== mailbox)
-    throw new Error("mailbox returned an invalid response");
-  return body;
-}
-
-export interface LetterAccepted {
-  version: 1;
-  id: number;
-  path: "sent" | "queued";
-  to: string;
-  name: string;
-}
-
-export async function fetchSkills(
-  paneId: string,
-  signal?: AbortSignal,
-): Promise<string[]> {
-  const body = await getJson(
-    `/api/agents/${encodeURIComponent(paneId)}/skills`,
-    signal,
-  );
-  if (!isSkillsResponse(body))
-    throw new Error("skills returned an invalid response");
-  return body.skills;
-}
-
-export async function sendLetter(
-  source: string,
-  target: string,
-  body: string,
-  skill: string | null = null,
-): Promise<LetterAccepted> {
-  const payload: {
-    source: string;
-    target: string;
-    body: string;
-    skill?: string;
-  } = { source, target, body };
-  if (skill) payload.skill = skill;
-  const response = await fetch("/api/letters", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-  if (!response.ok) {
-    const detail = (await response.json().catch(() => null)) as {
-      error?: string;
-    } | null;
-    throw new Error(detail?.error ?? `letter failed (${response.status})`);
-  }
-  const accepted = (await response.json()) as unknown;
-  if (!isLetterAccepted(accepted))
-    throw new Error("letters returned an invalid response");
-  return accepted;
-}
-
-function isSkillsResponse(value: unknown): value is { skills: string[] } {
-  return (
-    isRecord(value) &&
-    Array.isArray(value.skills) &&
-    value.skills.every((skill) => typeof skill === "string")
-  );
-}
-
-function isLetterAccepted(value: unknown): value is LetterAccepted {
-  return (
-    isRecord(value) &&
-    value.version === 1 &&
-    Number.isSafeInteger(value.id) &&
-    (value.path === "sent" || value.path === "queued") &&
-    typeof value.to === "string" &&
-    typeof value.name === "string"
-  );
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
+function record(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
-
-function isWhoResponse(value: unknown): value is WhoResponse {
-  return (
-    isRecord(value) &&
-    Array.isArray(value.agents) &&
-    value.agents.every(isAgent)
-  );
-}
-
-function isAgent(value: unknown): value is Agent {
-  if (!isRecord(value)) return false;
-  return (
-    ["name", "pane_id", "session", "location", "cwd"].every(
-      (key) => typeof value[key] === "string",
-    ) &&
-    (value.state === "idle" || value.state === "busy") &&
-    value.backend === "herdr"
-  );
-}
-
-function isScreenCapture(value: unknown): value is ScreenCapture {
-  return (
-    isRecord(value) &&
-    typeof value.pane_id === "string" &&
-    typeof value.screen === "string"
-  );
-}
-
-function isMailboxesResponse(value: unknown): value is MailboxesResponse {
-  return (
-    isRecord(value) &&
-    Array.isArray(value.mailboxes) &&
-    value.mailboxes.every((mailbox) => typeof mailbox === "string")
-  );
-}
-
-function isNullableString(value: unknown): value is string | null {
+function nullable(value: unknown): boolean {
   return value === null || typeof value === "string";
 }
-
-function isNullableId(value: unknown): value is number | null {
-  return value === null || (Number.isSafeInteger(value) && Number(value) >= 0);
+function invalid(): never {
+  throw new ApiError("invalid_response", "応答形式が不正です");
 }
-
-function isMailboxEvent(value: unknown): value is MailboxEvent {
-  if (!isRecord(value)) return false;
+async function request(path: string, init: RequestInit = {}): Promise<unknown> {
+  let response: Response;
+  try {
+    response = await fetch(path, {
+      cache: "no-store",
+      ...init,
+      headers: { Accept: "application/json", ...init.headers },
+    });
+  } catch {
+    throw new ApiError("network", "接続できません");
+  }
+  const body: unknown = await response.json().catch(() => null);
+  if (!response.ok) {
+    if (
+      record(body) &&
+      record(body.error) &&
+      typeof body.error.message === "string" &&
+      typeof body.error.code === "string"
+    )
+      throw new ApiError(body.error.code, body.error.message);
+    throw new ApiError(
+      "http",
+      `接続先がエラーを返しました (HTTP ${response.status})`,
+    );
+  }
+  return body;
+}
+export async function fetchAgents(): Promise<Agent[]> {
+  const body = await request("/api/agents");
+  if (
+    !record(body) ||
+    !Array.isArray(body.agents) ||
+    !body.agents.every(
+      (a) =>
+        record(a) &&
+        ["pane_id", "name", "workspace", "cwd", "harness", "status"].every(
+          (k) => typeof a[k] === "string",
+        ) &&
+        nullable(a.session_id) &&
+        nullable(a.send_unavailable),
+    )
+  )
+    invalid();
+  return body.agents as Agent[];
+}
+export async function fetchConversation(
+  pane: string,
+  session: string,
+): Promise<Conversation> {
+  const body = await request(
+    `/api/conversation?${new URLSearchParams({ pane, session })}`,
+  );
+  if (
+    !record(body) ||
+    body.pane_id !== pane ||
+    body.session_id !== session ||
+    typeof body.truncated !== "boolean" ||
+    !Array.isArray(body.messages) ||
+    !body.messages.every(
+      (m) =>
+        record(m) &&
+        typeof m.id === "string" &&
+        (m.role === "user" || m.role === "assistant") &&
+        typeof m.text === "string" &&
+        (m.timestamp === undefined || nullable(m.timestamp)),
+    )
+  )
+    invalid();
+  return body as unknown as Conversation;
+}
+export async function sendMessage(
+  pane_id: string,
+  session_id: string,
+  body: string,
+): Promise<void> {
+  const result = await request("/api/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ pane_id, session_id, body }),
+  });
+  if (!record(result) || result.status !== "submitted") invalid();
+}
+export function errorReason(error: unknown): string {
+  return error instanceof Error ? error.message : "接続できません";
+}
+export function statusLabel(status: string): string {
   return (
-    Number.isSafeInteger(value.id) &&
-    Number(value.id) >= 0 &&
-    [
-      "created_at",
-      "mailbox",
-      "source_label",
-      "body",
-      "target_name",
-      "target_pane",
-    ].every((key) => typeof value[key] === "string") &&
-    (value.direction === "in" || value.direction === "out") &&
-    isNullableString(value.skill) &&
-    isNullableId(value.reply_to)
+    (
+      {
+        idle: "待機中",
+        working: "作業中",
+        done: "応答終了",
+        blocked: "承認待ち",
+        unknown: "状態不明",
+      } as Record<string, string>
+    )[status] ?? status
   );
 }
-
-function isMailboxResponse(value: unknown): value is MailboxResponse {
-  return (
-    isRecord(value) &&
-    value.version === 1 &&
-    typeof value.mailbox === "string" &&
-    Array.isArray(value.events) &&
-    value.events.every(isMailboxEvent)
-  );
+const unavailableLabels: Record<string, string> = {
+  unsupported: "この CLI は送信に未対応です。",
+  unregistered: "対象セッションが未登録、または特定できません。",
+  blocked: "対象は承認待ちのため、送信できません。",
+  unknown: "対象の状態を確認できないため、送信できません。",
+  unavailable: "対象を利用できないため、送信できません。",
+};
+export function unavailableReason(agent: Agent): string {
+  if (agent.send_unavailable)
+    return unavailableLabels[agent.send_unavailable] ?? agent.send_unavailable;
+  if (!agent.session_id) return unavailableLabels.unregistered!;
+  if (!["codex", "claude"].includes(agent.harness))
+    return `${agent.harness} は送信に未対応です。`;
+  if (!["idle", "working", "done"].includes(agent.status))
+    return (
+      unavailableLabels[agent.status] ??
+      `現在の状態 (${agent.status}) では送信できません。`
+    );
+  return "";
 }

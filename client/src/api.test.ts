@@ -1,214 +1,60 @@
-import { describe, expect, it, vi } from "vitest";
-import {
-  AgentsFetchError,
-  fetchAgents,
-  fetchMailbox,
-  fetchMailboxes,
-  fetchScreen,
-  sendLetter,
-} from "./api";
-
-function json(value: unknown, status = 200): Response {
-  return new Response(JSON.stringify(value), { status });
-}
-
-describe("HTTP API", () => {
-  it("validates agents and encodes pane ids", async () => {
-    const fetch = vi
-      .fn()
-      .mockResolvedValueOnce(
-        json({
-          agents: [
-            {
-              name: "codex",
-              state: "idle",
-              pane_id: "w1:p1",
-              session: "dev",
-              location: "dev:0.1",
-              cwd: "/tmp/project with spaces",
-              backend: "herdr",
-            },
-          ],
-        }),
-      )
-      .mockResolvedValueOnce(json({ pane_id: "w1:p1", screen: "safe text" }));
-    vi.stubGlobal("fetch", fetch);
-
-    await expect(fetchAgents()).resolves.toHaveLength(1);
-    await expect(fetchScreen("w1:p1")).resolves.toEqual({
-      pane_id: "w1:p1",
-      screen: "safe text",
-    });
-    expect(fetch.mock.calls[1]?.[0]).toBe("/api/agents/w1%3Ap1/screen");
-    const [, whoInit] = fetch.mock.calls[0] as [string, RequestInit];
-    expect(fetch.mock.calls[0]?.[0]).toBe("/api/who");
-    expect(whoInit.cache).toBe("no-store");
-  });
-
-  it("builds incremental mailbox queries and validates event fields", async () => {
-    const fetch = vi
-      .fn()
-      .mockResolvedValueOnce(json({ mailboxes: ["mobile"] }))
-      .mockResolvedValueOnce(
-        json({
-          version: 1,
-          mailbox: "mobile",
-          events: [
-            {
-              id: 12,
-              created_at: "2026-07-21T11:00:00Z",
-              mailbox: "mobile",
-              source_label: "mobile",
-              direction: "in",
-              body: "依頼",
-              skill: null,
-              target_name: "claude",
-              target_pane: "w1:p1",
-              reply_to: null,
-            },
-          ],
-        }),
-      );
-    vi.stubGlobal("fetch", fetch);
-
-    await expect(fetchMailboxes()).resolves.toEqual(["mobile"]);
-    await expect(
-      fetchMailbox("mobile", { after: 9, limit: 100 }),
-    ).resolves.toMatchObject({
-      version: 1,
-      mailbox: "mobile",
-    });
-    expect(fetch.mock.calls[1]?.[0]).toBe(
-      "/api/mailbox/mobile?after=9&limit=100",
-    );
-  });
-
-  it("rejects unsuccessful, mismatched, and malformed responses", async () => {
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(json({}, 503)));
-    const unavailable = await fetchAgents().catch((error: unknown) => error);
-    expect(unavailable).toBeInstanceOf(AgentsFetchError);
-    expect(unavailable).toMatchObject({ kind: "status", status: 503 });
-    expect(String(unavailable)).toContain("503");
-
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockResolvedValue(
-        new Response("<!doctype html>", {
-          status: 200,
-          headers: { "Content-Type": "text/html" },
-        }),
-      ),
-    );
-    const html = await fetchAgents().catch((error: unknown) => error);
-    expect(html).toBeInstanceOf(AgentsFetchError);
-    expect(["content-type", "schema"]).toContain(
-      (html as AgentsFetchError).kind,
-    );
-
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockResolvedValue(
-        json({
-          agents: [
-            {
-              name: "codex",
-              state: "idle",
-              pane_id: "w1:p1",
-              session: "dev",
-              location: "dev:0.1",
-              cwd: "/tmp",
-            },
-          ],
-        }),
-      ),
-    );
-    await expect(fetchAgents()).rejects.toMatchObject({ kind: "schema" });
-
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockResolvedValue(
-        json({
-          agents: [
-            {
-              name: "codex",
-              state: "working",
-              pane_id: "w1:p1",
-              session: "dev",
-              location: "dev:0.1",
-              cwd: "/tmp",
-              backend: "herdr",
-            },
-          ],
-        }),
-      ),
-    );
-    await expect(fetchAgents()).rejects.toMatchObject({ kind: "schema" });
-
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockRejectedValue(new TypeError("Failed to fetch")),
-    );
-    await expect(fetchAgents()).rejects.toMatchObject({ kind: "network" });
-
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockResolvedValue(json({ pane_id: "w1:p2", screen: "" })),
-    );
-    await expect(fetchScreen("w1:p1")).rejects.toThrow("invalid response");
-
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(json({ mailboxes: [7] })));
-    await expect(fetchMailboxes()).rejects.toThrow("invalid response");
-
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockResolvedValue(
-        json({
-          version: 1,
-          mailbox: "mobile",
-          events: [{ id: 1, direction: "sideways" }],
-        }),
-      ),
-    );
-    await expect(fetchMailbox("mobile")).rejects.toThrow("invalid response");
+import { afterEach, expect, it, vi } from "vitest";
+import { fetchAgents, fetchConversation, sendMessage } from "./api";
+afterEach(() => vi.unstubAllGlobals());
+it("loads registered remote targets", async () => {
+  const agent = {
+    pane_id: "w:p",
+    name: "codex",
+    workspace: "work",
+    cwd: "/work",
+    harness: "codex",
+    status: "busy",
+    session_id: "s",
+    send_unavailable: null,
+  };
+  const fetcher = vi.fn().mockResolvedValue(Response.json({ agents: [agent] }));
+  vi.stubGlobal("fetch", fetcher);
+  expect(await fetchAgents()).toEqual([agent]);
+  expect(fetcher.mock.calls[0][0]).toBe("/api/agents");
+});
+it("rejects a conversation from a replaced session", async () => {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn().mockResolvedValue(
+      Response.json({
+        pane_id: "w:p",
+        session_id: "other",
+        messages: [],
+        truncated: false,
+      }),
+    ),
+  );
+  await expect(fetchConversation("w:p", "original")).rejects.toThrow(
+    "応答形式",
+  );
+});
+it("submits original text with the exact target session", async () => {
+  const fetcher = vi
+    .fn()
+    .mockResolvedValue(Response.json({ status: "submitted" }));
+  vi.stubGlobal("fetch", fetcher);
+  await sendMessage("pane/α", "s", "  原文\n次の行  ");
+  expect(JSON.parse(fetcher.mock.calls[0][1].body)).toEqual({
+    pane_id: "pane/α",
+    session_id: "s",
+    body: "  原文\n次の行  ",
   });
 });
-
-describe("letters", () => {
-  it("posts a letter as JSON and validates the accepted response", async () => {
-    const fetch = vi
-      .fn()
-      .mockResolvedValueOnce(
-        json({ version: 1, id: 9, path: "sent", to: "w1:p1", name: "claude" }),
-      );
-    vi.stubGlobal("fetch", fetch);
-
-    await expect(sendLetter("mobile", "w1:p1", "hello")).resolves.toEqual({
-      version: 1,
-      id: 9,
-      path: "sent",
-      to: "w1:p1",
-      name: "claude",
-    });
-    const [url, init] = fetch.mock.calls[0] as [string, RequestInit];
-    expect(url).toBe("/api/letters");
-    expect(init.method).toBe("POST");
-    expect((init.headers as Record<string, string>)["Content-Type"]).toBe(
-      "application/json",
+it("surfaces structured errors without retrying a submission", async () => {
+  const fetcher = vi
+    .fn()
+    .mockResolvedValue(
+      Response.json(
+        { error: { code: "blocked", message: "承認待ちです" } },
+        { status: 409 },
+      ),
     );
-    expect(JSON.parse(String(init.body))).toEqual({
-      source: "mobile",
-      target: "w1:p1",
-      body: "hello",
-    });
-  });
-
-  it("surfaces the server error code on rejection", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockResolvedValueOnce(json({ error: "source_not_allowed" }, 403)),
-    );
-    await expect(sendLetter("mobile", "w1:p1", "hello")).rejects.toThrow(
-      "source_not_allowed",
-    );
-  });
+  vi.stubGlobal("fetch", fetcher);
+  await expect(sendMessage("p", "s", "本文")).rejects.toThrow("承認待ちです");
+  expect(fetcher).toHaveBeenCalledTimes(1);
 });

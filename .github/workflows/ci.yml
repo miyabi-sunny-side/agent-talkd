@@ -57,5 +57,5 @@ jobs:
       - name: Run tests
         run: cargo test --locked
 
-      - name: Run herdr bridge integration tests
-        run: cargo test --locked --test bridge -- --ignored
+      - name: Run HTTP and Herdr integration tests
+        run: cargo test --locked --test remote

@@ -13,7 +13,6 @@ beforeEach(() => window.history.replaceState(null, "", "/"));
 it("round-trips every route, including opaque pane ids", () => {
   const routes: Route[] = [
     { view: "registry" },
-    { view: "letters" },
     { view: "agent", pane: "w1:p2" },
     // pane id は herdr 発行の opaque 文字列 — `/` や Unicode を含み得るので
     // path segment ではなく query に載せる。
@@ -61,7 +60,7 @@ it("reports the current route on popstate and stops after unsubscribe", () => {
 
   window.history.replaceState(null, "", "/letters");
   window.dispatchEvent(new PopStateEvent("popstate"));
-  expect(seen).toEqual([{ view: "letters" }]);
+  expect(seen).toEqual([{ view: "registry" }]);
 
   unsubscribe();
   window.history.replaceState(null, "", "/");

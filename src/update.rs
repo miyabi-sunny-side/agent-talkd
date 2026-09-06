@@ -15,8 +15,6 @@ use sha2::{Digest, Sha256};
 use tar::Archive;
 use tempfile::{NamedTempFile, TempDir};
 
-use crate::{config::Config, lifecycle};
-
 const REPOSITORY: &str = "miyabi-sunny-side/agent-talkd";
 const RELEASE_API: &str =
     "https://api.github.com/repos/miyabi-sunny-side/agent-talkd/releases/latest";
@@ -63,7 +61,7 @@ impl Downloader for CurlDownloader {
     }
 }
 
-pub async fn run() -> Result<i32> {
+pub fn run() -> Result<i32> {
     let target = update_target()?;
     let current_text = env!("CARGO_PKG_VERSION");
     let current = match Version::parse(current_text) {
@@ -72,7 +70,7 @@ pub async fn run() -> Result<i32> {
             eprintln!(
                 "agent-talk: local version '{current_text}' is not valid semver; update skipped: {error}"
             );
-            reconcile(&target, current_text).await?;
+            reconcile(&target, current_text)?;
             return Ok(0);
         }
     };
@@ -83,7 +81,7 @@ pub async fn run() -> Result<i32> {
         println!(
             "agent-talk: already current (local {current}, latest {remote}); binary unchanged"
         );
-        reconcile(&target, current_text).await?;
+        reconcile(&target, current_text)?;
         return Ok(0);
     }
 
@@ -91,7 +89,7 @@ pub async fn run() -> Result<i32> {
     let extracted = download_and_verify(&CurlDownloader, &workspace, &remote, asset)?;
     atomic_replace(&target, &extracted)?;
     println!("agent-talk: updated {current} -> {remote}");
-    reconcile(&target, &remote.to_string()).await?;
+    reconcile(&target, &remote.to_string())?;
     Ok(0)
 }
 
@@ -264,33 +262,14 @@ fn atomic_replace(target: &Path, source: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn reconcile(target: &Path, expected: &str) -> Result<()> {
-    lifecycle::executable_matches_version(target, expected)?;
-    let output = Command::new(target)
-        .arg("ensure-daemon")
-        .output()
-        .context("cannot run the updated binary's ensure-daemon")?;
-    if !output.status.success() {
-        bail!(
-            "binary is installed, but daemon reconciliation failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+fn reconcile(target: &Path, expected: &str) -> Result<()> {
+    let output = Command::new(target).arg("--version").output()?;
+    if !output.status.success()
+        || String::from_utf8_lossy(&output.stdout).trim() != format!("agent-talk {expected}")
+    {
+        bail!("installed binary failed its version check");
     }
-    if !output.stdout.is_empty() {
-        print!("{}", String::from_utf8_lossy(&output.stdout));
-    }
-
-    if let Some(config) = Config::discover_optional()? {
-        let status = lifecycle::daemon_status(&config)
-            .await
-            .context("binary is installed, but daemon postcondition failed")?;
-        if !status.ready || status.version != expected {
-            bail!(
-                "binary is installed, but daemon version is {} instead of {expected}",
-                status.version
-            );
-        }
-    }
+    println!("agent-talk: restart the managed daemon to use the installed binary");
     Ok(())
 }
 

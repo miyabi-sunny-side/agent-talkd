@@ -2,32 +2,23 @@
 
 ## Product boundary
 
-- This repository implements a herdr-native message broker in Rust. The shipped executable is the single `agent-talk` binary; its CLI and daemon modes share that binary.
-- The supported multiplexer is herdr. One daemon owns registrations, busy/idle state, delivery queues, and journal recovery in one event loop, and it listens on one Unix domain socket derived from the herdr socket. Clients derive the same socket from their own environment and all reach the same process. (tmux support was removed after the herdr migration.)
-- Keep the product local to the same host. Do not treat self-reported pane/source metadata as an authentication boundary.
-- The daemon may expose the read-only HTTP surface over TCP when `AGENT_TALK_HTTP_ADDR` is set (default: off). This is the mobile access path; the network boundary is owned by the operator's VPN, not by this process. Do not add credential handling or an authentication layer here without a new user decision.
-- The repository includes a Svelte status client under `client/`. It is a read-only view over the daemon's HTTP adapter.
+- This repository implements a remote message console for humans using Herdr. One Rust `agent-talk` binary serves an embedded Svelte browser app and a small HTTP API.
+- Herdr owns live destinations and lifecycle state. Codex and Claude Code own their native session transcripts. Messages go verbatim into the selected existing CLI session; replies are read from that session's transcript.
+- Peer communication, MCP, broker RPC, mailboxes, delivery journals, acknowledgements, reminders, and worker orchestration are removed. Do not reintroduce parallel message storage or interpret a person's instruction with another AI.
+- HTTP listens only when `AGENT_TALK_HTTP_ADDR` is explicitly set. The operator owns the Tailscale/loopback access boundary. Same-privilege processes can also invoke the API; this process does not guarantee human-only access.
 
-## Architecture and invariants
+## Architecture
 
-- `src/main.rs` is the command dispatcher. Keep user-facing command parsing and help consistent with `src/help.rs` and the request handling in `src/client.rs`.
-- `src/daemon.rs` coordinates RPC and health-tick events; `src/state.rs` owns delivery state transitions; `src/journal.rs` owns durable append/recovery/checkpoint behavior; `src/backend.rs` adapts herdr panes to the addressing surface; `src/herdr.rs` isolates the herdr API; `src/lifecycle.rs` manages daemon discovery and replacement.
-- Treat daemon memory as the live source of truth for delivery state. Registration follows herdr's native agent identity through the pull sync; there is no mirror state.
-- Never inject keystrokes into a pane that is `blocked` or `unknown`. herdr reports `blocked` for approval dialogs; a pane whose status is unknown is not idle. First delivery and queue drain may prompt a `working` pane so a long-lived background process cannot strand the doorbell; receipt reminders stay limited to `idle` / `done`.
-- Preserve the delivery durability contract: persist and `fsync` a message before reporting it as sent or queued, recover unread messages and queued deliveries after restart, and never reuse message IDs after checkpointing.
-- Keep terminal injection limited to daemon-generated, validated notification text. Message bodies remain in the journal and are retrieved with `agent-talk read <id>`.
-- Preserve backward-compatibility behavior deliberately. Protocol additions that older daemons cannot interpret must fail explicitly instead of silently degrading to a different command.
-- Keep platform-dependent behavior behind the existing multiplexer, lifecycle, configuration, and update boundaries. Avoid scattering subprocess execution or filesystem-path discovery through command handlers.
-
-## Change discipline
-
-- Keep changes small and focused. Add or update tests alongside observable CLI, protocol, state-machine, journal, lifecycle, or delivery behavior.
-- Do not hand-edit `Cargo.lock`; update it through Cargo when dependency metadata changes.
-- Public behavior belongs in `README.md`; non-obvious delivery and persistence invariants belong in `docs/design.md`. Keep both aligned with implemented behavior.
+- `src/main.rs` owns daemon/update command dispatch. `src/config.rs` owns environment discovery.
+- `src/daemon.rs` owns HTTP input validation, origin checks, embedded assets, and connection handling.
+- `src/herdr.rs` owns bounded Herdr RPC and checks the expected native session and foreground process immediately before prompting. Rejected, missing, unregistered, unknown, or blocked destinations receive no input. Input acknowledgement is not work completion; lost acknowledgements are indeterminate and must not be automatically retried.
+- `src/history.rs` reads bounded native Codex/Claude transcripts. Do not accept arbitrary user-supplied file paths or replace reports with terminal screenshots.
+- `src/update.rs` verifies release checksums and replaces the executable. The operator restarts the managed service.
+- `DESIGN.md` owns browser interaction and visual design. Preserve draft text and keep it bound to the selected CLI session. Mobile users must not need terminal modifier keys.
 
 ## Verification
 
-Run the following from the repository root:
+Run from the repository root:
 
 ```sh
 npm --prefix client ci
@@ -38,12 +29,10 @@ npm --prefix client run build
 cargo fmt -- --check
 cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo test --locked
-cargo test --locked --test bridge -- --ignored
+cargo test --locked --test remote
 cargo build --locked --release
 ```
 
-Run the frontend build before the Rust checks so `client/dist` is embedded in the
-binary under test. Cargo deliberately does not invoke npm, and remains buildable
-without `client/dist`; in that case static HTTP routes return 503.
+Build the frontend before Rust so `client/dist` is embedded. Cargo itself does not invoke npm; builds without client assets serve API routes but return 503 for the UI.
 
-The ignored integration tests in `tests/bridge.rs` spawn a background daemon against a fake herdr socket, so they do not need herdr installed. Run every command before delivery; if the environment prevents one, report that command and the reason explicitly.
+Use Chromium + Playwright for browser E2E. Integration tests isolate HTTP and Herdr sockets. Changes to live input or transcript adapters also require dedicated real Codex/Claude sessions: select in the browser, submit original text, verify actual CLI receipt and visible assistant output. Never use another person's pane for tests.

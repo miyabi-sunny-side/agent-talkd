@@ -3,7 +3,7 @@ name = "agent-talkd"
 version = "0.14.4"
 edition = "2024"
 rust-version = "1.96"
-description = "A herdr-native message broker for interactive coding agents"
+description = "A remote message console for Herdr coding sessions"
 license = "MIT"
 repository = "https://github.com/miyabi-sunny-side/agent-talkd"
 readme = "README.md"
@@ -15,10 +15,6 @@ build = "build.rs"
 [[bin]]
 name = "agent-talk"
 path = "src/main.rs"
-
-[[bin]]
-name = "agent-talk-mcp"
-path = "src/bin/agent-talk-mcp.rs"
 
 [dependencies]
 anyhow = "1.0"
@@ -39,7 +35,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [dev-dependencies]
-# 受領催促のタイマーを paused clock で検証するため。release build には効かない。
+# Isolated socket tests can control time without delaying the suite.
 tokio = { version = "1.49", features = ["test-util"] }
 
 [lints.clippy]
