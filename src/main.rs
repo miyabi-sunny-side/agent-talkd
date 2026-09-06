@@ -6,7 +6,7 @@ mod update;
 
 use anyhow::{Result, bail};
 
-const HELP: &str = "agent-talk — remote messages for Herdr sessions\n\nUsage: agent-talk daemon | update | --version | --help\n\nThe daemon serves the embedded browser app and HTTP API.\nSet AGENT_TALK_HTTP_ADDR and make herdr available on PATH.\nPeer communication and broker commands have been removed.\n";
+const HELP: &str = "agent-talk — remote messages for Herdr sessions\n\nUsage: agent-talk daemon | update | --version | --help\n\nThe daemon serves the embedded browser app and HTTP API.\nSet PORT (default 5002) and make herdr available on PATH.\nPeer communication and broker commands have been removed.\n";
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {

@@ -465,7 +465,7 @@ mod tests {
                     .args(["--exact", "daemon::tests::logging_probe", "--nocapture"])
                     .env("AGENT_TALK_TEST_LOGGING", "1")
                     .env("HOME", home.path())
-                    .env("AGENT_TALK_HTTP_ADDR", "127.0.0.1:0");
+                    .env_remove("PORT");
                 for (name, value) in [
                     ("LOG_LEVEL", level),
                     ("AGENT_TALK_LOG_LEVEL", legacy),

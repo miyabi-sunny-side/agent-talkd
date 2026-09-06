@@ -11,12 +11,12 @@ Tailscale 越しに Herdr の Codex / Claude Code セッションへメッセー
 Linux x86_64 / macOS arm64 向け release archive は `agent-talk` と `LICENSE` を含みます。Svelte 画面はバイナリに埋め込みます。
 
 ```sh
-AGENT_TALK_HTTP_ADDR=127.0.0.1:5002 agent-talk daemon
+PORT=5002 agent-talk daemon
 ```
 
-HTTP は明示設定時だけ待ち受けます。sandbox の通常経路は loopback listener と Tailscale HTTPS です。アクセス範囲はこの外側の構成が管理します。同権限のプロセスが API を使うことまで禁止する認証機構はありません。
+daemon 起動時に HTTP を待ち受けます。sandbox の通常経路は Tailscale HTTPS です。アクセス範囲は Tailscale やプロキシなど配布側の構成が管理します。同権限のプロセスが API を使うことまで禁止する認証機構はありません。
 
-設定は `AGENT_TALK_HTTP_ADDR`、任意の `LOG_LEVEL` です。`LOG_LEVEL` は小文字の `off` / `error` / `warn` / `info` / `debug` / `trace` を受け付け、未設定・不正値は `info` になります。空白付きの値、大文字、モジュール別のフィルター指定は不正値です。実行ユーザーの `PATH` に `herdr` が必要です。接続先の解決と RPC 通信は Herdr CLI が所有し、agent-talk 独自のソケット設定はありません。Herdr 自身の接続設定が必要なら Herdr の環境へ設定します。`HOME` は CLI 履歴の所在を解決します。CLI は `daemon`、`update`、`--help`、`--version` のみです。`update` は checksum を検証して実行ファイルを更新し、稼働サービスの再起動は運用側で行います。
+待受は `0.0.0.0`、ポートは `PORT`（未設定時 `5002`）です。`PORT` は `1`〜`65535` の数字のみを受け付け、空文字・不正値はエラーで起動を停止します。旧 `AGENT_TALK_HTTP_ADDR` は参照しません。ログ設定は任意の `LOG_LEVEL` です。`LOG_LEVEL` は小文字の `off` / `error` / `warn` / `info` / `debug` / `trace` を受け付け、未設定・不正値は `info` になります。空白付きの値、大文字、モジュール別のフィルター指定は不正値です。実行ユーザーの `PATH` に `herdr` が必要です。接続先の解決と RPC 通信は Herdr CLI が所有し、agent-talk 独自のソケット設定はありません。Herdr 自身の接続設定が必要なら Herdr の環境へ設定します。`HOME` は CLI 履歴の所在を解決します。CLI は `daemon`、`update`、`--help`、`--version` のみです。`update` は checksum を検証して実行ファイルを更新し、稼働サービスの再起動は運用側で行います。
 
 ## 対応とセッションの接続
 

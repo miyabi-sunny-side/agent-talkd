@@ -5,7 +5,7 @@
 - This repository implements a remote message console for humans using Herdr. One Rust `agent-talk` binary serves an embedded Svelte browser app and a small HTTP API.
 - Herdr owns live destinations and lifecycle state. Codex and Claude Code own their native session transcripts. Messages go verbatim into the selected existing CLI session; replies are read from that session's transcript.
 - Peer communication, MCP, broker RPC, mailboxes, delivery journals, acknowledgements, reminders, and worker orchestration are removed. Do not reintroduce parallel message storage or interpret a person's instruction with another AI.
-- HTTP listens only when `AGENT_TALK_HTTP_ADDR` is explicitly set. The operator owns the Tailscale/loopback access boundary. Same-privilege processes can also invoke the API; this process does not guarantee human-only access.
+- HTTP listens on `0.0.0.0` using `PORT` (default `5002`, digits in `1..=65535`; invalid values fail startup). The operator owns the Tailscale/proxy access boundary. Same-privilege processes can also invoke the API; this process does not guarantee human-only access.
 
 ## Architecture
 

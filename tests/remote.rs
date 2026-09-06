@@ -1,8 +1,10 @@
 //! Exercise the shipped HTTP binary against isolated Herdr and transcript fixtures.
 use serde_json::{Value, json};
 use std::{
+    ffi::OsString,
     io::{Read, Write},
     net::{TcpListener, TcpStream},
+    os::unix::ffi::OsStringExt,
     process::{Child, Command, Stdio},
     thread,
     time::Duration,
@@ -64,7 +66,8 @@ fn browser_api_routes_original_text_to_the_verified_session_and_reads_native_out
             )
             .env_remove("AGENT_TALK_HERDR_SOCKET")
             .env_remove("HERDR_SOCKET_PATH")
-            .env("AGENT_TALK_HTTP_ADDR", format!("127.0.0.1:{port}"))
+            .env("PORT", port.to_string())
+            .env("AGENT_TALK_HTTP_ADDR", "invalid-legacy-address")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -252,5 +255,26 @@ fn removed_peer_and_lifecycle_commands_fail_explicitly() {
                 .unwrap()
                 .success()
         );
+    }
+}
+
+#[test]
+fn invalid_port_fails_before_starting_the_daemon() {
+    let home = tempfile::tempdir().unwrap();
+    for port in ["", "0", "65536", "-1", "+5002", " 5002", "5002 ", "bad"]
+        .into_iter()
+        .map(OsString::from)
+        .chain([OsString::from_vec(vec![0xff])])
+    {
+        let output = Command::new(env!("CARGO_BIN_EXE_agent-talk"))
+            .arg("daemon")
+            .env("HOME", home.path())
+            .env("PORT", &port)
+            .env("AGENT_TALK_HTTP_ADDR", "127.0.0.1:5002")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "PORT={port:?}");
+        assert!(stderr.contains("PORT"), "{stderr}");
     }
 }

@@ -1,3 +1,5 @@
+> 履歴記録: 現行の待受設定は `PORT`（既定 `5002`）、bind は `0.0.0.0`。以下の旧 TCP opt-in 設定は廃止済みです。
+
 > Superseded: historical broker design only. The current product is the [remote session console](../design.md); peer/MCP/journal behavior described below is removed.
 
 # 0001. agent-talkd を会話ブローカへ縮小し、agent 窓口を MCP に一本化する
