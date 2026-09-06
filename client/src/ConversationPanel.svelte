@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount, tick, untrack } from "svelte";
+  import { appendMessages } from "./conversation";
   import {
     fetchConversation,
     sendMessage,
@@ -38,12 +39,23 @@
   let loaded = $state(false);
   let historyError = $state("");
   let truncated = $state(false);
+  let olderCursor = $state<string | null>(null);
+  let nextCursor = $state("");
+  let pollCursor = "";
+  let detached = $state(false);
+  let limited = $state(false);
+  let retryMode: "poll" | "latest" | "older" | "newer" = "poll";
+  let unread = $state(false);
+  let atBottom = $state(true);
+  let paging = $state(false);
+  let cursorChanged = $state(false);
   let textarea: HTMLTextAreaElement;
   let tab: HTMLButtonElement;
   let viewport: HTMLElement;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let disposed = false;
   let fetching = false;
+  let queued: "latest" | "older" | "newer" | undefined;
   const changed = $derived(agent.session_id !== target.session);
   const blocked = $derived(
     changed
@@ -62,28 +74,120 @@
       /* storage unavailable: retain in memory */
     }
   });
-  async function refresh() {
-    if (fetching || disposed || !target.session || changed || !available)
+  function trackScroll() {
+    atBottom =
+      viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight < 64;
+  }
+  async function refresh(mode: "poll" | "latest" | "older" | "newer" = "poll") {
+    if (fetching) {
+      if (mode !== "poll") queued = mode;
+      return;
+    }
+    if (
+      disposed ||
+      !target.session ||
+      changed ||
+      !available ||
+      (cursorChanged && mode !== "latest")
+    )
       return;
     fetching = true;
+    paging = mode !== "poll";
+    const origin = document.activeElement;
+    const cursor =
+      mode === "older" && olderCursor
+        ? { before: olderCursor }
+        : mode === "newer"
+          ? { after: nextCursor }
+          : mode === "poll" && pollCursor
+            ? { after: pollCursor }
+            : {};
     try {
-      const response = await fetchConversation(target.pane, target.session);
+      const response = await fetchConversation(
+        target.pane,
+        target.session,
+        cursor,
+      );
       if (disposed || changed) return;
+      // Read the position after the request: the person may have scrolled while it was in flight.
       const follow =
         !loaded ||
-        (viewport &&
-          viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight <
-            64);
-      messages = response.messages;
-      truncated = response.truncated;
+        mode === "latest" ||
+        (mode === "poll" && atBottom && !detached);
+      const previousTop = viewport?.scrollTop ?? 0;
+      const anchor = Array.from(
+        viewport?.querySelectorAll<HTMLElement>("[data-message-id]") ?? [],
+      ).find(
+        (element) =>
+          element.getBoundingClientRect().bottom >=
+          viewport.getBoundingClientRect().top,
+      );
+      const anchorY = anchor?.getBoundingClientRect().top;
+      if (mode !== "poll" || !loaded) {
+        limited = false;
+        messages = response.messages;
+        olderCursor = response.older_cursor;
+        nextCursor = response.next_cursor;
+        detached = mode === "older" || (mode === "newer" && response.has_more);
+        if (!detached) pollCursor = response.next_cursor;
+        unread = false;
+        truncated = response.truncated;
+      } else {
+        pollCursor = response.next_cursor;
+        if (response.messages.length) {
+          unread = true;
+          if (!detached) {
+            const appended = appendMessages(messages, response.messages);
+            if (appended) {
+              messages = appended;
+              nextCursor = response.next_cursor;
+            } else {
+              detached = true;
+              limited = true;
+            }
+          }
+        } else if (!detached) nextCursor = response.next_cursor;
+        truncated ||= response.truncated;
+      }
       loaded = true;
-      historyError = "";
+      if (mode !== "poll" || retryMode === "poll") historyError = "";
+      cursorChanged = false;
       await tick();
-      if (follow && viewport) viewport.scrollTop = viewport.scrollHeight;
+      if (viewport) {
+        if ((follow && !detached) || mode === "older")
+          viewport.scrollTop = viewport.scrollHeight;
+        else if (mode === "newer") viewport.scrollTop = 0;
+        else if (anchor?.isConnected && anchorY !== undefined)
+          viewport.scrollTop += anchor.getBoundingClientRect().top - anchorY;
+        else viewport.scrollTop = previousTop;
+        trackScroll();
+      }
+      if (atBottom && !detached) unread = false;
+      await tick();
+      if (
+        mode !== "poll" &&
+        origin instanceof HTMLButtonElement &&
+        !origin.isConnected &&
+        document.activeElement === document.body
+      )
+        viewport?.focus({ preventScroll: true });
     } catch (error) {
-      if (!disposed) historyError = errorReason(error);
+      if (!disposed) {
+        retryMode = mode;
+        cursorChanged =
+          error instanceof ApiError && error.code === "cursor_changed";
+        historyError = cursorChanged
+          ? "履歴ファイルが変わりました。表示済みの会話を保持しています。最新へ戻って読み直してください。"
+          : errorReason(error);
+      }
     } finally {
       fetching = false;
+      paging = false;
+      if (queued) {
+        const next = queued;
+        queued = undefined;
+        void refresh(next);
+      }
     }
   }
   function schedule() {
@@ -164,11 +268,38 @@
   }}
 />
 <div class="conversation-workspace">
+  <div class="history-controls">
+    <output aria-live="polite"
+      >{historyError
+        ? `会話を更新できません: ${historyError}`
+        : paging
+          ? "会話のページを読み込んでいます…"
+          : limited
+            ? "表示上限に達しました。新しい会話、または最新へ戻ると続きを読めます。"
+            : detached
+              ? unread
+                ? "新しい会話があります。過去の会話を表示しています。"
+                : "過去の会話を表示しています。"
+              : unread
+                ? "新しい会話があります。"
+                : "会話・報告"}</output
+    >
+    {#if historyError && !cursorChanged}<button
+        class="quiet-button"
+        onclick={() => refresh(retryMode)}>再試行</button
+      >{/if}
+    {#if loaded && (!atBottom || detached || unread || cursorChanged)}<button
+        class="quiet-button"
+        disabled={paging}
+        onclick={() => refresh("latest")}>最新へ戻る</button
+      >{/if}
+  </div>
   <!-- svelte-ignore a11y_no_noninteractive_tabindex (Scrollable conversation needs keyboard scrolling.) -->
   <section
     class="conversation-panel"
     aria-label="会話・報告"
     bind:this={viewport}
+    onscroll={trackScroll}
     tabindex="0"
   >
     <div class="conversation-meta">
@@ -177,11 +308,6 @@
     </div>
     <p class="conversation-cwd">{agent.cwd}</p>
     {#if blocked}<p class="availability" role="status">{blocked}</p>{/if}
-    {#if historyError}<div class="history-error">
-        <output class="failed" aria-live="polite"
-          >会話を更新できません: {historyError}</output
-        ><button class="quiet-button" onclick={refresh}>再試行</button>
-      </div>{/if}
     {#if !target.session}<p class="panel-note">
         対象セッションを特定できないため、会話を表示できません。
       </p>
@@ -190,15 +316,27 @@
         aria-busy="true"
       >
         <span class="brush-loader"></span>
-        <p>会話を読み込んでいます</p>
+        <p>直近の会話を読み込んでいます</p>
       </div>
     {:else if loaded && messages.length === 0}<p class="panel-note">
-        まだ会話・報告はありません。
+        この範囲に表示できる会話・報告はありません。
       </p>{/if}
-    {#if truncated}<p class="panel-note">直近の会話を表示しています。</p>{/if}
+    {#if loaded}<p class="conversation-cwd">
+        {olderCursor
+          ? "古い会話はページごとに表示します。"
+          : "会話の先頭です。"}
+      </p>{/if}
+    {#if olderCursor}<button
+        class="quiet-button history-page"
+        disabled={paging || cursorChanged}
+        onclick={() => refresh("older")}>古い会話</button
+      >{/if}
+    {#if truncated}<p class="panel-note">
+        大きすぎる記録や読み取れない記録の一部を省いています。
+      </p>{/if}
     <ol class="conversation-list">
       {#each messages as message (message.id)}
-        <li class:user={message.role === "user"}>
+        <li data-message-id={message.id} class:user={message.role === "user"}>
           <div class="message-meta">
             <strong
               >{message.role === "user" ? "あなた" : "エージェント"}</strong
@@ -210,6 +348,11 @@
         </li>
       {/each}
     </ol>
+    {#if detached}<button
+        class="quiet-button history-page"
+        disabled={paging || cursorChanged}
+        onclick={() => refresh("newer")}>新しい会話</button
+      >{/if}
   </section>
   <aside class="letter-dock" class:expanded={open} aria-label="手紙">
     <div class="letter-dock-tab">

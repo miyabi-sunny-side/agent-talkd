@@ -25,7 +25,7 @@ SessionStart hook が最初のプロンプト後に動く CLI では、端末で
 
 Herdr が原文入力を受け付けても、CLI の処理完了を意味しません。実際の出力は会話に表示されます。送信途中の接続切断で受付が確認できない場合は、会話を確認してから再送してください。自動再送や永続キューはありません。
 
-履歴は Codex の `~/.codex/sessions` と Claude の `~/.claude/projects` にある JSONL を読み、user / assistant のテキストを表示します。tool の内部応答や推論内容は表示しません。最新 2 MiB / 最大 500 メッセージを表示する基本接続で、長い履歴のページングは後続の改善です。履歴が利用できない場合は端末画面を代替の報告として扱わずエラーを表示します。
+履歴は Codex の `~/.codex/sessions` と Claude の `~/.claude/projects` にある JSONL を読み、user / assistant のテキストを表示します。tool の内部応答や推論内容は表示しません。直近から開き、「古い会話」「新しい会話」で長い履歴をページ単位に辿れます。各取得は最大 2 MiB / 500 メッセージで、新着は差分取得します。過去を読んでいる間の更新や再接続で読み位置を保持し、「最新へ戻る」で直近末尾へ戻れます。表示は最大 1000 件 / 4 MiB の本文までとし、上限では既存の表示を保持してページ移動を案内します。巨大な単一記録や壊れた記録の省略は画面に示します。ページ再読込は同じセッションの直近から再開します。履歴が利用できない場合は端末画面を代替の報告として扱わずエラーを表示します。
 
 Herdr は session identity を原子的に比較して prompt を送る API を持たないため、照合直後に同じ pane のプロセスが入れ替わる短い競合窓は残ります。送信直前の session / foreground process 照合と Herdr の blocked 判定を使い、名前による曖昧な宛先解決を避けます。
 
@@ -36,9 +36,12 @@ Herdr は session identity を原子的に比較して prompt を送る API を�
 | health / version | `GET /api/hello` |
 | Herdr 内の対象一覧 | `GET /api/agents` |
 | 対象 CLI の会話 | `GET /api/conversation?pane=<pane>&session=<session_id>` |
+| 会話の前後ページ | 同 URL に `before=<cursor>` または `after=<cursor>`（排他） |
 | 原文メッセージ入力 | `POST /api/messages` |
 
 送信は `Content-Type: application/json` で `{"pane_id":"w1:p3","session_id":"一覧の識別子","body":"原文"}` を渡します。本文は最大 32 KiB、空白だけの本文と改行・タブ以外の制御文字を拒否します。成功応答は `{"status":"submitted"}`。エラーは `{"error":{"code":"...","message":"..."}}` です。CORS を開放せず、異なる Origin と cross-site fetch を拒否します。
+
+会話レスポンスの `older_cursor` は過去ページ（先頭なら `null`）、`next_cursor` はそのページの続きの取得に使います。`has_more` は要求方向に続きがあること、`pending_tail` は書きかけの末尾待ち、`truncated` は読み取れない記録の省略を表します。カーソルはその native 履歴専用です。ファイルの置換・縮小等で `cursor_changed`（409）になったら、表示中の会話を保持して直近を開き直します。native 履歴の通常の追記を前提とし、独立した会話の保存・再送は行いません。
 
 ## 旧 broker からの移行
 

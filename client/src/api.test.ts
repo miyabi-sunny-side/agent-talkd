@@ -26,6 +26,9 @@ it("rejects a conversation from a replaced session", async () => {
         session_id: "other",
         messages: [],
         truncated: false,
+        older_cursor: null,
+        next_cursor: "cursor-1",
+        has_more: false,
       }),
     ),
   );
@@ -57,4 +60,24 @@ it("surfaces structured errors without retrying a submission", async () => {
   vi.stubGlobal("fetch", fetcher);
   await expect(sendMessage("p", "s", "本文")).rejects.toThrow("承認待ちです");
   expect(fetcher).toHaveBeenCalledTimes(1);
+});
+it("encodes opaque paging cursors with the selected session", async () => {
+  const fetcher = vi.fn().mockResolvedValue(
+    Response.json({
+      pane_id: "p",
+      session_id: "s",
+      messages: [],
+      truncated: false,
+      older_cursor: null,
+      next_cursor: "end",
+      has_more: false,
+    }),
+  );
+  vi.stubGlobal("fetch", fetcher);
+  await fetchConversation("p", "s", { before: "opaque:/+?" });
+  expect(
+    new URL(fetcher.mock.calls[0][0], "http://localhost").searchParams.get(
+      "before",
+    ),
+  ).toBe("opaque:/+?");
 });

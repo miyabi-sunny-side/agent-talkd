@@ -116,6 +116,49 @@ fn browser_api_routes_original_text_to_the_verified_session_and_reads_native_out
     let (status, conversation) = request(port, "GET", &path, None, "");
     assert_eq!(status, 200);
     assert_eq!(conversation["messages"][1]["text"], "実セッションの報告");
+    assert_eq!(conversation["older_cursor"], Value::Null);
+    assert_eq!(conversation["has_more"], false);
+    let cursor = conversation["next_cursor"].as_str().unwrap();
+    let newer_path = format!("{path}&after={cursor}");
+    assert!(
+        request(port, "GET", &newer_path, None, "").1["messages"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let mut transcript = std::fs::OpenOptions::new()
+        .append(true)
+        .open(history_dir.join("rollout-session-a.jsonl"))
+        .unwrap();
+    for i in 0..503 {
+        writeln!(transcript, "{}", json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":format!("追加{i}")}]}})).unwrap();
+    }
+    let (status, added) = request(port, "GET", &newer_path, None, "");
+    assert_eq!(status, 200);
+    assert_eq!(added["messages"].as_array().unwrap().len(), 500);
+    assert_eq!(added["messages"][0]["text"], "追加0");
+    assert_eq!(added["has_more"], true);
+    let next = added["next_cursor"].as_str().unwrap();
+    let tail = request(port, "GET", &format!("{path}&after={next}"), None, "").1;
+    assert_eq!(tail["messages"].as_array().unwrap().len(), 3);
+    assert_eq!(tail["has_more"], false);
+    let before = request(port, "GET", &format!("{path}&before={cursor}"), None, "").1;
+    assert_eq!(before["messages"].as_array().unwrap().len(), 2);
+    for suffix in [
+        "&before=x",
+        "&after=",
+        "&before=x&after=y",
+        "&after=x&after=x",
+        "&other=x",
+        "&pane=another",
+    ] {
+        assert_eq!(
+            request(port, "GET", &format!("{path}{suffix}"), None, "").0,
+            400
+        );
+    }
+    std::fs::write(history_dir.join("rollout-session-a.jsonl"), "").unwrap();
+    assert_eq!(request(port, "GET", &newer_path, None, "").0, 409);
     assert_eq!(
         request(
             port,

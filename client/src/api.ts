@@ -19,6 +19,9 @@ export interface Conversation {
   session_id: string;
   messages: Message[];
   truncated: boolean;
+  older_cursor: string | null;
+  next_cursor: string;
+  has_more: boolean;
 }
 export class ApiError extends Error {
   constructor(
@@ -85,15 +88,19 @@ export async function fetchAgents(): Promise<Agent[]> {
 export async function fetchConversation(
   pane: string,
   session: string,
+  cursor: { before?: string; after?: string } = {},
 ): Promise<Conversation> {
   const body = await request(
-    `/api/conversation?${new URLSearchParams({ pane, session })}`,
+    `/api/conversation?${new URLSearchParams({ pane, session, ...cursor })}`,
   );
   if (
     !record(body) ||
     body.pane_id !== pane ||
     body.session_id !== session ||
     typeof body.truncated !== "boolean" ||
+    !nullable(body.older_cursor) ||
+    typeof body.next_cursor !== "string" ||
+    typeof body.has_more !== "boolean" ||
     !Array.isArray(body.messages) ||
     !body.messages.every(
       (m) =>

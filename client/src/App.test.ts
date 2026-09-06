@@ -23,6 +23,9 @@ beforeEach(() => {
             session_id: "s",
             messages: [],
             truncated: false,
+            older_cursor: null,
+            next_cursor: "cursor-1",
+            has_more: false,
           }),
     ),
   );

@@ -1,6 +1,6 @@
 ---
 name: agent-talkd remote messages UI
-version: 3
+version: 4
 description: >
   Project design authority for the agent-talkd web client. Self-contained:
   everything needed to implement and verify the UI lives in this file.
@@ -24,8 +24,8 @@ Codex / Claude Code を対象とし、その他の CLI は実際の adapter 対�
 48px app header、compact summary、session 単位カード、状態 border / 文字色、
 下部の手紙 dock を継承し、モバイル縦スペースを優先する。
 mailbox・skill 選択・エージェント間通信・呼び鈴・ack の操作は置かない。
-brush loader は loading 表示として残す。長履歴の pagination / 継続閲覧の拡張は
-後続タスクの担当とし、本変更では既存 CLI 履歴の直近の出力を接続する。
+brush loader は loading 表示として残す。長い native CLI 履歴は直近から開き、
+古い会話のページ取得と差分更新で、同じ session の原文を継続して読める。
 
 ## 2. 画面と URL (router contract)
 
@@ -47,6 +47,8 @@ fallback するため、サーバ変更は不要。
 - 同一 workspace 内の agent タブ切替は `replaceState` (Back はタブ履歴を
   遡らず一覧へ戻る)。
 - `popstate` で再 fetch なしに view を復元する。reload は同じ画面を復元する。
+  full reload 後の会話は同じ CLI session の直近から再開し、過去の読み位置の
+  永続復元は要求しない。取得中は直近を開いていることが分かる表示にする。
 - 未知 path は Registry を描画し `replaceState` で `/` へ正規化する。
 - deep-link (`/agent?pane=...`) は agents fetch 完了前に not-found 判定しない。
   fetch 成功後も pane が不在なら silent redirect せず、URL を保ったまま
@@ -226,6 +228,33 @@ viewport 全幅。左右 gutter は詳細 `.detail-bar-primary` と共通 token�
   本文を保持し「接続が切れています」等の理由を示す。報告がないことを完了としない。
 - 更新時に全文を live announcement せず、接続・送信状態を `aria-live="polite"`
   で通知する。読んでいる途中の scroll 位置を更新で末尾へ飛ばさない。
+- 初回は直近ページの末尾を表示する。先頭に「古い会話」quiet-button を
+  置き、前のページがある場合だけ操作可能にする。取得中はボタン付近で状態を示し
+  重複取得を防ぐ。過去取得に失敗しても現在の本文を残し、同じ場所で再試行できる。
+  最古まで到達したら「会話の先頭です」と示し、追加取得を止める。
+- 過去の履歴は「古い会話」「新しい会話」で明示的に表示ページを切り替える。
+  各ページは最大 500 件 / 2MiB とし、ページ単位で表示することを操作付近で説明する。
+  古いページを開いたらその末尾を表示し、続きを遡る操作は上端に置く。
+  「新しい会話」は次のページへ進み、間の会話を飛ばさずに辿れるようにする。
+- 新着差分でも、過去を読んでいる間は同じ本文・読み位置を保持する。
+  末尾を追従しているときだけ新着に追従する。本文を重複表示せず、時系列を保つ。
+  古いページの閲覧中は新着の有無だけ更新し、本文を最新ページへ入れ替えない。
+- 自動追記後の表示・保持は最大 1000 件 / 4MiB とする。上限に達したら既存表示を
+  保って「表示上限に達しました。最新へ戻ると続きを読めます」と説明する。
+  ページ切替または「最新へ」の明示操作で旧表示を解放する。背景の差分更新で
+  読んでいる本文を追い出したり、無断で別ページへ切り替えたりしない。
+- 詳細 chrome 直下に高さ 44px の操作バーを確保し、本文の scroll から独立させる。
+  状態と「最新へ戻る」quiet-button はこのバーに置く。状態のないときは
+  「会話・報告」と表示する。長い状態・エラー文は高さ 44px 以内の内部 scroll で
+  全文へ到達できるようにし、状態変化で本文の開始位置を動かさない。
+- 最新から離れている間は、操作バーの「最新へ戻る」を表示する。
+  新着があればその旨を短く併記し、上限に達しても新着本文を無制限に
+  蓄積しない。押すと同じ session の直近を取得して末尾へ移動する。失敗したら
+  元の本文・位置を保って再試行できる。新着なしでも最新へ戻れる。
+- 新しい操作は既存の quiet-button、本文・muted・状態色の recipe を再利用する。
+  本文や手紙 dock を覆わず、320px 幅でも折り返して到達できること。keyboard
+  操作と focus-visible を備え、touch target は 44px 以上。非同期取得で focus を
+  奪わず、操作元が消えるページ切替では会話領域へ focus を移して操作を継続する。
 - terminal 画面・キー送信 UI は主面に置かない。承認待ちを含め、スマホで端末キーを
   再現する操作を解決手段として要求しない。
 
@@ -343,12 +372,16 @@ maskable 版は通常版の描画を中心 (256,256) 基準で `scale(0.875)` �
 
 | 対象 | 周期 | 条件 |
 |---|---|---|
-| 選択 session の会話・報告 | 2s | `/agent` 表示中 + document visible |
-| registry (`/api/who`) | 5s | 全 view で document visible (App level 単一 poller) |
+| 選択 session の会話・報告 (`/api/conversation`) | 2s | `/agent` 表示中 + document visible。初回は直近、その後は前方差分 |
+| registry (`/api/agents`) | 5s | 全 view で document visible (App level 単一 poller) |
 
 hidden で停止し、visible 復帰で即時 refresh。古い宛先の遅延レスポンスを新しい
 宛先の履歴へ混ぜない。poll 失敗で取得済み内容を消さず、可視状態と aria-live で
-失敗を示す。長履歴 pagination 用の UI や独立保存基盤は今回追加しない。
+失敗を示す。切断・再接続中も取得済みの本文と読み位置を保持し、初回 loading に
+戻さない。同じ session への復帰は前方差分から再開する。cursor が無効になり
+直近の再取得が必要な場合も、本文を残したまま説明と「最新へ」の操作を示す。
+過去ページは §7.5 の明示操作で取得する。native CLI 履歴を情報源とし、独立した
+会話の保存基盤は追加しない。
 
 ## 10. Responsive
 
@@ -394,6 +427,9 @@ hidden で停止し、visible 復帰で即時 refresh。古い宛先の遅延レ
   旧 `/letters` と未知 path → `/` (replace)、popstate = 復元。
 - **detail**: loading → ready / empty / error。継続 fetch の error は本文保持。
   対象消滅や identity 変更で送信を止め、説明を示す。
+- **history**: 直近追従 ⇄ 過去閲覧。後方取得中 / 後方取得失敗は本文・位置保持。
+  過去閲覧中の新着は最新への導線で知らせる。表示上限でのページ切替と直近への
+  移動は明示操作で行う。切断 → 復帰は取得済み表示を保ち、identity を混ぜない。
 - **composer**: closed ⇄ open。送信 idle → sending → accepted / delivered /
   failed / result-unknown。状態名は API が確かめた事実に合わせる。
   accepted / delivered を agent の処理完了へ自動遷移させない。
@@ -412,6 +448,11 @@ hidden で停止し、visible 復帰で即時 refresh。古い宛先の遅延レ
 - 実操作で deep-link reload、Back/Forward、テーマ保存、IME 改行、focus 復帰、
   disabled 理由、loading / empty / error、draft 復元と再起動時の隔離を確認する。
   prefers-color-scheme / reduced-motion も emulation で確認する。
+- 長履歴で複数の過去ページへ到達できること、境界の重複・欠落がないこと、表示と
+  保持が上記の上限内に収まることを確認する。過去閲覧中の新着で同一メッセージの
+  viewport 内の縦座標を測り、変化が 2px 以内であることを確認する。
+  上限到達時は明示操作による切替のみ許可し、「最新へ」で直近末尾に戻れること、
+  取得失敗・切断・復帰で既存本文を消さないこと、focus と狭幅の操作性を確認する。
 - 実ブラウザ経路で Codex と Claude Code の対象確認 → 原文指示 → 実 session 受信
   → assistant 報告表示を確認する。追加指示と接続切断・終了時の表示も確認し、
   送信成功だけで実 session の処理・報告検証を代替しない。

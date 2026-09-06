@@ -116,8 +116,16 @@ async fn conversation(console: &Console, query: Option<&str>) -> HttpResponse {
             "対象のセッションが変わりました。一覧から確認し直してください",
         );
     }
+    let pagination = if let Some(cursor) = query.get("before") {
+        history::Page::Before(cursor.clone())
+    } else if let Some(cursor) = query.get("after") {
+        history::Page::After(cursor.clone())
+    } else {
+        history::Page::Latest
+    };
     let home = console.home.clone();
-    match tokio::task::spawn_blocking(move || history::read(&agent, &home)).await {
+    match tokio::task::spawn_blocking(move || history::read_page(&agent, &home, &pagination)).await
+    {
         Ok(Ok(conversation)) => json_response(StatusCode::OK, &json!(conversation)),
         Ok(Err(error)) => adapter_error(&error),
         Err(_) => error_response(
@@ -241,11 +249,10 @@ fn adapter_error(error: &anyhow::Error) -> HttpResponse {
             (error.code, error.message.as_str())
         });
     let status = match code {
-        "session_changed" | "blocked" | "unknown" | "unregistered" | "unsupported" => {
-            StatusCode::CONFLICT
-        }
+        "cursor_changed" | "session_changed" | "blocked" | "unknown" | "unregistered"
+        | "unsupported" => StatusCode::CONFLICT,
         "not_found" => StatusCode::NOT_FOUND,
-        "invalid_input" => StatusCode::BAD_REQUEST,
+        "invalid_cursor" | "invalid_input" => StatusCode::BAD_REQUEST,
         _ => StatusCode::SERVICE_UNAVAILABLE,
     };
     error_response(status, code, message.trim())
@@ -257,13 +264,25 @@ fn parse_query(query: &str) -> Result<BTreeMap<String, String>> {
         let (key, value) = field.split_once('=').context("query field has no value")?;
         let key = decode(key)?;
         anyhow::ensure!(
-            matches!(key.as_str(), "pane" | "session"),
+            matches!(key.as_str(), "pane" | "session" | "before" | "after"),
             "unknown query field"
         );
         anyhow::ensure!(
             fields.insert(key, decode(value)?).is_none(),
             "duplicate query field"
         );
+    }
+    anyhow::ensure!(
+        !(fields.contains_key("before") && fields.contains_key("after")),
+        "conflicting cursors"
+    );
+    for (key, value) in &fields {
+        anyhow::ensure!(!value.is_empty(), "empty query field");
+        match key.as_str() {
+            "pane" => anyhow::ensure!(value.len() <= 256, "pane too long"),
+            "session" => anyhow::ensure!(value.len() <= 4096, "session too long"),
+            _ => history::validate_cursor(value)?,
+        }
     }
     Ok(fields)
 }
@@ -351,7 +370,18 @@ mod tests {
         let query = parse_query("pane=w1%3Ap2&session=a%2Fb%25%CE%B1").unwrap();
         assert_eq!(query["pane"], "w1:p2");
         assert_eq!(query["session"], "a/b%α");
-        for invalid in ["pane=%", "pane=%ff", "pane=a&pane=b", "path=/tmp/file"] {
+        for invalid in [
+            "pane=%",
+            "pane=%ff",
+            "pane=a&pane=b",
+            "path=/tmp/file",
+            "pane=",
+            "session=",
+            "before=",
+            "after=garbage",
+            "before=x&after=y",
+            "after=x&after=y",
+        ] {
             assert!(parse_query(invalid).is_err());
         }
     }

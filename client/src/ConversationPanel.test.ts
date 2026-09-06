@@ -23,6 +23,9 @@ beforeEach(() => {
           session_id: "s",
           messages: [{ id: "1", role: "assistant", text: "実際の報告" }],
           truncated: false,
+          older_cursor: null,
+          next_cursor: "cursor-1",
+          has_more: false,
         }),
   );
   vi.stubGlobal("fetch", fetcher);
@@ -59,6 +62,9 @@ it("preserves failed drafts and never automatically resends", async () => {
           session_id: "s",
           messages: [],
           truncated: false,
+          older_cursor: null,
+          next_cursor: "cursor-1",
+          has_more: false,
         }),
   );
   render(ConversationPanel, { agent, available: true, connected: true });
@@ -105,6 +111,9 @@ it("does not clear edits made while sending", async () => {
           session_id: "s",
           messages: [],
           truncated: false,
+          older_cursor: null,
+          next_cursor: "cursor-1",
+          has_more: false,
         }),
   );
   render(ConversationPanel, { agent, available: true, connected: true });
@@ -190,6 +199,9 @@ it("keeps a newly edited draft when an earlier unmounted sender finishes", async
           session_id: "s",
           messages: [],
           truncated: false,
+          older_cursor: null,
+          next_cursor: "cursor-1",
+          has_more: false,
         }),
   );
   const first = render(ConversationPanel, {
@@ -214,4 +226,48 @@ it("keeps a newly edited draft when an earlier unmounted sender finishes", async
   expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe(
     "戻って編集した下書き",
   );
+});
+it("changes bounded pages only on explicit navigation and requests newer records from that page", async () => {
+  fetcher.mockImplementation(async (path: string) => {
+    const params = new URL(path, "http://localhost").searchParams;
+    const old = params.has("before");
+    return Response.json({
+      pane_id: "w:p",
+      session_id: "s",
+      messages: [
+        {
+          id: old ? "1" : "2",
+          role: "assistant",
+          text: old ? "古い報告" : "新しい報告",
+        },
+      ],
+      truncated: false,
+      older_cursor: old ? null : "before",
+      next_cursor: old ? "old-end" : "new-end",
+      has_more: old ? false : true,
+    });
+  });
+  render(ConversationPanel, { agent, available: true, connected: true });
+  await screen.findByText("新しい報告");
+  await fireEvent.click(screen.getByRole("button", { name: "古い会話" }));
+  await screen.findByText("古い報告");
+  expect(screen.queryByText("新しい報告")).toBeNull();
+  await waitFor(() =>
+    expect(
+      (screen.getByRole("button", { name: "新しい会話" }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(false),
+  );
+  const visibility = vi
+    .spyOn(document, "visibilityState", "get")
+    .mockReturnValue("visible");
+  await fireEvent(document, new Event("visibilitychange"));
+  await screen.findByText("新しい会話があります。過去の会話を表示しています。");
+  expect(screen.getByText("古い報告")).toBeTruthy();
+  visibility.mockRestore();
+  await fireEvent.click(screen.getByRole("button", { name: "新しい会話" }));
+  await screen.findByText("新しい報告");
+  expect(
+    fetcher.mock.calls.some(([path]) => String(path).includes("after=old-end")),
+  ).toBe(true);
 });

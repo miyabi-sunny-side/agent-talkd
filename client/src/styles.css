@@ -884,3 +884,30 @@ textarea:focus-visible,
 .letter-dock.expanded .letter-dock-panel {
   visibility: visible;
 }
+
+.history-controls {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  padding-inline: 12px;
+  height: 44px;
+  flex-shrink: 0;
+  font-size: 12px;
+  color: var(--muted);
+  border-bottom: 1px solid var(--border);
+}
+.history-controls output {
+  flex: 1;
+  min-width: 0;
+  max-height: 44px;
+  overflow: auto;
+  overflow-wrap: anywhere;
+}
+.history-controls button,
+.history-page {
+  min-height: 44px;
+}
+.history-page {
+  margin-block: 8px;
+}
