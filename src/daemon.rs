@@ -9,8 +9,8 @@ use hyper::{
     service::service_fn,
 };
 use hyper_util::rt::TokioIo;
-use serde::Deserialize;
-use serde_json::{Value, json};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
 use tokio::{net::TcpListener, sync::Mutex};
 
 use crate::{config::Config, herdr::Herdr, history};
@@ -73,7 +73,7 @@ async fn handle(console: Arc<Console>, request: Request<Incoming>) -> HttpRespon
             &json!({"name":"agent-talk","version":env!("CARGO_PKG_VERSION")}),
         ),
         (&Method::GET, "/api/agents") => match console.herdr.list().await {
-            Ok(agents) => json_response(StatusCode::OK, &json!({"agents":agents})),
+            Ok(agents) => json_response(StatusCode::OK, &BTreeMap::from([("agents", agents)])),
             Err(error) => adapter_error(&error),
         },
         (&Method::GET, "/api/screen") => screen(&console, request.uri().query()).await,
@@ -121,7 +121,7 @@ async fn screen(console: &Console, query: Option<&str>) -> HttpResponse {
         .screen(pane, terminal, query.get("session").map(String::as_str))
         .await
     {
-        Ok(screen) => json_response(StatusCode::OK, &json!(screen)),
+        Ok(screen) => json_response(StatusCode::OK, &screen),
         Err(error) => adapter_error(&error),
     }
 }
@@ -169,7 +169,7 @@ async fn conversation(console: &Console, query: Option<&str>) -> HttpResponse {
     let home = console.home.clone();
     match tokio::task::spawn_blocking(move || history::read_page(&agent, &home, &pagination)).await
     {
-        Ok(Ok(conversation)) => json_response(StatusCode::OK, &json!(conversation)),
+        Ok(Ok(conversation)) => json_response(StatusCode::OK, &conversation),
         Ok(Err(error)) => adapter_error(&error),
         Err(_) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -357,11 +357,11 @@ fn decode(value: &str) -> Result<String> {
     String::from_utf8(decoded).context("query is not UTF-8")
 }
 
-fn json_response(status: StatusCode, value: &Value) -> HttpResponse {
+fn json_response(status: StatusCode, value: &impl Serialize) -> HttpResponse {
     response(
         status,
         "application/json; charset=utf-8",
-        Bytes::from(value.to_string()),
+        Bytes::from(serde_json::to_vec(value).expect("API response serializes")),
     )
 }
 

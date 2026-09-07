@@ -31,6 +31,18 @@ fn request(port: u16, method: &str, path: &str, body: Option<&Value>, extra: &st
     stream.read_to_string(&mut response).unwrap();
     let (headers, body) = response.split_once("\r\n\r\n").unwrap();
     let status = headers.split_whitespace().nth(1).unwrap().parse().unwrap();
+    for expected in [
+        "content-type: application/json; charset=utf-8",
+        "cache-control: no-store",
+        "x-content-type-options: nosniff",
+        "referrer-policy: same-origin",
+    ] {
+        assert!(
+            headers
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case(expected))
+        );
+    }
     (status, serde_json::from_str(body).unwrap())
 }
 
@@ -111,6 +123,13 @@ fn verified_session_lifecycle(pane: &str) {
     let (status, conversation) = request(port, "GET", &path, None, "");
     assert_eq!(status, 200);
     assert_eq!(conversation["messages"][1]["text"], "実セッションの報告");
+    assert_eq!(conversation["pane_id"], pane);
+    assert_eq!(conversation["session_id"], token);
+    assert_eq!(conversation["messages"][0]["role"], "user");
+    assert_eq!(conversation["messages"][1]["role"], "assistant");
+    assert!(conversation["messages"][0].get("timestamp").is_none());
+    assert_eq!(conversation["truncated"], false);
+    assert_eq!(conversation["pending_tail"], false);
     assert_eq!(conversation["older_cursor"], Value::Null);
     assert_eq!(conversation["has_more"], false);
     let cursor = conversation["next_cursor"].as_str().unwrap();
