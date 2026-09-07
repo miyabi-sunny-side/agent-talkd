@@ -59,7 +59,7 @@ Herdr が原文入力を受け付けても、CLI の処理完了を意味しま�
 
 確認した Herdr 0.8.2 の CLI は session identity を原子的に比較して prompt を送る操作を持たないため、照合直後に同じ pane のプロセスが入れ替わる短い競合窓は残ります。送信直前の session / foreground process 照合と Herdr の blocked 判定を使い、名前による曖昧な宛先解決を避けます。
 
-履歴取得を Herdr へ集約するための [必要契約と不足機能](docs/history-ownership.md) を整理しています。Herdr 0.8.2 は native session の参照を提供しますが、会話ページの取得 API はありません。実移譲と agent-talk の HOME 依存解消は未実装で、依存機能が提供されるまでは上記の会話表示を維持します。
+「会話」は native 履歴を読む機能、「画面」は Herdr の端末表示を定期取得して出先から様子を確認する機能です。取得元と更新は独立しており、会話履歴を取得できなくても「画面」を開けます。詳しくは [会話履歴と端末画面の取得責務](docs/history-ownership.md) を参照してください。
 
 ## HTTP API
 

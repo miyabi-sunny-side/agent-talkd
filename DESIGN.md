@@ -380,7 +380,7 @@ maskable 版は通常版の描画を中心 (256,256) 基準で `scale(0.875)` �
 - 取得成功時刻を可視表示し、自動更新の開始時刻で上書きしない。loading / 空の画面 /
   初回失敗 + 再試行を区別する。更新失敗・切断・終了後は取得済み表示と成功時刻を
   残し、「古い表示」と理由を併記する。切替後の再取得前も現在確認済みとは表示しない。
-- 画面閲覧は送信可否と独立する。native session 未登録 / unsupported / blocked でも、
+- 画面閲覧は会話履歴の取得成功・送信可否と独立する。native session 未登録 / unsupported / blocked でも、
   Herdr の端末実体を特定できれば閲覧できる。API は pane + terminal identity を必須、
   native CLI session identity を任意とし、native 登録を閲覧の必須条件にしない。
 - pane + terminal identity と、指定した場合の CLI session identity を固定して取得する。
