@@ -12,6 +12,11 @@ with (root / 'calls.jsonl').open('a') as calls:
     calls.write(json.dumps(args) + '\n')
 row = state['row']
 command = args[:2]
+rows = [row, *state.get('extra_rows', [])]
+if command in (['agent', 'get'], ['agent', 'prompt'], ['pane', 'read']):
+    row = next(candidate for candidate in rows if candidate['pane_id'] == args[2])
+elif command == ['pane', 'process-info']:
+    row = next(candidate for candidate in rows if candidate['pane_id'] == args[3])
 mode = state.get('mode', '')
 if command == ['agent', 'prompt'] and mode:
     if mode == 'timeout':
@@ -33,21 +38,21 @@ if command == ['agent', 'prompt'] and mode:
         sys.exit(1)
 if command == ['agent', 'list']:
     assert args == ['agent', 'list']
-    result = {'agents': [row]}
+    result = {'agents': rows}
 elif command == ['workspace', 'list']:
     assert args == ['workspace', 'list']
     result = {'workspaces': []}
 elif command == ['tab', 'list']:
-    assert args == ['tab', 'list', '--workspace', 'w1']
+    assert args[:3] == ['tab', 'list', '--workspace'] and args[3] in {r['workspace_id'] for r in rows}
     result = {'tabs': []}
 elif command == ['agent', 'get']:
-    assert args == ['agent', 'get', 'w1:p2']
-    result = {'agent': row}
+    assert args == ['agent', 'get', row['pane_id']]
+    result = {'agent': dict(row, pane_id=state.get('get_pane_id', row['pane_id']))}
 elif command == ['pane', 'process-info']:
-    assert args == ['pane', 'process-info', '--pane', 'w1:p2']
-    result = {'type': 'pane_process_info', 'process_info': {'pane_id': 'w1:p2', 'foreground_processes': [{'pid': state.get('pid', 123), 'name': 'codex'}]}}
+    assert args == ['pane', 'process-info', '--pane', row['pane_id']]
+    result = {'type': 'pane_process_info', 'process_info': {'pane_id': row['pane_id'], 'foreground_processes': [{'pid': state.get('pid', 123), 'name': 'codex'}]}}
 elif command == ['pane', 'read']:
-    assert args == ['pane', 'read', 'w1:p2', '--source', 'visible', '--format', 'text']
+    assert args == ['pane', 'read', row['pane_id'], '--source', 'visible', '--format', 'text']
     screen_mode = state.get('screen_mode', '')
     if screen_mode == 'restart':
         row['agent_session']['value'] = 'session-b'
@@ -59,7 +64,7 @@ elif command == ['pane', 'read']:
     sys.stdout.write('x' * (256 * 1024 + 1) if screen_mode == 'oversized' else '確認してください\n[許可] [拒否]')
     sys.exit(0)
 elif command == ['agent', 'prompt']:
-    assert len(args) == 4 and args[2] == 'w1:p2'
+    assert len(args) == 4 and args[2] == row['pane_id']
     result = {'type': 'agent_prompted', 'agent': row}
     if mode == 'wrong-terminal':
         result['agent']['terminal_id'] = 'other-terminal'

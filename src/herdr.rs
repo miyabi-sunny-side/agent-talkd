@@ -333,12 +333,14 @@ async fn read_bounded(reader: impl tokio::io::AsyncRead + Unpin, limit: u64) -> 
 }
 
 fn validate_pane(pane: &str) -> Result<()> {
-    let valid = pane.split_once(":p").is_some_and(|(w, p)| {
-        w.strip_prefix('w')
-            .is_some_and(|w| !w.is_empty() && w.bytes().all(|b| b.is_ascii_digit()))
-            && !p.is_empty()
-            && p.bytes().all(|b| b.is_ascii_digit())
-    });
+    // Herdr v0.7.5 src/workspace.rs uses this alphabet for both public numbers.
+    const PUBLIC_ID_ALPHABET: &[u8] = b"123456789ABCDEFGHJKMNPQRSTVWXYZ0";
+    let valid_number = |number: &str| {
+        !number.is_empty() && number.bytes().all(|b| PUBLIC_ID_ALPHABET.contains(&b))
+    };
+    let valid = pane
+        .split_once(":p")
+        .is_some_and(|(w, p)| w.strip_prefix('w').is_some_and(valid_number) && valid_number(p));
     if !valid || pane.len() > 64 {
         return Err(error("invalid_input", "Invalid pane ID"));
     }
@@ -609,6 +611,57 @@ mod tests {
         assert!(validate_pane("w1:p2;exit").is_err());
     }
     #[test]
+    fn accepts_herdr_public_pane_ids() {
+        for pane in [
+            "w1:p2",
+            "w10:p1",
+            "w2N:p3",
+            "w2J:p9",
+            "w2E:p6",
+            "w10:p2N",
+            "w2N:p3J",
+            "w123456789ABCDEFGHJKMNPQRSTVWXYZ0:p0",
+            "w0:p123456789ABCDEFGHJKMNPQRSTVWXYZ0",
+        ] {
+            validate_pane(pane).unwrap_or_else(|error| panic!("{pane}: {error}"));
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_public_pane_ids() {
+        for pane in [
+            "",
+            "w:p1",
+            "w1:p",
+            "w1p2",
+            "w1::p2",
+            "w1:p2:p3",
+            "w1:t2",
+            "W1:p2",
+            "w1:P2",
+            "w2n:p3",
+            "w1:p2n",
+            "wI:p1",
+            "w1:pI",
+            "wL:p1",
+            "w1:pL",
+            "wO:p1",
+            "w1:pO",
+            "wU:p1",
+            "w1:pU",
+            " w1:p2",
+            "w1:p2 ",
+            "w1:p2\n",
+            "w1:p2;exit",
+            "wé:p1",
+            "w1:p２",
+        ] {
+            assert!(validate_pane(pane).is_err(), "{pane:?}");
+        }
+        assert!(validate_pane(&format!("w{}:p1", "1".repeat(61))).is_err());
+    }
+
+    #[test]
     fn malformed_processes_are_not_silently_dropped() {
         let value = json!({"type":"pane_process_info","process_info":{"pane_id":"w1:p2","foreground_processes":[{"name":"codex","pid":23},{"name":"codex"}]}});
         assert!(process_identity(&value, "w1:p2", "codex").is_err());
@@ -651,7 +704,7 @@ mod tests {
             let fixture = support::CliFixture::new(&row());
             fixture.update(|state| {
                 state["row"]["agent_status"] = json!(status);
-                state["row"]["pane_id"] = json!(pane);
+                state["get_pane_id"] = json!(pane);
                 state["pid"] = json!(pid);
             });
             let herdr = Herdr::new(fixture.executable());

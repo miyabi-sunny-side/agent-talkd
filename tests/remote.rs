@@ -35,11 +35,23 @@ fn request(port: u16, method: &str, path: &str, body: Option<&Value>, extra: &st
 }
 
 #[test]
-#[allow(clippy::too_many_lines)] // One end-to-end lifecycle, with shared isolated CLI state.
 fn browser_api_routes_original_text_to_the_verified_session_and_reads_native_output() {
+    for pane in ["w1:p2", "w2N:p3", "w2J:p9", "w2E:p6", "w10:p2N", "w2N:p3J"] {
+        verified_session_lifecycle(pane);
+    }
+}
+
+#[allow(clippy::too_many_lines)] // One end-to-end lifecycle, with shared isolated CLI state.
+fn verified_session_lifecycle(pane: &str) {
+    let workspace = pane.split_once(':').unwrap().0;
+    let encoded_pane = pane.replace(':', "%3A");
     let directory = tempfile::tempdir().unwrap();
-    let row = json!({"pane_id":"w1:p2","terminal_id":"terminal-1","workspace_id":"w1","agent":"codex","agent_status":"working","agent_session":{"source":"herdr:codex","agent":"codex","kind":"id","value":"session-a"}});
+    let row = json!({"pane_id":pane,"terminal_id":"terminal-1","workspace_id":workspace,"agent":"codex","agent_status":"working","agent_session":{"source":"herdr:codex","agent":"codex","kind":"id","value":"session-a"}});
     let fixture = support::CliFixture::new(&row);
+    let mut numeric_row = row.clone();
+    numeric_row["pane_id"] = json!("w10:p1");
+    numeric_row["workspace_id"] = json!("w10");
+    fixture.update(|state| state["extra_rows"] = json!([numeric_row]));
     let history_dir = directory.path().join(".codex/sessions");
     std::fs::create_dir_all(&history_dir).unwrap();
     std::fs::write(history_dir.join("rollout-session-a.jsonl"),concat!(
@@ -81,18 +93,21 @@ fn browser_api_routes_original_text_to_the_verified_session_and_reads_native_out
         thread::sleep(Duration::from_millis(20));
     }
     let (status, agents) = request(port, "GET", "/api/agents", None, "");
-    assert_eq!(status, 200);
+    assert_eq!(status, 200, "{pane}: {agents}");
+    assert_eq!(agents["agents"].as_array().unwrap().len(), 2);
+    assert_eq!(agents["agents"][0]["pane_id"], pane);
+    assert_eq!(agents["agents"][1]["pane_id"], "w10:p1");
     let token = agents["agents"][0]["session_id"].as_str().unwrap();
-    let body = json!({"pane_id":"w1:p2","session_id":token,"body":"  原文\n$(literal) `本文`  "});
+    let body = json!({"pane_id":pane,"session_id":token,"body":"  原文\n$(literal) `本文`  "});
     assert_eq!(
         request(port, "POST", "/api/messages", Some(&body), "").1,
         json!({"status":"submitted"})
     );
     assert_eq!(
         fixture.prompts(),
-        vec![json!({"target":"w1:p2","text":body["body"]})]
+        vec![json!({"target":pane,"text":body["body"]})]
     );
-    let path = format!("/api/conversation?pane=w1%3Ap2&session={token}");
+    let path = format!("/api/conversation?pane={encoded_pane}&session={token}");
     let (status, conversation) = request(port, "GET", &path, None, "");
     assert_eq!(status, 200);
     assert_eq!(conversation["messages"][1]["text"], "実セッションの報告");
@@ -155,10 +170,11 @@ fn browser_api_routes_original_text_to_the_verified_session_and_reads_native_out
         request(port, "POST", "/api/messages", Some(&body), "").1["error"]["code"],
         "blocked"
     );
-    let screen_path = format!("/api/screen?pane=w1%3Ap2&terminal=terminal-1&session={token}");
+    let screen_path =
+        format!("/api/screen?pane={encoded_pane}&terminal=terminal-1&session={token}");
     let (status, screen) = request(port, "GET", &screen_path, None, "");
     assert_eq!(status, 200, "blocked targets remain readable: {screen}");
-    assert_eq!(screen["pane_id"], "w1:p2");
+    assert_eq!(screen["pane_id"], pane);
     assert_eq!(screen["session_id"], token);
     assert_eq!(screen["terminal_id"], "terminal-1");
     assert_eq!(screen["text"], "確認してください\n[許可] [拒否]");
@@ -174,7 +190,7 @@ fn browser_api_routes_original_text_to_the_verified_session_and_reads_native_out
         request(port, "GET", "/api/screen?pane=w1:p2", None, "").0,
         400
     );
-    let terminal_path = "/api/screen?pane=w1:p2&terminal=terminal-1";
+    let terminal_path = &format!("/api/screen?pane={encoded_pane}&terminal=terminal-1");
     for (mode, expected) in [
         ("oversized", 503),
         ("restart", 409),
