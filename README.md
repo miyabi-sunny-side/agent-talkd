@@ -16,7 +16,36 @@ PORT=5002 agent-talk daemon
 
 daemon 起動時に HTTP を待ち受けます。sandbox の通常経路は Tailscale HTTPS です。アクセス範囲は Tailscale やプロキシなど配布側の構成が管理します。同権限のプロセスが API を使うことまで禁止する認証機構はありません。
 
-待受は `0.0.0.0`、ポートは `PORT`（未設定時 `5002`）です。`PORT` は `1`〜`65535` の数字のみを受け付け、空文字・不正値はエラーで起動を停止します。旧 `AGENT_TALK_HTTP_ADDR` は参照しません。ログ設定は任意の `LOG_LEVEL` です。`LOG_LEVEL` は小文字の `off` / `error` / `warn` / `info` / `debug` / `trace` を受け付け、未設定・不正値は `info` になります。空白付きの値、大文字、モジュール別のフィルター指定は不正値です。実行ユーザーの `PATH` に `herdr` が必要です。接続先の解決と RPC 通信は Herdr CLI が所有し、agent-talk 独自のソケット設定はありません。Herdr 自身の接続設定が必要なら Herdr の環境へ設定します。`HOME` は CLI 履歴の所在を解決します。CLI は `daemon`、`update`、`--help`、`--version` のみです。`update` は checksum を検証して実行ファイルを更新し、稼働サービスの再起動は運用側で行います。
+CLI は `daemon`、`update`、`--help`、`--version` のみです。`update` は checksum を検証して実行ファイルを更新し、稼働サービスの再起動は運用側で行います。
+
+## 環境変数
+
+### アプリ設定
+
+次の設定は `daemon` 起動時に読みます。待受アドレスは `0.0.0.0` 固定です。
+
+| 変数 | 用途 | 必須・既定値 | 値の扱い |
+|---|---|---|---|
+| `PORT` | HTTP 待受ポート | 任意、未設定時 `5002` | ASCII 数字だけの `1`〜`65535`。空文字、空白・符号付き、範囲外、非 UTF-8 はエラーで起動停止。 |
+| `LOG_LEVEL` | stderr に出すログのレベル | 任意、未設定時 `info` | 小文字の `off` / `error` / `warn` / `info` / `debug` / `trace`。空文字、空白付き、大文字、モジュール別フィルター、非 UTF-8 など不正値は `info`。 |
+
+旧 `AGENT_TALK_HTTP_ADDR` と `AGENT_TALK_HERDR_SOCKET` は参照しません。ログ設定も `AGENT_TALK_LOG_LEVEL` や `RUST_LOG` は参照せず、`LOG_LEVEL` のみです。廃止した設定への互換 fallback はありません。
+
+### OS・CLI の実行環境
+
+| 変数 | 用途 | 必須・既定値 | 未設定・不正値の扱い |
+|---|---|---|---|
+| `HOME` | daemon が読む native 会話履歴の基点（`$HOME/.codex/sessions`、`$HOME/.claude/projects`） | daemon では必須、アプリの既定値なし | 未設定は起動エラー。空文字・相対パス・存在しないパスは起動時に検証せず、履歴取得時に解決・読み取りできなければエラー。 |
+| `PATH` | daemon の `herdr`、update の `curl` の実行ファイル探索 | 各 CLI を実行できる環境が必要、アプリの既定値なし | OS の探索規則に従う。見つからない・実行できない場合は CLI 呼び出し時にエラー（daemon 起動時の検査はなし）。 |
+| `TMPDIR` | update のダウンロード・展開用一時ディレクトリ（`tempfile` 経由） | 任意、未設定時は OS の一時領域 | [Rust の `temp_dir`](https://doc.rust-lang.org/std/env/fn.temp_dir.html) に従う。指定先へ一時ディレクトリを作成できなければ update はエラー。 |
+
+agent-talk の `update` / `--help` / `--version` はアプリの設定読込を行いません。`herdr` と `curl` は起動元の環境を継承し、各 CLI 自身の設定はそれぞれが解釈します。
+
+### Herdr が所有する設定
+
+接続先の解決と RPC 通信は Herdr CLI が所有します。Herdr の接続に環境変数が必要なら、agent-talk を起動するサービスの環境に渡してください。既定値と不正値の扱いは利用する Herdr の仕様に従い、agent-talk では独自に解釈・上書きしません。
+
+実装の参照先: [設定読込](src/config.rs)、[コマンド振り分け](src/main.rs)、[Herdr CLI 呼び出し](src/herdr.rs)、[履歴読込](src/history.rs)、[更新処理](src/update.rs)。
 
 ## 対応とセッションの接続
 
