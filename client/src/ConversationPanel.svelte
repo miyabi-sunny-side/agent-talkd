@@ -2,7 +2,7 @@
   import { onMount, tick, untrack } from "svelte";
   import ScreenPanel from "./ScreenPanel.svelte";
   import Markdown from "./Markdown.svelte";
-  import { appendMessages } from "./conversation";
+  import { appendMessages, formatTimestamp } from "./conversation";
   import {
     fetchConversation,
     sendMessage,
@@ -371,12 +371,13 @@
       </p>{/if}
     <ol class="conversation-list">
       {#each messages as message (message.id)}
+        {@const timestamp = formatTimestamp(message.timestamp)}
         <li data-message-id={message.id} class:user={message.role === "user"}>
           <div class="message-meta">
             <strong
               >{message.role === "user" ? "あなた" : "エージェント"}</strong
-            >{#if message.timestamp}<time datetime={message.timestamp}
-                >{message.timestamp}</time
+            >{#if timestamp}<time datetime={message.timestamp ?? undefined}
+                >{timestamp}</time
               >{/if}
           </div>
           {#if message.role === "assistant"}<Markdown

@@ -1,5 +1,19 @@
 import type { Message } from "./api";
 
+export function formatTimestamp(timestamp?: string | null): string {
+  if (!timestamp) return "";
+  const date = new Date(timestamp);
+  if (Number.isNaN(date.getTime())) return "";
+  return date.toLocaleString("ja-JP", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+}
+
 // Native IDs are byte positions. Never build history from repeated snapshots.
 // Stop growing the window before dropping anything the person may be reading.
 export function appendMessages(
