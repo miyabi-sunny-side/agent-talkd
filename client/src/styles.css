@@ -888,7 +888,6 @@ textarea:focus-visible,
 .history-controls {
   display: flex;
   align-items: center;
-  justify-content: flex-end;
   gap: 8px;
   padding-inline: 12px;
   height: 44px;
@@ -965,9 +964,6 @@ main.detail-view {
 .view-tabs button.active {
   color: var(--on-surface);
   border-bottom-color: var(--accent);
-}
-.view-caption {
-  margin-left: auto;
 }
 .screen-panel {
   flex: 1;

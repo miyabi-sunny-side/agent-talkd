@@ -314,7 +314,7 @@
                   : "過去の会話を表示しています。"
                 : unread
                   ? "新しい会話があります。"
-                  : "会話・報告"}</output
+                  : ""}</output
       >
       {#if historyError && !cursorChanged}<button
           class="quiet-button"
@@ -325,7 +325,7 @@
           disabled={paging}
           onclick={() => refresh("latest")}>最新へ戻る</button
         >{/if}
-    {:else}<span class="view-caption">閲覧専用</span>{/if}
+    {/if}
   </div>
   <!-- svelte-ignore a11y_no_noninteractive_tabindex (Scrollable conversation needs keyboard scrolling.) -->
   <section
