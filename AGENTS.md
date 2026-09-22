@@ -36,4 +36,17 @@ cargo build --locked --release
 
 Build the frontend before Rust so `client/dist` is embedded. Cargo itself does not invoke npm; builds without client assets serve API routes but return 503 for the UI.
 
-Use Chromium + Playwright for browser E2E. Integration tests isolate HTTP and replace the Herdr executable with a Python 3 CLI fixture. Changes to live input or transcript adapters also require dedicated real Codex/Claude sessions: select in the browser, submit original text, verify actual CLI receipt and visible assistant output. Never use another person's pane for tests.
+Build the fixture before running a single test target from a fresh checkout:
+
+```sh
+cargo build --locked --example herdr-fixture
+cargo test --locked --test remote
+```
+
+The full `cargo test --locked` command builds the fixture automatically.
+
+Use Chromium + Playwright for browser E2E.
+Integration tests use isolated HTTP and a Rust Herdr fixture.
+Cargo builds it as the `herdr-fixture` example.
+
+Changes to live input or transcript adapters also require dedicated real Codex/Claude sessions: select in the browser, submit original text, verify actual CLI receipt and visible assistant output. Never use another person's pane for tests.

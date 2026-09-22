@@ -1,5 +1,5 @@
 use serde_json::{Value, json};
-use std::{os::unix::fs::PermissionsExt, path::PathBuf};
+use std::path::PathBuf;
 
 pub struct CliFixture {
     pub directory: tempfile::TempDir,
@@ -9,9 +9,15 @@ impl CliFixture {
         let fixture = Self {
             directory: tempfile::tempdir().unwrap(),
         };
-        std::fs::write(fixture.executable(), include_str!("herdr_cli.py")).unwrap();
-        std::fs::set_permissions(fixture.executable(), std::fs::Permissions::from_mode(0o755))
-            .unwrap();
+        let binary = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("examples/herdr-fixture");
+        std::fs::copy(binary, fixture.executable())
+            .expect("cargo test builds the isolated herdr-fixture example");
         std::fs::write(
             fixture.directory.path().join("state.json"),
             json!({"row":row}).to_string(),

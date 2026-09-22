@@ -16,6 +16,10 @@ build = "build.rs"
 name = "agent-talk"
 path = "src/main.rs"
 
+[[example]]
+name = "herdr-fixture"
+path = "tests/support/herdr_cli.rs"
+
 [dependencies]
 anyhow = "1.0"
 bytes = "1.11"
