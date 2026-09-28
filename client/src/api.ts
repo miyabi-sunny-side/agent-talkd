@@ -127,6 +127,28 @@ export async function sendMessage(
   });
   if (!record(result) || result.status !== "submitted") invalid();
 }
+/** Store an image briefly on the server; returns the absolute path agents can read. */
+export async function uploadImage(
+  pane: string,
+  session: string,
+  file: File,
+): Promise<string> {
+  const result = await request(
+    `/api/images?${new URLSearchParams({ pane, session })}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": file.type },
+      body: file,
+    },
+  );
+  if (
+    !record(result) ||
+    typeof result.path !== "string" ||
+    !result.path.startsWith("/")
+  )
+    invalid();
+  return result.path as string;
+}
 export function errorReason(error: unknown): string {
   return error instanceof Error ? error.message : "接続できません";
 }

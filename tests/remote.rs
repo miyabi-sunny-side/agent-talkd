@@ -21,12 +21,32 @@ impl Drop for Process {
 }
 
 fn request(port: u16, method: &str, path: &str, body: Option<&Value>, extra: &str) -> (u16, Value) {
+    let body = body.map_or_else(String::new, Value::to_string);
+    raw(
+        port,
+        method,
+        path,
+        "application/json",
+        body.as_bytes(),
+        extra,
+    )
+}
+
+fn raw(
+    port: u16,
+    method: &str,
+    path: &str,
+    content_type: &str,
+    body: &[u8],
+    extra: &str,
+) -> (u16, Value) {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
-    let body = body.map_or_else(String::new, Value::to_string);
-    write!(stream,"{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{extra}\r\n{body}",body.len()).unwrap();
+    write!(stream,"{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n{extra}\r\n",body.len()).unwrap();
+    // The server may answer and close before an oversized body is fully sent.
+    let _ = stream.write_all(body);
     let mut response = String::new();
     stream.read_to_string(&mut response).unwrap();
     let (headers, body) = response.split_once("\r\n\r\n").unwrap();
@@ -44,6 +64,43 @@ fn request(port: u16, method: &str, path: &str, body: Option<&Value>, extra: &st
         );
     }
     (status, serde_json::from_str(body).unwrap())
+}
+
+fn start(fixture: &support::CliFixture, home: &std::path::Path) -> (Process, u16) {
+    let port = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let process = Process(
+        Command::new(env!("CARGO_BIN_EXE_agent-talk"))
+            .arg("daemon")
+            .env("HOME", home)
+            .env(
+                "PATH",
+                std::env::join_paths(
+                    std::iter::once(fixture.directory.path().to_path_buf())
+                        .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+                )
+                .unwrap(),
+            )
+            .env_remove("AGENT_TALK_HERDR_SOCKET")
+            .env_remove("HERDR_SOCKET_PATH")
+            .env("PORT", port.to_string())
+            .env("AGENT_TALK_HTTP_ADDR", "invalid-legacy-address")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    for attempt in 0..100 {
+        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            break;
+        }
+        assert!(attempt < 99, "daemon did not start");
+        thread::sleep(Duration::from_millis(20));
+    }
+    (process, port)
 }
 
 #[test]
@@ -71,39 +128,7 @@ fn verified_session_lifecycle(pane: &str) {
         "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"確認\"}]}}\n",
         "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"実セッションの報告\"}]}}\n"
     )).unwrap();
-    let port = TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    let _process = Process(
-        Command::new(env!("CARGO_BIN_EXE_agent-talk"))
-            .arg("daemon")
-            .env("HOME", directory.path())
-            .env(
-                "PATH",
-                std::env::join_paths(
-                    std::iter::once(fixture.directory.path().to_path_buf())
-                        .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
-                )
-                .unwrap(),
-            )
-            .env_remove("AGENT_TALK_HERDR_SOCKET")
-            .env_remove("HERDR_SOCKET_PATH")
-            .env("PORT", port.to_string())
-            .env("AGENT_TALK_HTTP_ADDR", "invalid-legacy-address")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
-    );
-    for attempt in 0..100 {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            break;
-        }
-        assert!(attempt < 99, "daemon did not start");
-        thread::sleep(Duration::from_millis(20));
-    }
+    let (_process, port) = start(&fixture, directory.path());
     let (status, agents) = request(port, "GET", "/api/agents", None, "");
     assert_eq!(status, 200, "{pane}: {agents}");
     assert_eq!(agents["agents"].as_array().unwrap().len(), 2);
@@ -268,6 +293,86 @@ fn verified_session_lifecycle(pane: &str) {
         400
     );
     assert_eq!(request(port, "GET", "/api/hello", None, "").0, 200);
+}
+
+#[test]
+fn images_are_stored_briefly_for_the_verified_session_only() {
+    let home = tempfile::tempdir().unwrap();
+    let row = json!({"pane_id":"w1:p2","terminal_id":"terminal-1","workspace_id":"w1","agent":"codex","agent_status":"idle","agent_session":{"source":"herdr:codex","agent":"codex","kind":"id","value":"session-a"}});
+    let fixture = support::CliFixture::new(&row);
+    let (_process, port) = start(&fixture, home.path());
+    let agents = request(port, "GET", "/api/agents", None, "").1;
+    let token = agents["agents"][0]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let path = format!("/api/images?pane=w1%3Ap2&session={token}");
+    let png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR-image";
+
+    let (status, stored) = raw(port, "POST", &path, "image/png", png, "");
+    assert_eq!(status, 200, "{stored}");
+    let file = std::path::PathBuf::from(stored["path"].as_str().unwrap());
+    let directory = home
+        .path()
+        .join(".cache/agent-talk/images")
+        .canonicalize()
+        .unwrap();
+    assert!(file.is_absolute());
+    assert_eq!(file.parent().unwrap(), directory);
+    assert_eq!(file.extension().unwrap(), "png");
+    assert_eq!(std::fs::read(&file).unwrap(), png);
+    assert!(fixture.prompts().is_empty(), "uploading never sends input");
+
+    for (content_type, body, extra, status, code) in [
+        (
+            "image/heic",
+            &b"\0\0\0\x18ftypheic"[..],
+            "",
+            415,
+            "unsupported_image",
+        ),
+        ("image/png", b"not an image", "", 415, "unsupported_image"),
+        ("image/jpeg", b"%PDF-1.7", "", 415, "unsupported_image"),
+        ("text/plain", png, "", 415, "unsupported_image"),
+        (
+            "image/png",
+            png,
+            "Origin: https://unrelated.example\r\n",
+            403,
+            "cross_origin",
+        ),
+        (
+            "image/png",
+            png,
+            "Sec-Fetch-Site: cross-site\r\n",
+            403,
+            "cross_origin",
+        ),
+    ] {
+        let (actual, failure) = raw(port, "POST", &path, content_type, body, extra);
+        assert_eq!(actual, status, "{content_type}: {failure}");
+        assert_eq!(failure["error"]["code"], code);
+    }
+    let oversized = vec![0_u8; 20 * 1024 * 1024 + 1];
+    let (status, failure) = raw(port, "POST", &path, "image/png", &oversized, "");
+    assert_eq!(status, 413, "{failure}");
+    for target in [
+        "/api/images",
+        "/api/images?pane=w1%3Ap2",
+        "/api/images?pane=w1%3Ap2&session=other",
+        "/api/images?pane=w1%3Ap2&session=x&path=/tmp/x",
+    ] {
+        let (status, failure) = raw(port, "POST", target, "image/png", png, "");
+        assert!(
+            matches!(status, 400 | 404 | 409),
+            "{target}: {status} {failure}"
+        );
+    }
+    fixture.update(|state| state["row"]["agent_status"] = json!("blocked"));
+    assert_eq!(raw(port, "POST", &path, "image/png", png, "").0, 200);
+    let files = std::fs::read_dir(&directory).unwrap().count();
+    assert_eq!(files, 2, "rejected uploads leave no files");
+    assert!(fixture.prompts().is_empty());
 }
 
 #[test]

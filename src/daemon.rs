@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::{net::TcpListener, sync::Mutex};
 
-use crate::{config::Config, herdr::Herdr, history};
+use crate::{config::Config, herdr::Herdr, history, images};
 
 mod embedded {
     include!(concat!(env!("OUT_DIR"), "/web_assets.rs"));
@@ -25,6 +25,7 @@ type HttpResponse = Response<Full<Bytes>>;
 struct Console {
     herdr: Herdr,
     home: PathBuf,
+    images: PathBuf,
     // Prevent two browser submissions from interleaving in a terminal input field.
     input: Mutex<()>,
 }
@@ -40,8 +41,26 @@ pub async fn run(config: Config) -> Result<()> {
         .context("cannot bind HTTP listener")?;
     let console = Arc::new(Console {
         herdr: Herdr::new("herdr".into()),
+        images: images::directory(&config.home),
         home: config.home,
         input: Mutex::new(()),
+    });
+    let directory = console.images.clone();
+    tokio::spawn(async move {
+        loop {
+            let directory = directory.clone();
+            match tokio::task::spawn_blocking(move || {
+                images::sweep(&directory, std::time::SystemTime::now())
+            })
+            .await
+            {
+                Ok(Ok(0)) => {}
+                Ok(Ok(removed)) => tracing::info!(removed, "expired images removed"),
+                Ok(Err(error)) => tracing::warn!(%error, "cannot remove expired images"),
+                Err(error) => tracing::warn!(%error, "image cleanup stopped"),
+            }
+            tokio::time::sleep(Duration::from_mins(10)).await;
+        }
     });
     tracing::info!(address = %listener.local_addr()?, "remote console listening");
     loop {
@@ -79,6 +98,7 @@ async fn handle(console: Arc<Console>, request: Request<Incoming>) -> HttpRespon
         (&Method::GET, "/api/screen") => screen(&console, request.uri().query()).await,
         (&Method::GET, "/api/conversation") => conversation(&console, request.uri().query()).await,
         (&Method::POST, "/api/messages") => submit(&console, request).await,
+        (&Method::POST, "/api/images") => upload(&console, request).await,
         (_, path) if path.starts_with("/api/") || path == "/api" => {
             error_response(StatusCode::NOT_FOUND, "not_found", "この API はありません")
         }
@@ -141,24 +161,10 @@ async fn conversation(console: &Console, query: Option<&str>) -> HttpResponse {
             "履歴取得の指定を確認してください",
         );
     }
-    let (Some(pane), Some(session)) = (query.get("pane"), query.get("session")) else {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_query",
-            "宛先とセッションを指定してください",
-        );
-    };
-    let agent = match console.herdr.get(pane).await {
+    let agent = match verified_agent(console, &query).await {
         Ok(agent) => agent,
-        Err(error) => return adapter_error(&error),
+        Err(response) => return response,
     };
-    if agent.session_id.as_deref() != Some(session.as_str()) {
-        return error_response(
-            StatusCode::CONFLICT,
-            "session_changed",
-            "対象のセッションが変わりました。一覧から確認し直してください",
-        );
-    }
     let pagination = if let Some(cursor) = query.get("before") {
         history::Page::Before(cursor.clone())
     } else if let Some(cursor) = query.get("after") {
@@ -281,6 +287,123 @@ async fn submit(console: &Console, request: Request<Incoming>) -> HttpResponse {
     {
         Ok(()) => json_response(StatusCode::OK, &json!({"status":"submitted"})),
         Err(error) => adapter_error(&error),
+    }
+}
+
+/// The live agent for `pane`, only while it still runs the requested CLI `session`.
+async fn verified_agent(
+    console: &Console,
+    query: &BTreeMap<String, String>,
+) -> Result<crate::herdr::Agent, HttpResponse> {
+    let (Some(pane), Some(session)) = (query.get("pane"), query.get("session")) else {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_query",
+            "宛先とセッションを指定してください",
+        ));
+    };
+    let agent = console
+        .herdr
+        .get(pane)
+        .await
+        .map_err(|error| adapter_error(&error))?;
+    if agent.session_id.as_deref() != Some(session.as_str()) {
+        return Err(error_response(
+            StatusCode::CONFLICT,
+            "session_changed",
+            "対象のセッションが変わりました。一覧から確認し直してください",
+        ));
+    }
+    Ok(agent)
+}
+
+async fn upload(console: &Console, request: Request<Incoming>) -> HttpResponse {
+    if !same_origin(request.headers()) {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "cross_origin",
+            "同じサイトから送信してください",
+        );
+    }
+    let unsupported = || {
+        error_response(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported_image",
+            "PNG・JPEG・WebP の画像を選んでください。HEIC などは JPEG で保存し直すと送れます",
+        )
+    };
+    // A non-safelisted type also makes cross-site browsers preflight the request.
+    if request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(images::declared_type)
+        .is_none()
+    {
+        return unsupported();
+    }
+    let query = match parse_query(request.uri().query().unwrap_or_default()) {
+        Ok(query) if query.keys().all(|key| key == "pane" || key == "session") => query,
+        _ => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_query",
+                "宛先とセッションを指定してください",
+            );
+        }
+    };
+    if let Err(response) = verified_agent(console, &query).await {
+        return response;
+    }
+    let too_large = || {
+        error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "image_too_large",
+            "画像は 20 MiB までです。縮小してから選び直してください",
+        )
+    };
+    let declared = request
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok()?.parse::<usize>().ok());
+    if declared.is_some_and(|length| length > images::MAX_BYTES) {
+        return too_large();
+    }
+    // ponytail: one upload is buffered in memory (<= 20 MiB); stream to disk if many run at once.
+    let collected = tokio::time::timeout(
+        Duration::from_mins(2),
+        Limited::new(request.into_body(), images::MAX_BYTES).collect(),
+    )
+    .await;
+    let bytes = match collected {
+        Ok(Ok(collected)) => collected.to_bytes(),
+        Ok(Err(error)) if error.is::<http_body_util::LengthLimitError>() => return too_large(),
+        _ => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_body",
+                "画像の受信が完了しませんでした。もう一度お試しください",
+            );
+        }
+    };
+    let Some(extension) = images::kind(&bytes) else {
+        return unsupported();
+    };
+    let directory = console.images.clone();
+    match tokio::task::spawn_blocking(move || images::save(&directory, &bytes, extension)).await {
+        Ok(Ok(path)) if path.to_str().is_some() => {
+            json_response(StatusCode::OK, &json!({"path": path}))
+        }
+        result => {
+            if let Ok(Err(error)) = result {
+                tracing::warn!(%error, "cannot store image");
+            }
+            error_response(
+                StatusCode::INSUFFICIENT_STORAGE,
+                "image_not_saved",
+                "画像を保存できませんでした",
+            )
+        }
     }
 }
 

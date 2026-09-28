@@ -12,6 +12,7 @@
 | 会話の前後ページ | 同 URL に `before=<cursor>` または `after=<cursor>`（排他） |
 | 閲覧専用の現在画面 | `GET /api/screen?pane=<pane>&terminal=<terminal_id>`（任意で `session=<session_id>`） |
 | 原文メッセージ入力 | `POST /api/messages` |
+| 手紙に添える画像の一時保存 | `POST /api/images?pane=<pane>&session=<session_id>` |
 
 ## 現在の画面
 
@@ -28,6 +29,15 @@
 ```
 
 本文は最大 32 KiB、空白だけの本文と改行・タブ以外の制御文字を拒否します。成功応答は `{"status":"submitted"}`。エラーは `{"error":{"code":"...","message":"..."}}` です。CORS を開放せず、異なる Origin と cross-site fetch を拒否します。
+
+## 画像の一時保存
+
+本文に画像ファイルそのものを載せる`Content-Type`（`image/png`、`image/jpeg`、`image/webp`）を指定します。
+上限は1枚20 MiBです。内容の先頭がPNG・JPEG・WebPであることも確かめ、HEIC等は`unsupported_image`（415）、超過は`image_too_large`（413）で拒否します。
+宛先は会話取得と同じく、指定のpaneが同じCLIセッションのままであることを確認します。送信と同じOrigin検査を適用します。
+成功応答は`{"path":"/home/<user>/.cache/agent-talk/images/image-<random>.png"}`の絶対パスです。
+サーバーが名前を生成し、既存ファイルを上書きしません。保存だけでは対象へ何も入力しません。
+画像は保存から24時間後に自動削除されます。パスは本文に含めて`POST /api/messages`で渡します。
 
 ## 会話のページ取得
 

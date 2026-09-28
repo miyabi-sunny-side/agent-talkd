@@ -1,11 +1,18 @@
+<script lang="ts" module>
+  // The mounted panel for each draft, so a late upload reaches the draft it started from.
+  const inserters = new Map<string, (path: string) => void>();
+</script>
+
 <script lang="ts">
   import { onMount, tick, untrack } from "svelte";
+  import { appendPath, imageProblem, IMAGE_TYPES } from "./image";
   import ScreenPanel from "./ScreenPanel.svelte";
   import Markdown from "./Markdown.svelte";
   import { appendMessages, formatTimestamp } from "./conversation";
   import {
     fetchConversation,
     sendMessage,
+    uploadImage,
     errorReason,
     unavailableReason,
     statusLabel,
@@ -53,6 +60,11 @@
   let atBottom = $state(true);
   let paging = $state(false);
   let cursorChanged = $state(false);
+  let uploading = $state(false);
+  let imageStatus = $state("");
+  let imageFailed = $state(false);
+  let retryFile = $state<File | null>(null);
+  let fileInput: HTMLInputElement;
   let textarea: HTMLTextAreaElement;
   let tab: HTMLButtonElement;
   let viewport: HTMLElement;
@@ -210,7 +222,64 @@
         void refresh().finally(schedule);
       }, 2000);
   }
+  function insertPath(path: string) {
+    draft = appendPath(draft, path);
+  }
+  function deliverPath(path: string) {
+    const live = inserters.get(draftKey);
+    if (live) return live(path);
+    try {
+      sessionStorage.setItem(
+        draftKey,
+        appendPath(sessionStorage.getItem(draftKey) ?? "", path),
+      );
+    } catch {
+      /* storage unavailable: nothing retains a closed draft */
+    }
+  }
+  async function upload(file: File) {
+    const problem = imageProblem(file);
+    if (problem) {
+      imageFailed = true;
+      retryFile = null;
+      imageStatus = problem;
+      return;
+    }
+    if (uploading || !target.session) return;
+    uploading = true;
+    imageFailed = false;
+    retryFile = null;
+    imageStatus = "画像をアップロードしています…";
+    try {
+      deliverPath(await uploadImage(target.pane, target.session, file));
+      if (disposed) return;
+      imageStatus = "画像を本文に追加しました。24 時間後に自動で削除されます。";
+      await tick();
+      if (open && document.activeElement !== textarea) {
+        textarea.focus();
+        textarea.setSelectionRange(draft.length, draft.length);
+        textarea.scrollTop = textarea.scrollHeight;
+      }
+    } catch (error) {
+      if (disposed) return;
+      imageFailed = true;
+      const final =
+        error instanceof ApiError &&
+        ["unsupported_image", "image_too_large"].includes(error.code);
+      retryFile = final ? null : file;
+      imageStatus = `${errorReason(error)}。本文は変更していません。`;
+    } finally {
+      uploading = false;
+    }
+  }
+  function picked(event: Event) {
+    const input = event.currentTarget as HTMLInputElement;
+    const file = input.files?.[0];
+    input.value = "";
+    if (file) void upload(file);
+  }
   onMount(() => {
+    inserters.set(draftKey, insertPath);
     void refresh();
     schedule();
     const visibility = () => {
@@ -221,6 +290,7 @@
     document.addEventListener("visibilitychange", visibility);
     return () => {
       disposed = true;
+      if (inserters.get(draftKey) === insertPath) inserters.delete(draftKey);
       if (timer) clearTimeout(timer);
       document.removeEventListener("visibilitychange", visibility);
     };
@@ -245,7 +315,8 @@
   }
   async function submit(event: SubmitEvent) {
     event.preventDefault();
-    if (sending || blocked || !target.session || !draft.trim()) return;
+    if (sending || uploading || blocked || !target.session || !draft.trim())
+      return;
     const body = draft;
     sending = true;
     result = "送信中です…";
@@ -261,6 +332,7 @@
           /* retain memory */
         }
       }
+      if (!imageFailed) imageStatus = "";
       result =
         "送信を受け付けました。Herdr の入力受付を確認しました。進捗・完了は会話の報告で確認できます。";
       void refresh();
@@ -446,12 +518,39 @@
           rows="3"
           placeholder="指示や追加の依頼を、そのまま送れます"></textarea>
         {#if blocked}<p class="composer-blocked">{blocked}</p>{/if}
+        <div class="image-status" class:failed={imageFailed}>
+          <output aria-live="polite">{imageStatus}</output>
+          {#if retryFile && !uploading}<button
+              type="button"
+              class="quiet-button"
+              aria-label="画像を再試行"
+              onclick={() => retryFile && upload(retryFile)}>再試行</button
+            >{/if}
+        </div>
         <div class="compose-actions">
-          <output class="compose-status" class:failed aria-live="polite"
+          <button
+            type="button"
+            class="image-button"
+            disabled={uploading || sending || !target.session || changed}
+            onclick={() => fileInput.click()}
+            ><svg viewBox="0 0 24 24" aria-hidden="true"
+              ><rect x="3" y="4" width="18" height="16" rx="2" /><circle
+                cx="9"
+                cy="10"
+                r="2"
+              /><path d="m21 16-5-5-9 9" /></svg
+            >{uploading ? "アップロード中…" : "画像を追加"}</button
+          ><input
+            type="file"
+            accept={IMAGE_TYPES.join(",")}
+            hidden
+            bind:this={fileInput}
+            onchange={picked}
+          /><output class="compose-status" class:failed aria-live="polite"
             >{result}</output
           ><button
             type="submit"
-            disabled={sending || !!blocked || !draft.trim()}
+            disabled={sending || uploading || !!blocked || !draft.trim()}
             >{sending ? "送信中…" : "送信"}</button
           >
         </div>

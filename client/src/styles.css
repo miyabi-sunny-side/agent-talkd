@@ -947,6 +947,55 @@ main.detail-view {
 .compose-status:empty {
   display: none;
 }
+.image-button {
+  display: inline-flex;
+  min-height: 44px;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 14px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--on-surface);
+  background: transparent;
+  font: inherit;
+  cursor: pointer;
+}
+.image-button:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.image-button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.image-button svg {
+  width: 17px;
+  height: 17px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.image-status {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+.image-status:has(> output:empty) {
+  display: none;
+}
+.image-status output {
+  flex: 1;
+  min-width: 0;
+}
+.image-status.failed output {
+  color: var(--danger);
+}
 .view-tabs {
   display: flex;
   align-self: stretch;

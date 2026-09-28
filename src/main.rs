@@ -2,6 +2,7 @@ mod config;
 mod daemon;
 mod herdr;
 mod history;
+mod images;
 mod update;
 
 use anyhow::{Result, bail};

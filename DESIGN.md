@@ -1,6 +1,6 @@
 ---
 name: agent-talkd remote messages UI
-version: 5
+version: 6
 description: >
   Project design authority for the agent-talkd web client. Self-contained:
   everything needed to implement and verify the UI lives in this file.
@@ -299,6 +299,23 @@ viewport 全幅。左右 gutter は詳細 `.detail-bar-primary` と共通 token�
   再利用を止め、別 session になった説明を表示する。
 - 成功は確認できた範囲で「送信を受け付けました」または「対象へ入力しました」と
   表示し、処理完了の印を付けない。結果不明時はその旨を説明し自動再送しない。
+- **画像を追加**: 送信と同じ操作行の左端に置く副ボタン (画像 SVG + 「画像を追加」、
+  min-height 44px、透明地 + `--border` 枠の pill、送信の塗りより弱い)。押すと OS 標準の
+  ファイル選択を開き (`accept` は PNG / JPEG / WebP)、1 回に 1 枚を扱う。アップロード
+  だけでは送信せず、成功時にサーバーが返した実ファイルの絶対パスを本文末尾へ独立した
+  1 行として追記する (既存本文・改行は保持し、末尾が改行でなければ改行を補う)。
+  本文 textarea へ focus を戻し、利用者は説明を書き足して通常の「送信」で渡す。
+- 画像の状態は本文と操作行の間の 1 行 (12px、通常は `--muted`、失敗は `--danger`、
+  `aria-live`) に出し、空のときは場所を取らない。表示は「画像をアップロードしています…」
+  → 成功「画像を本文に追加しました。24 時間後に自動で削除されます。」/ 失敗理由 +
+  「本文は変更していません。」。通信・保存失敗には同じファイルを送り直す「再試行」
+  (quiet-button、accessible name「画像を再試行」) を添える。形式違い・20 MiB 超過・空
+  ファイルは選択直後に通信せず理由を示す。HEIC 等には JPEG で保存し直す案内を出す。
+  選択の取消しは何も変えない。
+- アップロード中は画像ボタンと送信を無効化し、本文の編集は続けられる。完了時は開始時の
+  pane + CLI session の下書きへだけ追記する。その宛先の panel が開いていればその下書きへ、
+  閉じていれば保存済み下書きへ追記し、別の宛先の下書きには混ぜない。session が変わった
+  後、または session 不明の宛先では画像ボタンを無効にする。
 
 ### 7.7 対象・接続の状態
 
@@ -438,7 +455,8 @@ maskable 版は通常版の描画を中心 (256,256) 基準で `scale(0.875)` �
   resize / scroll に追従し、無い場合は `dvh` に fallback する。safe-area の左右・下
   inset を含めて可視領域に収める。入力欄の最小高さで送信を押し出さない。
   panel の padding と border を高さに含め、内部 scroll の末尾で送信ボタン全体が
-  可視領域内に入ること。状態説明が長くても閉じる・送信が到達不能にならない。
+  可視領域内に入ること。画像の失敗表示と「再試行」が出ている状態でも、画像ボタン・
+  再試行・送信・閉じるの全体へ到達できること。状態説明が長くても閉じる・送信が到達不能にならない。
 - ≥1020px: 一覧の本文 main は 1020px で中央固定。app header は viewport 全幅
   のまま (詳細 1 段目と brand/menu の端を揃える)。詳細は viewport 全幅を使い、
   本文は折り返して表示。dock の tab は右寄せ、上辺の線は全幅。
@@ -483,7 +501,8 @@ maskable 版は通常版の描画を中心 (256,256) 基準で `scale(0.875)` �
 - **content view**: 会話 ⇄ 画面。切替で対象・draft・会話の読み位置を維持。
   画面は loading → ready / empty / error、継続失敗・切断・終了で stale。
   identity 変更で旧表示の更新を停止する。
-- **composer**: closed ⇄ open。送信 idle → sending → accepted / delivered /
+- **composer**: closed ⇄ open。画像 idle → uploading → added / failed (再試行可) /
+  rejected (通信なし)。uploading 中は送信不可。送信 idle → sending → accepted / delivered /
   failed / result-unknown。状態名は API が確かめた事実に合わせる。
   accepted / delivered を agent の処理完了へ自動遷移させない。
 - **theme**: dark | light | system。選択即適用・即保存・reload 後も維持。
@@ -515,6 +534,11 @@ maskable 版は通常版の描画を中心 (256,256) 基準で `scale(0.875)` �
   復帰で即時取得すること、取得時刻・更新失敗・切断・終了・identity 変更時の古い表示を
   確認する。専用 Herdr pane の実際の行・空白と Web 表示を比較し、画像との違いを
   記録する。利用者の作業 pane にテスト入力を送らない。
+- 画像: 実ファイルの選択 → 実パスの追記 → 説明追記 → 送信、取消し、形式違い・超過・
+  内容が画像でないファイル、通信・保存失敗と再試行、通信中の本文編集と宛先切替で、
+  下書きが残り別宛先へパスが混ざらないことを Chromium + Playwright で確認する。
+  追記されたパスの実画像を専用の Codex / Claude Code セッションが読めることも確認する。
+  実スマホの写真 picker (HEIC の自動変換等) を未確認なら、その制約を分けて報告する。
 - 実ブラウザ経路で Codex と Claude Code の対象確認 → 原文指示 → 実 session 受信
   → assistant 報告表示を確認する。追加指示と接続切断・終了時の表示も確認し、
   送信成功だけで実 session の処理・報告検証を代替しない。
