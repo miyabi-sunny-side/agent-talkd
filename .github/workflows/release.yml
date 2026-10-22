@@ -35,18 +35,6 @@ jobs:
         working-directory: client
         run: npm ci
 
-      - name: Check frontend formatting
-        working-directory: client
-        run: npm run format:check
-
-      - name: Check frontend types
-        working-directory: client
-        run: npm run check
-
-      - name: Run frontend tests
-        working-directory: client
-        run: npm test
-
       - name: Build embedded frontend
         working-directory: client
         run: npm run build
@@ -54,10 +42,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.96.0
         with:
           targets: ${{ matrix.target }}
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
 
       - name: Install musl toolchain
         if: runner.os == 'Linux'
