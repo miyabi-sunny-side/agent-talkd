@@ -4,21 +4,25 @@ use std::{fs, io::Write, process, thread, time::Duration};
 
 #[allow(clippy::too_many_lines)] // One small command dispatcher for the existing CLI fixture.
 fn main() {
-    let executable = std::env::current_exe().unwrap();
-    let root = executable.parent().unwrap();
+    let executable = std::env::current_exe().expect("locate fixture executable");
+    let root = executable
+        .parent()
+        .expect("fixture executable has a directory");
     let state_path = root.join("state.json");
-    let mut state: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    let mut state: Value =
+        serde_json::from_slice(&fs::read(&state_path).expect("read fixture state"))
+            .expect("fixture state is JSON written by the test harness");
     let args: Vec<String> = std::env::args().skip(1).collect();
     writeln!(
         fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(root.join("calls.jsonl"))
-            .unwrap(),
+            .expect("open fixture call log"),
         "{}",
         json!(args)
     )
-    .unwrap();
+    .expect("append fixture call log");
     let mut rows = vec![state["row"].clone()];
     rows.extend(
         state["extra_rows"]
@@ -35,7 +39,9 @@ fn main() {
         _ => None,
     };
     let index = pane.map_or(0, |pane| {
-        rows.iter().position(|row| row["pane_id"] == pane).unwrap()
+        rows.iter()
+            .position(|row| row["pane_id"] == pane)
+            .unwrap_or_else(|| panic!("fixture state has no pane {pane}"))
     });
     let row = &mut rows[index];
     let mode = state["mode"].as_str().unwrap_or("");
@@ -75,7 +81,10 @@ fn main() {
         ["agent", "list"] => json!({"agents":rows}),
         ["workspace", "list"] => json!({"workspaces":[]}),
         ["tab", "list", "--workspace", workspace] => {
-            assert!(rows.iter().any(|r| r["workspace_id"] == *workspace));
+            assert!(
+                rows.iter().any(|r| r["workspace_id"] == *workspace),
+                "fixture state has no workspace {workspace}"
+            );
             json!({"tabs":[]})
         }
         ["agent", "get", _] => {
@@ -100,7 +109,7 @@ fn main() {
             } else {
                 state["extra_rows"][index - 1] = row.clone();
             }
-            fs::write(state_path, state.to_string()).unwrap();
+            fs::write(state_path, state.to_string()).expect("write fixture state");
             if screen_mode == "oversized" {
                 print!("{}", "x".repeat(256 * 1024 + 1));
             } else {
